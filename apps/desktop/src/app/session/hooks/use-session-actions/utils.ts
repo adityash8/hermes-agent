@@ -505,6 +505,24 @@ export function preserveLocalPendingTurnMessages(
 
     const authoritative = nextByRoleOrdinal.get(`${message.role}:${ordinal}`)
 
+    // A settled stream row (`pending: false` after message.complete) whose reply
+    // the authoritative transcript already carries under its committed id is
+    // stale: ordinal pairing can't see it, because the commit shifted the row
+    // one ordinal earlier, and re-appending it renders the same answer twice
+    // (#70209). Only text-identical rows are dropped — a settled row the backend
+    // has NOT committed yet is the only copy of that reply and must survive.
+    if (
+      isPendingAssistant &&
+      message.pending !== true &&
+      nextMessages.some(
+        candidate =>
+          candidate.role === 'assistant' &&
+          textWithoutImageRefs(chatMessageText(candidate)) === textWithoutImageRefs(chatMessageText(message))
+      )
+    ) {
+      continue
+    }
+
     if (authoritative) {
       if (isPendingAssistant) {
         // Keep the local pending row when it is the same reply further along
