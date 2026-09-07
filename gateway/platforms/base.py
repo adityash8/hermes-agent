@@ -1895,6 +1895,7 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        self._session_cancellation_handler: Optional[Callable[[str, SessionSource], Awaitable[None]]] = None
         # Owning multiplex profile (None on primary); see _session_key_profile.
         self._owner_profile: Optional[str] = None
         # Registered by GatewayRunner (see set_authorization_check).
@@ -2240,6 +2241,37 @@ class BasePlatformAdapter(ABC):
     def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]]) -> None:
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
+
+    def set_session_cancellation_handler(
+        self, handler: Optional[Callable[[str, SessionSource], Awaitable[None]]],
+    ) -> None:
+        """Register runner interruption for platform surface removal, without a command reply."""
+        self._session_cancellation_handler = handler
+
+    async def request_session_cancellation(self, session_key: str, source: SessionSource) -> None:
+        """Stop generation and delivery after a platform surface disappears, without an ack.
+
+        Discard input before awaiting cleanup: a cancelled task's finally can drain it. A send
+        may discover deletion inside its own processing task; schedule its cancellation rather
+        than awaiting itself. The runner callback fences the executor before that unwind.
+        """
+        if not session_key:
+            return
+        task = self._session_tasks.get(session_key)
+        self._pending_messages.pop(session_key, None)
+        self._discard_text_debounce(session_key)
+        try:
+            handler = getattr(self, "_session_cancellation_handler", None)
+            if handler is not None:
+                await handler(session_key, source)
+            else:
+                await self.interrupt_session_activity(session_key, source.chat_id)
+        finally:
+            if task is not None and task is asyncio.current_task():
+                self._expected_cancelled_tasks.add(task)
+                asyncio.get_running_loop().call_soon(task.cancel)
+            elif self._session_tasks.get(session_key) is task:
+                await self.cancel_session_processing(session_key)
 
     def set_reaction_handler(self, handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]) -> None:
         """Set the handler for platform-native emoji-reaction events: a normalised dict

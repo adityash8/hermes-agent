@@ -42,8 +42,10 @@ from gateway.platforms.base import (
     cache_document_from_bytes_async, cache_video_from_bytes_async)
 
 try:  # sibling module; support both package and flat plugin-dir import
+    from .deletion import SlackDeletionMixin, deletion_guard
     from .block_kit import render_blocks, sanitize_blocks
 except ImportError:  # pragma: no cover - plugin loaded outside package context
+    from deletion import SlackDeletionMixin, deletion_guard  # ty: ignore[unresolved-import]
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
 
 
@@ -831,7 +833,7 @@ def _extra_or_env_channel_set_getter(
     return getter
 
 
-class SlackAdapter(BasePlatformAdapter):
+class SlackAdapter(SlackDeletionMixin):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
@@ -908,13 +910,13 @@ class SlackAdapter(BasePlatformAdapter):
         # Agent-view context per (team, user) — never global, so one person's split-view
         # context can't leak into another's prompt. Bridges lifecycle/message event ordering.
         self._agent_view_contexts: Dict[Tuple[str, str], Dict[str, str]] = {}
-        # (channel, thread, status key) → last status bubble ts, so repeated
+        # (workspace, channel, thread, status key) → last status bubble ts, so repeated
         # progress callbacks edit ONE message instead of spamming the thread.
         # Status-bubble dedup (issue #30045, extended to Slack): remember the message ts of the last status
         # bubble per (channel, thread, status key) so repeated progress callbacks (compression retries,
         # fallback switches, ...) edit ONE message in place instead of appending a new bubble per event —
         # long retry loops used to spam threads with dozens of out-of-order status messages.
-        self._status_message_ids: Dict[Tuple[str, str, str], str] = {}
+        self._status_message_ids: Dict[Tuple[str, str, str, str], str] = {}
         self._thread_context_cache: Dict[str, _ThreadContextCache] = {}
         # Threads already rehydration-checked this process (first reply after a restart injects
         # missed messages exactly once); message IDs with reaction lifecycle (bounded: an exception
@@ -1321,6 +1323,7 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             async with aiohttp.ClientSession(trust_env=gateway_trust_env()) as session:
                 for idx, chunk in enumerate(chunks):
+                    self._check_deletion_scope()
                     # Only the first chunk replaces the ack.
                     payload = {"response_type": "ephemeral", "replace_original": idx == 0, "text": chunk}
                     async with session.post(
@@ -1353,14 +1356,15 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             client = self._get_client(chat_id)
             for chunk in chunks:
-                result = await client.chat_postEphemeral(channel=chat_id, user=user_id, text=chunk)
+                result = await self._deletion_call(
+                    client, "chat_postEphemeral", channel=chat_id, user=user_id, text=chunk)
                 payload = _slack_response_payload(result)
                 if not payload.get("ok"):
                     err = payload.get("error", "unknown_error") if payload else "unexpected_response"
                     return SendResult(success=False, error=f"chat.postEphemeral failed: {err}")
             return SendResult(success=True, message_id=None)
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=f"chat.postEphemeral failed: {e}")
 
     def _warn_if_missing_group_dm_scopes(self, auth_response, team_name: str) -> None:
         """Nudge a reinstall when group-DM scopes are absent: a missing ``message.mpim`` event
@@ -1694,7 +1698,7 @@ class SlackAdapter(BasePlatformAdapter):
             if client is None:
                 return None
             seed_text = f":thread: Jarvis handoff — *{(name or 'session').strip()[:80]}*"
-            result = await client.chat_postMessage(channel=parent_chat_id, text=seed_text)
+            result = await self._deletion_call(client, "chat_postMessage", channel=parent_chat_id, text=seed_text)
             ts = _slack_response_payload(result).get("ts")
             return str(ts) if ts else None
         except Exception as exc:
@@ -1862,6 +1866,7 @@ class SlackAdapter(BasePlatformAdapter):
         return self._workspace_thread_key(
             self._metadata_team_id(metadata), chat_id, str(thread_ts))
 
+    @deletion_guard
     async def send_native_task_card_progress(
         self, chat_id: str, tasks: List[Dict[str, str]], *, title: str = "Jarvis is working",
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
@@ -1896,7 +1901,7 @@ class SlackAdapter(BasePlatformAdapter):
                         value = _first_truthy(md, sources)
                         if value:
                             start_payload[key] = value
-                    result = await client.api_call("chat.startStream", json=start_payload)
+                    result = await self._deletion_call(client, "chat.startStream", json=start_payload)
                     if hasattr(result, "get"):
                         stream.stream_ts = str(result.get("ts") or result.get("message_ts") or "")
                     if not stream.stream_ts:
@@ -1907,7 +1912,7 @@ class SlackAdapter(BasePlatformAdapter):
                     "channel": chat_id, "ts": stream.stream_ts, "chunks": chunks}
                 if fallback_text:
                     append_payload["markdown_text"] = fallback_text
-                await client.api_call("chat.appendStream", json=append_payload)
+                await self._deletion_call(client, "chat.appendStream", json=append_payload)
                 return SendResult(success=True, message_id=stream.stream_ts)
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.error("[Slack] Native task-card progress error: %s", exc, exc_info=True)
@@ -1931,8 +1936,9 @@ class SlackAdapter(BasePlatformAdapter):
             stream.stopped = True
             try:
                 if self._app and stream.stream_ts:
-                    await self._get_client(stream.channel, team_id=stream.team_id).api_call(
-                        "chat.stopStream", json={"channel": stream.channel, "ts": stream.stream_ts})
+                    await self._deletion_call(
+                        self._get_client(stream.channel, team_id=stream.team_id), "chat.stopStream",
+                        team_id=stream.team_id, json={"channel": stream.channel, "ts": stream.stream_ts})
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.debug("[Slack] Native task-card stopStream failed: %s", exc)
             finally:
@@ -1971,7 +1977,7 @@ class SlackAdapter(BasePlatformAdapter):
         ``blocks`` (an edit sends ``blocks=[]`` so the message drops its stale layout). The client
         is re-resolved for the retry."""
         try:
-            return await getattr(client_fn(), method)(**kwargs)
+            return await self._deletion_call(client_fn(), method, **kwargs)
         except Exception as e:
             if kwargs.get("blocks") and self._is_block_payload_rejection(e):
                 retry_kwargs = dict(kwargs)
@@ -1981,9 +1987,10 @@ class SlackAdapter(BasePlatformAdapter):
                     retry_kwargs.pop("blocks", None)
                 logger.info(
                     "[Slack] Block Kit payload rejected; retrying %s without blocks: %s", verb, e)
-                return await getattr(client_fn(), method)(**retry_kwargs)
+                return await self._deletion_call(client_fn(), method, **retry_kwargs)
             raise
 
+    @deletion_guard
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -2000,7 +2007,7 @@ class SlackAdapter(BasePlatformAdapter):
                 return await self._send_slash_reply(chat_id, slash_ctx, content, metadata)
             # An active native stream that this content finalizes IS the final
             # message: seal it instead of posting a duplicate.
-            stream_result = await self._try_finalize_stream(chat_id, content)
+            stream_result = await self._try_finalize_stream(chat_id, content, metadata)
             if stream_result is not None:
                 return stream_result
             formatted = self.format_message(content)
@@ -2101,6 +2108,7 @@ class SlackAdapter(BasePlatformAdapter):
             "(%s); dropping rather than posting publicly", fallback_result.error)
         return fallback_result
 
+    @deletion_guard
     async def send_private_notice(
         self, chat_id: str, user_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -2116,7 +2124,7 @@ class SlackAdapter(BasePlatformAdapter):
             kwargs = {"channel": chat_id, "user": user_id, "text": formatted, "mrkdwn": True}
             if thread_ts:
                 kwargs["thread_ts"] = thread_ts
-            result = await self._client_for(chat_id, metadata).chat_postEphemeral(**kwargs)
+            result = await self._deletion_call(self._client_for(chat_id, metadata), "chat_postEphemeral", **kwargs)
             return SendResult(
                 success=True, message_id=result.get("message_ts") or result.get("ts"),
                 raw_response=result)
@@ -2124,12 +2132,13 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("[Slack] Ephemeral send error: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    @deletion_guard
     async def send_or_update_status(
         self, chat_id: str, status_key: str, content: str, *,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         """Send a status message or edit the previous one with the same (channel, thread, key) so
-        progress callbacks edit one bubble. If the edit fails (deleted, too old) the cached ts is
-        dropped and a fresh message is sent.
+        progress callbacks edit one bubble. Missing messages silence the thread; other edit
+        failures may fall back to a fresh message.
 
         Issue #30045 (Telegram) extended to Slack: progress/status callbacks (context-pressure, compression
         retries, model fallback, lifecycle) used to append a fresh bubble on every call, spamming threads
@@ -2137,7 +2146,7 @@ class SlackAdapter(BasePlatformAdapter):
         with the same (channel, thread, status_key) edit that message in place via ``chat.update``.
         """
         thread_ts = self._resolve_thread_ts(None, metadata) or ""
-        key = (str(chat_id), str(thread_ts), str(status_key))
+        key = (*self._deletion_key(chat_id, thread_ts, metadata), str(status_key))
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
             result = await self.edit_message(
@@ -2157,6 +2166,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._status_message_ids[key] = str(result.message_id)
         return result
 
+    @deletion_guard
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -2203,15 +2213,26 @@ class SlackAdapter(BasePlatformAdapter):
         """Delete a bot message (used to clean up temporary progress bubbles)."""
         if not self._app:
             return False
+        key = self._deletion_key(chat_id)
+        key = self._sent_surface(key, message_id)
+        self._remember_cleanup(key, message_id)
         try:
-            response = await self._get_client(chat_id).chat_delete(channel=chat_id, ts=message_id)
+            response = await self._get_client(chat_id, team_id=key[0]).chat_delete(channel=chat_id, ts=message_id)
             if not (hasattr(response, "get") and response.get("ok") is False):
                 return True
+            self._forget_cleanup(key, message_id)
+            if response.get("error") == "message_not_found":
+                await self._silence_deleted_surface(key, message_id, f"{time.time():.6f}", wait=False)
             logger.debug(
                 "[Slack] chat.delete returned ok=false for message %s in channel %s: %s",
                 message_id, chat_id, response.get("error", "unknown"))
             return False
         except Exception as e:  # pragma: no cover - best-effort cleanup
+            response = getattr(e, "response", None)
+            if hasattr(response, "get") and response.get("ok") is False:
+                self._forget_cleanup(key, message_id)
+                if response.get("error") == "message_not_found":
+                    await self._silence_deleted_surface(key, message_id, f"{time.time():.6f}", wait=False)
             logger.debug(
                 "[Slack] Failed to delete message %s in channel %s: %s", message_id, chat_id, e)
             return False
@@ -2242,6 +2263,7 @@ class SlackAdapter(BasePlatformAdapter):
         glyph = next((g for g in self._STREAM_CURSOR_GLYPHS if stripped.endswith(g)), None)
         return stripped[: -len(glyph)].rstrip() if glyph else text
 
+    @deletion_guard
     async def send_draft(
         self, chat_id: str, draft_id: int, content: str, metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
@@ -2253,8 +2275,11 @@ class SlackAdapter(BasePlatformAdapter):
         if self._native_stream_unsupported:
             return SendResult(success=False, error="native streaming unsupported")
         text = self._strip_stream_cursor(content)
-        client = self._get_client(chat_id)
+        client = self._client_for(chat_id, metadata)
         stream = self._active_streams.get(chat_id)
+        if stream and stream.get("surface") != self._deletion_key(
+                chat_id, self._resolve_thread_ts(None, metadata), metadata):
+            stream = None
         try:
             if stream is not None and stream.get("draft_id") != draft_id:
                 # New segment while a prior stream is open: seal the old one so
@@ -2273,7 +2298,7 @@ class SlackAdapter(BasePlatformAdapter):
                 self._active_streams.pop(chat_id, None)
                 return SendResult(success=False, error="stream prefix mismatch")
             delta = text[len(sent) :]
-            await client.chat_appendStream(channel=chat_id, ts=stream["ts"], markdown_text=delta)
+            await self._deletion_call(client, "chat_appendStream", channel=chat_id, ts=stream["ts"], markdown_text=delta)
             stream["sent"] = text
             return SendResult(success=True, message_id=stream["ts"])
         except Exception as e:  # pragma: no cover - network/API errors
@@ -2303,19 +2328,20 @@ class SlackAdapter(BasePlatformAdapter):
         start_kwargs: Dict[str, Any] = {"channel": chat_id, "thread_ts": thread_ts}
         md = metadata or {}
         user_id = md.get("user_id") or md.get("sender_id")
-        team_id = self._channel_team.get(chat_id)
+        team_id = self._metadata_team_id(metadata) or self._channel_team.get(chat_id)
         if user_id:
             start_kwargs["recipient_user_id"] = str(user_id)
         if team_id:
             start_kwargs["recipient_team_id"] = str(team_id)
         if text:
             start_kwargs["markdown_text"] = text
-        response = await client.chat_startStream(**start_kwargs)
+        response = await self._deletion_call(client, "chat_startStream", **start_kwargs)
         ts = response.get("ts") if response else None
         if not ts:
             raise RuntimeError("chat.startStream returned no ts")
         self._active_streams[chat_id] = {
-            "ts": str(ts), "draft_id": draft_id, "sent": text, "started": time.time()}
+            "ts": str(ts), "draft_id": draft_id, "sent": text, "started": time.time(),
+            "surface": self._deletion_key(chat_id, thread_ts, metadata)}
         self._bot_message_ts.add(str(ts))
         return SendResult(success=True, message_id=str(ts))
 
@@ -2333,18 +2359,23 @@ class SlackAdapter(BasePlatformAdapter):
                     kwargs["markdown_text"] = final_text[len(sent) :]
             if blocks:
                 kwargs["blocks"] = blocks
-            await self._get_client(chat_id).chat_stopStream(**kwargs)
+            team_id = (stream.get("surface") or ("",))[0]
+            await self._deletion_call(
+                self._get_client(chat_id, team_id=team_id), "chat_stopStream", team_id=team_id, **kwargs)
             return True
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(
                 "[Slack] chat.stopStream failed for %s/%s: %s", chat_id, stream.get("ts"), e)
             return False
 
-    async def _try_finalize_stream(self, chat_id: str, content: str) -> Optional[SendResult]:
+    async def _try_finalize_stream(self, chat_id: str, content: str, metadata=None) -> Optional[SendResult]:
         """Seal the active native stream if ``content`` is its final text: SendResult when the
         stream IS the final message; None when unrelated (interim commentary), leaving it open."""
         stream = self._active_streams.get(chat_id)
         if stream is None:
+            return None
+        target = self._deletion_key(chat_id, self._resolve_thread_ts(None, metadata), metadata)
+        if stream.get("surface") and stream["surface"] != target:
             return None
         sent = stream.get("sent", "")
         text = self._strip_stream_cursor(content)
@@ -2363,7 +2394,7 @@ class SlackAdapter(BasePlatformAdapter):
         blocks = self._maybe_blocks(text)
         if blocks:
             try:
-                await self._get_client(chat_id).chat_update(
+                await self._deletion_call(self._client_for(chat_id, metadata), "chat_update",
                     channel=chat_id, ts=ts, text=self.format_message(text), blocks=blocks)
             except Exception as e:
                 logger.debug(
@@ -2371,6 +2402,7 @@ class SlackAdapter(BasePlatformAdapter):
         await self.stop_typing(chat_id)
         return SendResult(success=True, message_id=ts)
 
+    @deletion_guard
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Show a thread status via assistant.threads.setStatus.
         Needs assistant:write or chat:write scope; auto-clears on reply."""
@@ -2418,7 +2450,8 @@ class SlackAdapter(BasePlatformAdapter):
         self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:
         """``assistant.threads.setStatus`` (empty ``status`` clears); failures are debug-logged."""
         try:
-            await self._get_client(chat_id, team_id=team_id).assistant_threads_setStatus(
+            await self._deletion_call(
+                self._get_client(chat_id, team_id=team_id), "assistant_threads_setStatus", team_id=team_id,
                 channel_id=chat_id, thread_ts=thread_ts, status=status)
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setStatus %s: %s", fail_label, e)
@@ -2577,7 +2610,7 @@ class SlackAdapter(BasePlatformAdapter):
         source = {"file": file_path} if content is None else {"content": content}
         for attempt in range(attempts):
             try:
-                result = await self._client_for(chat_id, metadata).files_upload_v2(
+                result = await self._deletion_call(self._client_for(chat_id, metadata), "files_upload_v2",
                     channel=chat_id, **source, filename=filename, initial_comment=caption or "",
                     thread_ts=thread_ts)
                 self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
@@ -2588,6 +2621,7 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.debug("[Slack] %s retry %d/2 for %s: %s", label, attempt + 1, file_path, exc)
                 await asyncio.sleep(1.5 * (attempt + 1))
 
+    @deletion_guard
     async def _upload_file(
         self, chat_id: str, file_path: str, caption: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -2602,6 +2636,7 @@ class SlackAdapter(BasePlatformAdapter):
         return await self._upload_with_retry(
             chat_id, file_path, os.path.basename(file_path), caption, thread_ts, metadata)
 
+    @deletion_guard
     async def _send_local_file(
         self, chat_id: str, file_path: str, caption: Optional[str], reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]], kind: str, filename: str, not_found_error: str,
@@ -2623,6 +2658,7 @@ class SlackAdapter(BasePlatformAdapter):
             return await self._send_failure_notice(
                 chat_id, caption, failure_notice, reply_to, metadata)
 
+    @deletion_guard
     async def send_multiple_images(
         self, chat_id: str, images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None, human_delay: float = 0.0) -> None:
@@ -2656,7 +2692,7 @@ class SlackAdapter(BasePlatformAdapter):
                 logger.info(
                     "[Slack] Sending %d image(s) in single files_upload_v2 (chunk %d/%d)",
                     len(file_uploads), chunk_idx + 1, len(chunks))
-                await self._client_for(chat_id, metadata).files_upload_v2(
+                await self._deletion_call(self._client_for(chat_id, metadata), "files_upload_v2",
                     channel=chat_id, file_uploads=file_uploads, initial_comment=initial_comment,
                     thread_ts=thread_ts)
                 self._record_uploaded_file_thread(chat_id, thread_ts, metadata)
@@ -3108,6 +3144,7 @@ class SlackAdapter(BasePlatformAdapter):
         text = f"{caption}\n{notice}" if caption else notice
         return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
 
+    @deletion_guard
     async def send_image(
         self, chat_id: str, image_url: str, caption: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -4116,6 +4153,12 @@ class SlackAdapter(BasePlatformAdapter):
                 event.get("user", "") or "", event.get("bot_id", "") or "",
                 (_bot_profile.get("name") if isinstance(_bot_profile, dict) else "") or "",
                 event.get("channel", ""), event.get("ts", ""), event.get("thread_ts", ""))
+        # Deletions have their own persistent, workspace-scoped receipts. Never
+        # let ordinary message timestamp dedup swallow a distinct deletion event.
+        if event.get("subtype") == "message_deleted":
+            if not self._is_ignored_channel(event.get("channel", "")):
+                await self._handle_message_deleted(event, payload)
+            return None
         if event.get("subtype") == "message_changed":
             event = self._normalize_changed_message(event)
             if event is None:
@@ -4133,9 +4176,6 @@ class SlackAdapter(BasePlatformAdapter):
             logger.info("[Slack] Ignoring message in configured ignored channel %s", channel_id)
             return None
         if await self._drop_bot_sender(event):
-            return None
-        # Edits were normalized above so an @mention added by edit can wake the bot once.
-        if event.get("subtype") == "message_deleted":
             return None
         return event, dedup_team_id, channel_id
 
@@ -4254,6 +4294,11 @@ class SlackAdapter(BasePlatformAdapter):
             event_thread_ts=event_thread_ts, user_id=user_id, team_id=team_id, is_dm=is_dm,
             force_process=force_process)):
             return
+        deletion_key = self._deletion_key(channel_id, thread_ts, {"team_id": team_id})
+        if not await self._deletion_accept_summon(
+                deletion_key, event, user_id, is_dm, bot_uid, routing_text):
+            return
+        deletion_generation = self._deletion_generation(deletion_key)
         # Claim the message ts HERE: a link unfurl emits `message_changed` with a different event
         # ts, so only the `_processed_message_ts` guard stops a duplicate turn, and it must be set
         # before the slow enrichment awaits. Claiming before the filters would let an ignored
@@ -4293,6 +4338,9 @@ class SlackAdapter(BasePlatformAdapter):
                 f"{msg_event.text}")
         if ts:
             self._remember_processed_message_ts(ts)
+        if (self._deletion_record(deletion_key).get("muted")
+                or self._deletion_generation(deletion_key) != deletion_generation):
+            return
         await self.handle_message(msg_event)
 
     async def _build_message_event(
@@ -4518,8 +4566,9 @@ class SlackAdapter(BasePlatformAdapter):
         if thread_ts:
             kwargs["thread_ts"] = thread_ts
         team_id = self._metadata_team_id(metadata) if team_scoped else None
-        return await self._get_client(chat_id, team_id=team_id).chat_postMessage(**kwargs)
+        return await self._deletion_call(self._get_client(chat_id, team_id=team_id), "chat_postMessage", **kwargs)
 
+    @deletion_guard
     async def _send_interactive_prompt(
         self, chat_id: str, metadata: Optional[Dict[str, Any]],
         build: Callable[[], Tuple[str, list]], label: str, *,
@@ -4748,7 +4797,8 @@ class SlackAdapter(BasePlatformAdapter):
             {"type": "section", "text": {"type": "mrkdwn", "text": original_text or placeholder}},
             {"type": "context", "elements": [{"type": "mrkdwn", "text": decision_text}]}]
         try:
-            await self._get_client(channel_id, team_id=team_id).chat_update(
+            await self._deletion_call(
+                self._get_client(channel_id, team_id=team_id), "chat_update", team_id=team_id,
                 channel=channel_id, ts=msg_ts, text=decision_text,
                 blocks=sanitize_blocks(updated_blocks) if sanitize else updated_blocks)
         except Exception as e:
@@ -4791,8 +4841,9 @@ class SlackAdapter(BasePlatformAdapter):
                 thread_ts = message.get("thread_ts") or msg_ts  # stay in the same thread
                 if thread_ts:
                     post_kwargs["thread_ts"] = thread_ts
-                await self._get_client(channel_id, team_id=team_id or None).chat_postMessage(
-                    **post_kwargs)
+                await self._deletion_call(
+                    self._get_client(channel_id, team_id=team_id or None), "chat_postMessage",
+                    team_id=team_id, **post_kwargs)
             logger.info(
                 "Slack button resolved slash-confirm for session %s (choice=%s, user=%s)",
                 session_key, choice, user_name)

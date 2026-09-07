@@ -25,7 +25,7 @@ from gateway.restart import is_global_startup_conflict
 from gateway.run_shutdown import _log_suppressed
 from gateway.session import SessionSource
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, cast
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -1040,6 +1040,19 @@ class GatewayAdapterLifecycleMixin:
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
         adapter.set_busy_session_handler(busy_session_handler or self._handle_active_session_busy_message)
+        async def cancel_surface_session(session_key: str, source: SessionSource) -> None:
+            from gateway.run import _INTERRUPT_REASON_STOP
+            # Bind the originating transport explicitly; multiplex handlers are closures, and
+            # the source's routed profile can differ from the adapter's owning profile.
+            setattr(source, "_transport_adapter_ref", _weakref.ref(adapter))
+            await cast("GatewayRunner", self)._interrupt_and_clear_session(
+                session_key, source, interrupt_reason=_INTERRUPT_REASON_STOP,
+                invalidation_reason="surface_deleted",
+            )
+
+        set_cancellation = getattr(adapter, "set_session_cancellation_handler", None)
+        if callable(set_cancellation):
+            set_cancellation(cancel_surface_session)
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):
             _set_reaction(self._handle_reaction_event)
