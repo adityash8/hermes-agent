@@ -183,6 +183,7 @@ def _connect_with_recording_app(
     fake_mgr.get_slack_action_handlers.return_value = plugin_handlers
 
     with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+         patch.object(adapter, "_slack_self_event_filter", return_value=MagicMock()), \
          patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
          patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()), \
          patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}), \
@@ -249,6 +250,7 @@ class TestSlackAdapterPluginActionWiring:
         })
 
         with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
+             patch.object(adapter, "_slack_self_event_filter", return_value=MagicMock()), \
              patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
              patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()), \
              patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}), \

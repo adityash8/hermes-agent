@@ -1626,7 +1626,11 @@ class SlackAdapter(SlackDeletionMixin):
             self._team_clients, self._team_bot_user_ids, self._team_bot_names = {}, {}, {}
             self._app = AsyncApp(
                 token=bot_tokens[0], client=self._new_web_client(bot_tokens[0], proxy_url),
+                ignoring_self_events_enabled=False,
                 before_authorize=_slack_per_request_proxy_middleware(proxy_url))
+            # Replace, do not remove, echo protection. Public middleware registration
+            # places this after Bolt authorization and before every event listener.
+            self._app.use(self._slack_self_event_filter())
             _apply_slack_proxy(self._app.client, proxy_url)
             for token in bot_tokens:
                 await self._authenticate_workspace(token, proxy_url)

@@ -896,6 +896,9 @@ class TestSlackProxyBehavior:
                 self.registered_actions = []
                 created_apps.append(self)
 
+            def use(self, middleware):
+                self.registered_middleware = middleware
+
             def event(self, event_type):
                 self.registered_events.append(event_type)
 
@@ -938,6 +941,7 @@ class TestSlackProxyBehavior:
 
         with (
             patch.object(_slack_mod, "AsyncApp", side_effect=FakeApp),
+            patch.object(adapter, "_slack_self_event_filter", return_value=MagicMock()),
             patch.object(_slack_mod, "AsyncWebClient", side_effect=FakeWebClient),
             patch.object(_slack_mod, "AsyncSocketModeHandler", FakeSocketModeHandler),
             patch.object(

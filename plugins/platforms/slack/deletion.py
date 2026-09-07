@@ -66,6 +66,28 @@ def deletion_guard(method):
 
 
 class SlackDeletionMixin(BasePlatformAdapter):
+    @staticmethod
+    def _slack_self_event_filter():
+        """Keep Bolt's echo protection, except for authenticated deletion events.
+
+        Bolt extracts a deleted message's original author as context.user_id.
+        Its default self-event filter therefore swallows deletions of our replies.
+        Ownership and self-cleanup checks still run in _handle_message_deleted.
+        Import lazily so adapter discovery does not require the optional SDK.
+        """
+        from slack_bolt.middleware.ignoring_self_events.async_ignoring_self_events import (
+            AsyncIgnoringSelfEvents,
+        )
+
+        class DeletionAwareSelfEvents(AsyncIgnoringSelfEvents):
+            async def async_process(self, *, req, resp, next):
+                event = req.body.get("event") or {}
+                if event.get("type") == "message" and event.get("subtype") == "message_deleted":
+                    return await next()
+                return await super().async_process(req=req, resp=resp, next=next)
+
+        return DeletionAwareSelfEvents()
+
     # Implemented by SlackAdapter; declared here for the topical mixin's type contract.
     _channel_team: dict[str, str]
     _team_bot_user_ids: dict[str, str]

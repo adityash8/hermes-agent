@@ -109,6 +109,8 @@ def _connect_and_capture_handlers():
 
     with (
         patch.object(_slack_mod, "AsyncApp", return_value=mock_app),
+        # This test stubs the entire SDK; real middleware has separate ingress tests.
+        patch.object(adapter, "_slack_self_event_filter", return_value=MagicMock()),
         patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client),
         patch.object(
             _slack_mod, "AsyncSocketModeHandler", return_value=socket_mode_handler
