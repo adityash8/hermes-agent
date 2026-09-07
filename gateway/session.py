@@ -216,8 +216,13 @@ def _slack_tools_loaded() -> bool:
     try:
         from hermes_cli.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
-        # include_default_mcp_servers defaults True so a default-enabled Slack MCP counts too.
-        return "slack" in _get_platform_tools(load_config(), "slack")
+        from tools.registry import registry
+        # Config alone is not a capability: a disabled/unloaded plugin can leave
+        # a saved toolset key behind. Require usable schemas in the active scope.
+        if "slack" not in _get_platform_tools(load_config(), "slack"):
+            return False
+        names = set(registry.get_tool_names_for_toolset("slack"))
+        return bool(names and registry.get_definitions(names, quiet=True))
     except Exception:
         return False
 
