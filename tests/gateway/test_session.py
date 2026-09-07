@@ -156,30 +156,57 @@ class TestBuildSessionContextPrompt:
         # Static pointer tells the agent where the volatile id actually lives.
         assert "provided per-turn in the incoming user message" in p1
 
-    def test_slack_prompt_no_tools_shows_disclaimer(self):
-        """Without slack toolset loaded, prompt must show the stale-API disclaimer."""
-        from unittest.mock import patch
-        config = GatewayConfig(
-            platforms={
-                Platform.SLACK: PlatformConfig(enabled=True, token="fake"),
-            },
-        )
-        source = SessionSource(
-            platform=Platform.SLACK,
-            chat_id="C123",
-            chat_name="general",
-            chat_type="group",
-            user_name="bob",
-        )
-        ctx = build_session_context(source, config)
-        with patch("gateway.session._slack_tools_loaded", return_value=False):
-            prompt = build_session_context_prompt(ctx)
+    @pytest.mark.parametrize("connector_available", [False, True], ids=["no-connector", "composio"])
+    def test_slack_fallback_discovery_requires_authorized_access(self, monkeypatch, connector_available):
+        """A generic connector is not direct capability or evidence of authorized Slack access."""
+        from agent.secret_scope import set_secret_scope, reset_secret_scope
+        from gateway.session import _slack_tools_loaded, _SLACK_NO_TOOLS_NOTE, _SLACK_TOOLS_NOTE
+        from tools import mcp_tool, registry as registry_module
+        from tools.mcp_tool_discovery import get_registered_mcp_server_names
+        from tools.mcp_tool_registration import _track_mcp_tool_server, _forget_mcp_tool_server
+        from tools.registry import ToolRegistry
 
-        assert "Slack" in prompt
-        assert "cannot search" in prompt.lower()
-        assert "pin" in prompt.lower()
-        assert "current message's slack block/attachment payload" in prompt.lower()
-        assert "you can" not in prompt.lower() or "you cannot" in prompt.lower()
+        isolated = ToolRegistry()
+        monkeypatch.setattr(registry_module, "registry", isolated)
+        monkeypatch.setattr(mcp_tool, "_mcp_tool_server_names", {})
+        name = "mcp-composio_COMPOSIO_SEARCH_TOOLS"
+        scope = set_secret_scope({"SLACK_BOT_TOKEN": ""})
+        try:
+            if connector_available:
+                isolated.register(
+                    name=name, toolset="mcp-composio",
+                    schema={"name": name, "description": "Offline discovery fixture",
+                            "parameters": {"type": "object", "properties": {}}},
+                    handler=lambda args, **kwargs: "{}", check_fn=lambda: True,
+                )
+                _track_mcp_tool_server(name, "composio")
+            assert get_registered_mcp_server_names() == ({"composio"} if connector_available else set())
+            assert bool(isolated.get_definitions({name}, quiet=True)) is connector_available
+            assert _slack_tools_loaded() is False
+            ctx = build_session_context(
+                SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="group"),
+                GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="fake")}),
+            )
+            prompt = build_session_context_prompt(ctx)
+            assert _SLACK_NO_TOOLS_NOTE in prompt and _SLACK_TOOLS_NOTE not in prompt
+            note = prompt.lower()
+            assert "no direct slack tool detected for this session" in note
+            assert "not proof authenticated access is unavailable" in note
+            assert "if connector/discovery tools are already available in this session" in note
+            assert "returned schemas" in note and "permitted read operation" in note
+            assert "supplied slack permalink" in note
+            assert "neither authorization nor successful access" in note
+            assert "account/workspace/target/operation" in note and "authorized tools" in note
+            assert "channel restrictions" in note and "personal oauth dm-only gates" in note
+            assert "send/mutation approvals" in note
+            assert "no broad access claims" in note
+            assert "do not enable disabled tools" in note and "raw-token/terminal api bypass" in note
+            assert "if no authorized route exists, state the exact limitation" in note
+            assert "current message's slack block/attachment payload" in note
+        finally:
+            _forget_mcp_tool_server(name)
+            reset_secret_scope(scope)
+        assert get_registered_mcp_server_names() == set()
 
 
     def test_slack_tools_loaded_detects_real_mcp_registration(self):

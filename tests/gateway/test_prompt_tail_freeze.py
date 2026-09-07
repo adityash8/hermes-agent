@@ -26,6 +26,7 @@ import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.session import (
+    _slack_tools_loaded,
     SessionContext,
     SessionSource,
     build_session_context_prompt,
@@ -192,6 +193,43 @@ class TestEphemeralChangeKeyParity:
         t3 = runner._pinned_session_context_prompt(_slack_ctx(), False, "sk-slack")  # noqa: SLF001
         assert t2 is t1 and t3 is t1
         assert hashlib.sha256(t1.encode()).hexdigest() == hashlib.sha256(t3.encode()).hexdigest()
+
+
+    def test_generic_connector_preserves_pin_and_new_session_uses_current_note(self, monkeypatch):
+        from agent.secret_scope import set_secret_scope, reset_secret_scope
+        from gateway import session
+        from tools import mcp_tool
+        from tools.mcp_tool_discovery import get_registered_mcp_server_names
+        from tools.mcp_tool_registration import _track_mcp_tool_server, _forget_mcp_tool_server
+
+        # Override the autouse stub: exercise the real gate and tracker together.
+        monkeypatch.setattr(session, "_slack_tools_loaded", _slack_tools_loaded)
+        monkeypatch.setattr(mcp_tool, "_mcp_tool_server_names", {})
+        runner = _make_runner()
+        ctx = _make_context(platform=Platform.SLACK, connected=[Platform.SLACK], home_channels={})
+        name = "mcp-composio_COMPOSIO_SEARCH_TOOLS"
+        scope = set_secret_scope({"SLACK_BOT_TOKEN": ""})
+        try:
+            assert get_registered_mcp_server_names() == set()
+            assert _slack_tools_loaded() is False
+            # Model a conversation pinned before the current note was installed.
+            with monkeypatch.context() as prior:
+                prior.setattr(session, "_SLACK_NO_TOOLS_NOTE", "Previously rendered Slack note.")
+                pinned = runner._pinned_session_context_prompt(ctx, False, "existing")
+            key = _key(runner, ctx)
+            _track_mcp_tool_server(name, "composio")
+            assert get_registered_mcp_server_names() == {"composio"}
+            assert _slack_tools_loaded() is False
+            assert _key(runner, ctx) == key
+            assert runner._pinned_session_context_prompt(ctx, False, "existing") is pinned
+            fresh = runner._pinned_session_context_prompt(ctx, False, "new")
+            assert fresh == _render(ctx) and fresh != pinned
+            assert session._SLACK_NO_TOOLS_NOTE in fresh
+            assert "no direct slack tool detected for this session" in fresh.lower()
+        finally:
+            _forget_mcp_tool_server(name)
+            reset_secret_scope(scope)
+        assert get_registered_mcp_server_names() == set()
 
 
 # ---------------------------------------------------------------------------
