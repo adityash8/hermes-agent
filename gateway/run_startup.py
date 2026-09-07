@@ -1343,15 +1343,17 @@ class GatewayStartupMixin:
             raise RuntimeError(f"platform '{platform_name}' is not active in this gateway")
         home = handoff_config.get_home_channel(platform)
         if not home or not home.chat_id:
+            sethome_cmd = "/jarvis sethome" if platform == Platform.SLACK else "/sethome"
             raise RuntimeError(
-                f"no home channel configured for {platform_name}; run /sethome on the desired chat first"
+                f"no home channel configured for {platform_name}; run {sethome_cmd} on the desired chat first"
             )
         home_chat_id = str(home.chat_id)
         # Fresh thread for the handoff's own scrollback; None when unsupported or creation failed.
         cli_title = row.get("title") or cli_session_id[:8]
+        agent_name = "Jarvis" if platform == Platform.SLACK else "Hermes"
         try:
             new_thread_id = await transport.adapter.create_handoff_thread(
-                home_chat_id, f"Hermes — {cli_title}",
+                home_chat_id, f"{agent_name} — {cli_title}",
             )
         except Exception as exc:
             logger.debug("Handoff: create_handoff_thread raised on %s: %s", platform_name, exc, exc_info=True)

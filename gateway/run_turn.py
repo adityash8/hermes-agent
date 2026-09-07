@@ -1290,11 +1290,12 @@ class GatewayTurnMixin:
                 if prof and prof != "default" and _lgc().get_home_channel(source.platform):
                     home_env = "set"
         if not home_env:
-            # Slack routes every command through the parent `/hermes`; bare `/sethome` would fail.
-            sethome_cmd = "/hermes sethome" if source.platform == Platform.SLACK else "/sethome"
+            # Slack routes every command through the parent `/jarvis`; bare `/sethome` would fail.
+            sethome_cmd = "/jarvis sethome" if source.platform == Platform.SLACK else "/sethome"
+            agent_name = "Jarvis" if source.platform == Platform.SLACK else "Hermes"
             await self._deliver_platform_notice(
                 source, f"📬 No home channel is set for {platform_name.title()}. "
-                f"A home channel is where Hermes delivers cron job results and cross-platform "
+                f"A home channel is where {agent_name} delivers cron job results and cross-platform "
                 f"messages.\n\nType {sethome_cmd} to make this chat your home channel, or ignore "
                 f"to skip.",
             )

@@ -421,6 +421,9 @@ class GatewayNotificationsMixin:
 
     async def _send_update_output(self, target: "_UpdateTarget", text: str) -> None:
         """Send buffered update output as fenced chunks that fit message limits (Telegram: 4096)."""
+        if target.platform == Platform.SLACK:
+            # Keep host logs out of Slack; send the result summary separately.
+            return
         from tools.ansi_strip import strip_ansi
         clean = strip_ansi(text).strip()
         if not clean:
@@ -474,6 +477,7 @@ class GatewayNotificationsMixin:
             await self._watch_update_completion_only(paths, deadline, poll_interval)
             return
         session_key = target.session_key
+        agent_name = "Jarvis" if target.platform == Platform.SLACK else "Hermes"
         bytes_sent = 0
         last_stream_time = loop.time()
         buffer = ""
@@ -499,8 +503,8 @@ class GatewayNotificationsMixin:
                 with _log_suppressed(logging.WARNING, "Update final notification failed: %s"):
                     exit_code = self._update_exit_code(paths)
                     await target.send(
-                        "✅ Hermes update finished." if exit_code == 0
-                        else "❌ Hermes update failed (exit code {}).".format(exit_code)
+                        f"✅ {agent_name} update finished." if exit_code == 0
+                        else f"❌ {agent_name} update failed (exit code {exit_code})."
                     )
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
                 self._clear_update_markers(paths, session_key)
@@ -527,7 +531,7 @@ class GatewayNotificationsMixin:
             paths.exit_code.write_text("124", encoding="utf-8")
             await _flush_buffer()
             with suppress(Exception):
-                await target.send("❌ Hermes update timed out after 30 minutes.")
+                await target.send(f"❌ {agent_name} update timed out after 30 minutes.")
             self._clear_update_markers(paths, session_key)
 
     async def _send_update_notification(self) -> bool:
@@ -567,6 +571,7 @@ class GatewayNotificationsMixin:
             exit_code = self._update_exit_code(paths)
             output = paths.output.read_bytes().decode("utf-8", errors="replace") if paths.output.exists() else ""
             platform = Platform(platform_str)
+            agent_name = "Jarvis" if platform == Platform.SLACK else "Hermes"
             adapter = self.adapters.get(platform)
             if chat_id and not adapter:
                 # Target platform not reconnected yet (common right after the update's restart): keep the
@@ -576,15 +581,20 @@ class GatewayNotificationsMixin:
                 metadata = self._pending_marker_metadata(platform, chat_id, pending, adapter)
                 from tools.ansi_strip import strip_ansi
                 output = strip_ansi(output).strip()
-                if output:
+                if platform == Platform.SLACK:
+                    msg = (
+                        "✅ Jarvis update finished successfully." if exit_code == 0 else
+                        "❌ Jarvis update failed. Ask an admin to check the gateway logs on the host."
+                    )
+                elif output:
                     if len(output) > 3500:
                         output = "…" + output[-3500:]
-                    status = "✅ Hermes update finished." if exit_code == 0 else "❌ Hermes update failed."
+                    status = f"✅ {agent_name} update finished." if exit_code == 0 else f"❌ {agent_name} update failed."
                     msg = f"{status}\n\n```\n{output}\n```"
                 else:
                     msg = (
-                        "✅ Hermes update finished successfully." if exit_code == 0 else
-                        "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
+                        f"✅ {agent_name} update finished successfully." if exit_code == 0 else
+                        f"❌ {agent_name} update failed. Check the gateway logs or run `hermes update` manually for details."
                     )
                 await adapter.send(chat_id, msg, metadata=_non_conversational_metadata(metadata, platform=platform))
                 logger.info("Sent post-update notification to %s:%s (exit=%s)", platform_str, chat_id, exit_code)
@@ -692,8 +702,9 @@ class GatewayNotificationsMixin:
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
         for platform, platform_cfg, home, transport in self._home_channel_transports():
+            agent_name = "Jarvis" if platform == Platform.SLACK else "Hermes"
+            message = f"♻️ Gateway online — {agent_name} is back and ready."
             if not platform_cfg.gateway_restart_notification:
                 logger.info(
                     "Home-channel startup notification suppressed: %s has gateway_restart_notification=false",

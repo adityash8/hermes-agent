@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from hermes_cli.commands import (
-    COMMAND_REGISTRY, _is_gateway_available, _iter_plugin_command_entries, _resolve_config_gates)
+    COMMAND_REGISTRY, CommandDef, _is_gateway_available, _iter_plugin_command_entries, _resolve_config_gates)
 
 # Logger name parity with the origin module (tests capture "hermes_cli.commands").
 logger = logging.getLogger("hermes_cli.commands")
@@ -360,7 +360,7 @@ _SLACK_RESERVED_COMMANDS = frozenset({
     "me", "status", "away", "dnd", "shrug", "remind", "msg", "feed", "who", "collapse", "expand",
     "leave", "join", "open", "search", "topic", "mute", "pro", "shortcuts"})
 
-# Canonical commands deliberately routed through ``/hermes <command>`` on Slack only: the registry
+# Canonical commands deliberately routed through ``/jarvis <command>`` on Slack only: the registry
 # sits at Slack's 50-slash cap, so rather than let the clamp silently drop whichever command sorts
 # last (breaking the Telegram-parity test), low-frequency ones are demoted here. Rule: when a new
 # canonical command tips past the cap, demote a rarer one-off lookup (version, whoami, diff, ...)
@@ -376,20 +376,51 @@ def _sanitize_slack_name(raw: str) -> str:
     return _SLACK_INVALID_CHARS.sub("", raw.lower()).strip("-_")[:_SLACK_NAME_LIMIT]
 
 
+_SLACK_COMMAND_DESCRIPTIONS = {
+    "plan": "Write a Jarvis implementation plan without executing anything",
+    "snapshot": "Create or restore state snapshots of Jarvis config/state",
+    "goal": "Set a standing goal Jarvis works on across turns until achieved",
+    "busy": "Control how messages behave while Jarvis is working",
+    "reload-skills": "Refresh Jarvis skills after installs or removals",
+    "update": "Update Jarvis to the latest version",
+    "version": "Show Jarvis version",
+}
+
+
+def slack_command_description(command: CommandDef) -> str:
+    """Slack-owned built-in copy; never rewrite plugin descriptions or embedded paths."""
+    return _SLACK_COMMAND_DESCRIPTIONS.get(command.name, command.description)
+
+
+def slack_gateway_help_lines() -> list[str]:
+    """Render app-owned help before any skill or assistant content is appended."""
+    lines: list[str] = []
+    for cmd in _gateway_available_commands():
+        args = f" {cmd.args_hint}" if cmd.args_hint else ""
+        alias_parts = [f"`/jarvis {alias}`" for alias in cmd.aliases
+                       if not (alias.replace("-", "_") == cmd.name.replace("-", "_")
+                               and alias != cmd.name)]
+        alias_note = f" (alias: {', '.join(alias_parts)})" if alias_parts else ""
+        lines.append(f"`/jarvis {cmd.name}{args}` -- {slack_command_description(cmd)}{alias_note}")
+    return lines
+
+
 def slack_native_slashes() -> list[tuple[str, str, str]]:
     """(slash_name, description, usage_hint) triples for Slack: every gateway-available command
     (canonical names first so they win slots at the cap, then aliases, then plugins) becomes a
     standalone slash, deduped and clamped to the 50-command cap; Slack built-ins and
-    _SLACK_VIA_HERMES_ONLY are skipped. ``/hermes`` is always first for anything dropped."""
+    _SLACK_VIA_HERMES_ONLY are skipped. ``/jarvis`` is always first for anything dropped."""
     available = _gateway_available_commands()
-    wanted = [(cmd.name, cmd.description, cmd.args_hint or "") for cmd in available]
-    wanted += [(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+    wanted = [(cmd.name, slack_command_description(cmd), cmd.args_hint or "")
+              for cmd in available]
+    wanted += [(alias, f"Alias for /{cmd.name} — {slack_command_description(cmd)}", cmd.args_hint or "")
                for cmd in available for alias in cmd.aliases]
     wanted += [(name, desc, hint or "") for name, desc, hint in _iter_plugin_command_entries()]
 
     entries: list[tuple[str, str, str]] = [
-        ("hermes", "Talk to Hermes or run a subcommand", "[subcommand] [args]")]
-    seen = {"hermes"}
+        ("jarvis", "Talk to Jarvis or run a subcommand", "[subcommand] [args]")]
+    # Keep the old inbound entry point unavailable to plugins, but do not advertise it.
+    seen = {"jarvis", "hermes"}
     for name, desc, hint in wanted:
         slack_name = _sanitize_slack_name(name)
         if (not slack_name or slack_name in seen or slack_name in _SLACK_RESERVED_COMMANDS
@@ -417,7 +448,7 @@ def slack_app_manifest(
 
 
 def slack_subcommand_map() -> dict[str, str]:
-    """name/alias -> "/command" for the Slack ``/hermes`` handler, plugin commands included."""
+    """name/alias -> "/command" for the Slack ``/jarvis`` handler, plugin commands included."""
     mapping: dict[str, str] = {
         name: f"/{name}"
         for cmd in _gateway_available_commands() for name in (cmd.name, *cmd.aliases)}

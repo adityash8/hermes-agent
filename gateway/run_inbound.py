@@ -244,6 +244,12 @@ class GatewayInboundMixin:
             getattr(getattr(source, "platform", None), "value", "unknown"),
             getattr(source, "chat_id", None) or "unknown",
         )
+        if source.platform == Platform.SLACK and _paused_notice.startswith("⏸️ Hermes is paused"):
+            detail = _paused_notice.removeprefix("⏸️ Hermes is paused")
+            suffix = ". New work is on hold; run `hermes resume` to pick things back up."
+            if detail.endswith(suffix):
+                detail = detail.removesuffix(suffix) + ". Ask an admin to resume Jarvis on the host."
+            return "⏸️ Jarvis is paused" + detail
         return _paused_notice
 
     @staticmethod

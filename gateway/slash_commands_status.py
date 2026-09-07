@@ -233,7 +233,8 @@ class GatewayStatusCommandsMixin:
         )
 
         stamp = "%Y-%m-%d %H:%M"
-        lines = [t("gateway.status.header"), "",
+        header = "📊 **Jarvis Gateway Status**" if source.platform == Platform.SLACK else t("gateway.status.header")
+        lines = [header, "",
                  t("gateway.status.session_id", session_id=session_entry.session_id)]
         if title:
             lines.append(t("gateway.status.title", title=title))

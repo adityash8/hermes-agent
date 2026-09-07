@@ -236,7 +236,7 @@ async def test_relay_fronted_logical_home_gets_startup_notification(tmp_path, mo
     assert relay.send_for_platform.await_args.args[:3] == (
         Platform.SLACK,
         "D123",
-        "♻️ Gateway online — Hermes is back and ready.",
+        "♻️ Gateway online — Jarvis is back and ready.",
     )
     assert relay.send_for_platform.await_args.kwargs["metadata"]["user_id"] == "U123"
     assert relay.send_for_platform.await_args.kwargs["metadata"]["scope_id"] == "T123"

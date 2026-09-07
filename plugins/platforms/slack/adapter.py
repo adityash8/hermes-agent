@@ -1480,16 +1480,17 @@ class SlackAdapter(BasePlatformAdapter):
         # ALSO be declared in the app manifest (`hermes slack manifest`): Socket Mode won't
         # deliver undeclared commands at all.
         from hermes_cli.commands_platforms import slack_native_slashes
-        _slash_names = [name for name, _d, _h in slack_native_slashes()]
-        if _slash_names:
-            _slash_pattern = re.compile(
-                r"^/(?:" + "|".join(re.escape(n) for n in _slash_names) + r")$")
-        else:  # pragma: no cover - registry always non-empty
-            _slash_pattern = re.compile(r"^/hermes$")
+        # Keep the old umbrella inbound-only, including when the registry is empty.
+        _slash_names = dict.fromkeys(
+            ["jarvis", "hermes", *(name for name, _d, _h in slack_native_slashes())])
+        _slash_pattern = re.compile(
+            r"^/(?:" + "|".join(re.escape(n) for n in _slash_names) + r")$")
 
         @self._app.command(_slash_pattern)
         async def handle_hermes_command(ack, command):
             slash = (command.get("command") or "").lstrip("/")
+            if slash == "hermes":
+                slash = "jarvis"
             await ack(response_type="ephemeral", text=f"Running `/{slash}`…")
             await self._handle_slash_command(command)
 
@@ -1692,7 +1693,7 @@ class SlackAdapter(BasePlatformAdapter):
             client = self._get_client(parent_chat_id)
             if client is None:
                 return None
-            seed_text = f":thread: Hermes handoff — *{(name or 'session').strip()[:80]}*"
+            seed_text = f":thread: Jarvis handoff — *{(name or 'session').strip()[:80]}*"
             result = await client.chat_postMessage(channel=parent_chat_id, text=seed_text)
             ts = _slack_response_payload(result).get("ts")
             return str(ts) if ts else None
@@ -1862,7 +1863,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._metadata_team_id(metadata), chat_id, str(thread_ts))
 
     async def send_native_task_card_progress(
-        self, chat_id: str, tasks: List[Dict[str, str]], *, title: str = "Hermes is working",
+        self, chat_id: str, tasks: List[Dict[str, str]], *, title: str = "Jarvis is working",
         reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
         fallback_text: Optional[str] = None) -> SendResult:
         """Start or update a Slack-native plan/task progress stream."""
@@ -5213,7 +5214,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _handle_slash_command(self, command: dict) -> None:
         """Slash commands: native ``/<command> [args]`` for every COMMAND_REGISTRY entry, or
-        ``/hermes <subcommand> [args]``; other text after ``/hermes`` is a regular message."""
+        ``/jarvis <subcommand> [args]``; other text is a regular message. ``/hermes`` is an alias."""
         user_id = command.get("user_id", "")
         channel_id = command.get("channel_id", "")
         team_id = command.get("team_id", "")
@@ -5235,7 +5236,7 @@ class SlackAdapter(BasePlatformAdapter):
             message_type=(MessageType.COMMAND if text.startswith("/") else MessageType.TEXT),
             source=source, raw_message=command)
         # Stash response_url so the first reply for this channel+user goes ephemeral. COMMAND
-        # events only: free-form "/hermes <question>" replies must stay public.
+        # events only: free-form "/jarvis <question>" replies must stay public.
         response_url = command.get("response_url", "")
         if response_url and user_id and channel_id and text.startswith("/"):
             self._stash_slash_context(team_id, channel_id, user_id, response_url)
@@ -5250,11 +5251,11 @@ class SlackAdapter(BasePlatformAdapter):
     @staticmethod
     def _slash_command_text(command: dict) -> str:
         """Gateway message text for a slash payload. Native slashes keep Slack's raw argument
-        payload verbatim (internal/trailing spacing). ``/hermes`` (or a missing ``command``) maps
-        ``<subcommand> [args]`` via the registry, else free-form text is a regular question."""
+        payload verbatim (internal/trailing spacing). ``/jarvis``, legacy ``/hermes`` or a missing
+        ``command`` maps ``<subcommand> [args]`` via the registry; other text is a regular question."""
         slash_name = (command.get("command") or "").lstrip("/").strip()
         raw_text = str(command.get("text") or "")
-        if slash_name not in {"hermes", ""}:
+        if slash_name not in {"jarvis", "hermes", ""}:
             return f"/{slash_name}" if not raw_text else f"/{slash_name} {raw_text}"
         legacy_text = raw_text.strip()
         from hermes_cli.commands_platforms import slack_subcommand_map
@@ -5919,7 +5920,7 @@ _SETUP_STEPS = (
     "   3. Install to Workspace: Settings → Install App",
     "   4. After installing, invite the bot to channels: /invite @YourBot",)
 _SETUP_HOME_CHANNEL_HELP = (
-    "📬 Home Channel: where Hermes delivers cron job results,",
+    "📬 Home Channel: where Jarvis delivers cron job results,",
     "   cross-platform messages, and notifications.",
     "   To get a channel ID: open the channel in Slack, then right-click",
     "   the channel name → Copy link — the ID starts with C (e.g. C01ABC2DE3F).",
@@ -5933,7 +5934,7 @@ def _write_slack_manifest_and_instruct() -> None:
         from hermes_cli.slack_cli import _build_full_manifest
         from hermes_constants import get_hermes_home
         manifest = _build_full_manifest(
-            bot_name="Hermes", bot_description="Your Hermes agent on Slack")
+            bot_name="Jarvis", bot_description="Your Jarvis agent on Slack")
         target = _Path(get_hermes_home()) / "slack-manifest.json"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(
@@ -5945,7 +5946,7 @@ def _write_slack_manifest_and_instruct() -> None:
             "reinstall if scopes or slash commands changed.")
         print_info(
             "   Re-run `hermes slack manifest --write` anytime to refresh after "
-            "Hermes adds new commands.")
+            "Jarvis adds new commands.")
     except Exception as e:
         print_warning(f"Could not write Slack manifest: {e}")
 

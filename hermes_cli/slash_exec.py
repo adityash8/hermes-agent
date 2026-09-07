@@ -105,7 +105,9 @@ def _exec_help(ctx: CommandContext) -> CommandReply:
     """Core gateway /help body (pre platform mention decoration)."""
     from agent.i18n import t
     from hermes_cli.commands import gateway_help_lines
-    lines = [t("gateway.help.header"), *gateway_help_lines()]
+    help_lines = ctx.options.get("help_lines")
+    lines = [ctx.options.get("help_header", t("gateway.help.header")),
+             *(gateway_help_lines() if help_lines is None else help_lines)]
     skill_cmds = _skill_commands()
     try:
         if skill_cmds:
@@ -132,7 +134,8 @@ def _exec_commands(ctx: CommandContext) -> CommandReply:
     except ValueError:
         return CommandReply(t("gateway.commands.usage"), format="markdown")
 
-    entries = list(gateway_help_lines())
+    help_lines = ctx.options.get("help_lines")
+    entries = list(gateway_help_lines() if help_lines is None else help_lines)
     skill_cmds = _skill_commands()
     try:
         if skill_cmds:

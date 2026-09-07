@@ -488,6 +488,8 @@ class GatewaySlashCommandsMixin(
             if paused:
                 return f"{name} is already paused."
             self._pause_failed_platform(platform, reason="paused via /platform pause")
+            if event.source.platform == Platform.SLACK:
+                return f"✓ {name} paused. Resume with `/jarvis platform resume {name}` or `/jarvis restart` to reset."
             return f"✓ {name} paused. Resume with `/platform resume {name}` or `hermes gateway restart` to reset."
         if not queued:
             return f"{name} is not in the retry queue — nothing to resume."
@@ -558,16 +560,28 @@ class GatewaySlashCommandsMixin(
 
     async def _handle_version_command(self, event: MessageEvent) -> str:
         """Handle /version — show the running Hermes Agent version."""
-        return _execute("version").text
+        label = _execute("version").text
+        if event.source.platform == Platform.SLACK and label.startswith("Hermes Agent v"):
+            return "Jarvis" + label.removeprefix("Hermes Agent")
+        return label
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
-        return self._telegramized_command_reply(event, _execute("help").text)
+        options = {}
+        if event.source.platform == Platform.SLACK:
+            from hermes_cli.commands_platforms import slack_gateway_help_lines
+            options = {"help_header": "📖 **Jarvis Commands**\n",
+                       "help_lines": slack_gateway_help_lines()}
+        return self._telegramized_command_reply(event, _execute("help", options=options).text)
 
     async def _handle_commands_command(self, event: MessageEvent) -> str:
         # Page size is a surface parameter (Telegram messages are shorter).
         page_size = 15 if event.source.platform == Platform.TELEGRAM else 20
-        reply = _execute("commands", args=event.get_command_args(), options={"page_size": page_size})
+        options: dict[str, object] = {"page_size": page_size}
+        if event.source.platform == Platform.SLACK:
+            from hermes_cli.commands_platforms import slack_gateway_help_lines
+            options["help_lines"] = slack_gateway_help_lines()
+        reply = _execute("commands", args=event.get_command_args(), options=options)
         return self._telegramized_command_reply(event, reply.text)
 
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
@@ -954,8 +968,12 @@ class GatewaySlashCommandsMixin(
         adapter = self._adapter_for_source(event.source)
         if adapter is not None:
             adapter._busy_text_mode = self._effective_busy_text_mode(event.source)
+        description = _BUSY_MODE_BEHAVIOR[arg][1]
+        if event.source.platform == Platform.SLACK:
+            # Only the fixed mode description is branded, never message content.
+            description = description.replace("Hermes", "Jarvis")
         return EphemeralReply(
-            f"Busy input mode set to **`{arg}`** (saved).\n_{_BUSY_MODE_BEHAVIOR[arg][1]}_")
+            f"Busy input mode set to **`{arg}`** (saved).\n_{description}_")
 
     async def _handle_footer_command(self, event: MessageEvent) -> str:
         """Handle /footer command — toggle the runtime-metadata footer."""
@@ -1102,6 +1120,8 @@ class GatewaySlashCommandsMixin(
             return reply.text
         bundles = reply.data["bundles"]
         if not bundles:
+            if event.source.platform == Platform.SLACK:
+                return "No skill bundles installed. Ask an admin to create Jarvis skill bundles on the host."
             return ("No skill bundles installed.\nCreate one on the host with:\n"
                     "  `hermes bundles create <name> --skill <s1> --skill <s2>`\n"
                     f"Directory: `{reply.data['dir']}`")
@@ -1214,11 +1234,14 @@ class GatewaySlashCommandsMixin(
             except Exception:
                 return t("gateway.update.platform_not_messaging")
         if is_managed():
-            return f"✗ {format_managed_message('update Hermes Agent')}"
+            action = "update Jarvis" if src.platform == Platform.SLACK else "update Hermes Agent"
+            return f"✗ {format_managed_message(action)}"
         if not (Path(__file__).parent.parent.resolve() / '.git').exists():
             return t("gateway.update.not_git_repo")
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
+            if src.platform == Platform.SLACK:
+                return "Jarvis is running, but its update launcher is unavailable. Ask an admin to repair it on the host."
             return t("gateway.update.hermes_cmd_not_found")
         pending_path = _hermes_home / ".update_pending.json"
         output_path = _hermes_home / ".update_output.txt"
@@ -1239,7 +1262,8 @@ class GatewaySlashCommandsMixin(
             exit_code_path.unlink(missing_ok=True)
             return t("gateway.update.start_failed", error=e)
         self._schedule_update_notification_watch()
-        return t("gateway.update.starting")
+        notice = t("gateway.update.starting")
+        return notice.replace("Hermes", "Jarvis") if src.platform == Platform.SLACK else notice
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
