@@ -127,7 +127,8 @@ def review(manifest: str, candidate_root: str, decisions: str, output: str) -> N
         "sources": list(registry.sources.values()), "routes": list(registry.routes.values()),
         "owner_private": list(registry.owners.values())})
     if registry.analytics:
-        refreshed["analytics"] = [asdict(grant) for grant in registry.analytics]
+        refreshed["analytics"] = [grant.to_manifest() if hasattr(grant, "to_manifest") else asdict(grant)
+                                  for grant in registry.analytics]
     for record in refreshed["sources"]:
         sid = record["id"]
         if sid not in by_id:

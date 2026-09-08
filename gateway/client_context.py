@@ -391,8 +391,10 @@ async def handle_ingress(runner, event):
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("validate", "render", "answer"))
+    parser.add_argument("command", choices=("validate", "capabilities", "render", "answer"))
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--allow-tool", action="append")
+    parser.add_argument("--effective-toolset", action="append")
     parser.add_argument("--workspace")
     parser.add_argument("--channel")
     parser.add_argument("--user")
@@ -406,6 +408,11 @@ def main(argv: list[str] | None = None) -> int:
         from gateway.session import SessionSource
 
         registry = load_registry(args.manifest)
+        if args.command == "capabilities":
+            from gateway.client_context_reads import capability_report
+
+            print(json.dumps(capability_report(registry, args.allow_tool, args.effective_toolset)))
+            return 0
         if args.command == "validate":
             for route in registry.routes.values():
                 source = SessionSource(Platform.SLACK, route["chat_id"], scope_id=route["scope_id"], user_id="operator", chat_type="channel")

@@ -12,13 +12,14 @@ from dataclasses import dataclass
 
 from gateway import client_context as cc
 from gateway import client_context_analytics as analytics
+from gateway import client_context_reads as reads
 from gateway.client_context_policy import (
     MAX_PACKET, ContextChanged, _reject_json_constant, _unique_object, fields, load_registry,
     require, revalidate,
 )
 
 CAPABILITIES = {"scoped_source_read": "file", "scoped_history_read": "session_search",
-                analytics.TOOL: "web"}
+                analytics.TOOL: "web", **{name: "web" for name in reads.VENDORS}}
 MAX_ROUNDS = 4
 MAX_CALLS = 8
 MAX_HISTORY = 4
@@ -99,6 +100,9 @@ class ReadSurface:
         for name in self.names:
             if name == analytics.TOOL:
                 tools.extend(analytics.schemas(self.analytics_grants))
+                continue
+            if name in reads.VENDORS:
+                tools.extend(reads.schemas(self.analytics_grants, name))
                 continue
             records = self.history if name == "scoped_history_read" else self.records
             props = {key: {"type": "string", "enum": [value]}
@@ -242,6 +246,10 @@ async def run_scoped_turn(runner, event, source, key, generation, opts):
                         require(function["name"] in surface.valid_tool_names)
                         result = await asyncio.to_thread(analytics.execute, surface.analytics_grants,
                                                          function["arguments"], before_request)
+                    elif function["name"] in reads.VENDORS:
+                        require(function["name"] in surface.valid_tool_names)
+                        result = await asyncio.to_thread(reads.execute, surface.analytics_grants,
+                                                         function["name"], function["arguments"], before_request)
                     else:
                         result = await asyncio.to_thread(surface.execute, function["name"], function["arguments"])
                     await validate()

@@ -1,5 +1,18 @@
 # Scoped client context implementation
 
+## EZ-831 complete local acceptance (2026-09-08)
+
+All eight named platforms now have fixed, identity-bound read operations: GA4,
+Meta, Mixpanel, Tableau, PostHog, Stripe, Search Console and Google Ads. Cross-channel
+approved source/decision retrieval, superseded records, reviewed source refresh and
+owner tool preservation are covered end to end with synthetic transports.
+
+See [complete capability matrix, operator command, deployment prerequisites and
+verification evidence](ez831-completion-verification.md) for the current contract.
+The offline command is `python -m gateway.client_context capabilities --manifest ABS_PATH`.
+No live credentials, reports, configuration, source grants or services were changed.
+The GA4-only section below records the earlier increment and is historical.
+
 ## EZ-831 bounded GA4 extension (2026-09-08)
 
 Implemented in the isolated continuation worktree. **Live activation remains gated.**

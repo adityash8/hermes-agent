@@ -66,8 +66,13 @@ class AnalyticsGrant:
 
 def parse_grants(raw, routes):
     """Validate all bindings before any source bytes or provider input is read."""
-    grants, seen, properties, credentials = [], set(), {}, {}
-    for entry in items(raw, 64):
+    from gateway import client_context_reads as reads
+
+    entries = items(raw, 64)
+    require(all(isinstance(e, dict) and isinstance(e.get("operation"), str) for e in entries))
+    other = reads.parse_grants([e for e in entries if e["operation"] != TOOL], routes)
+    grants, seen, properties, credentials = [], {g.id for g in other}, {}, {}
+    for entry in (e for e in entries if e["operation"] == TOOL):
         fields(entry, GRANT_FIELDS)
         for key in ("id", "scope_id", "chat_id", "client"):
             identifier(entry[key])
@@ -101,7 +106,7 @@ def parse_grants(raw, routes):
             require(key not in mapping or mapping[key] == owner)
             mapping[key] = owner
         grants.append(AnalyticsGrant(**entry))
-    return tuple(grants)
+    return tuple(grants) + other
 
 
 def route_grants(registry, source, now=None):
@@ -114,6 +119,7 @@ def route_grants(registry, source, now=None):
 
 
 def schemas(grants):
+    grants = tuple(g for g in grants if g.operation == TOOL)
     if not grants:
         return []
     # anyOf preserves grant/account correlations, unlike independently merged enums.
