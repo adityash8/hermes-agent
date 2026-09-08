@@ -109,6 +109,7 @@ class TextAdapter(BasePlatformAdapter):
 def runner(corpus, monkeypatch):
     obj = object.__new__(GatewayRunner)
     obj.config = GatewayConfig(client_context=copy.deepcopy(corpus.setting))
+    obj.session_store = Mock()
     obj._session_key_for_source = lambda s: f"{s.scope_id}:{s.chat_id}:{s.thread_id}"
     obj._is_user_authorized_for_source = Mock(return_value=True)
     obj._claim_active_session_slot = Mock(return_value=(None, None))
@@ -900,12 +901,47 @@ async def test_owner_relay_retains_prompt_and_media_path(native_owner, runner, p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("denial", ["unknown", "missing-workspace", "revoked", "unauthorized", "unbound"])
+async def test_denied_relay_cannot_poison_reply_or_replay_state(runner, corpus, denial):
+    from gateway.relay.adapter import RelayAdapter
+
+    adapter = object.__new__(RelayAdapter)
+    runner._wire_adapter_handlers(adapter, authorization_check=lambda *a: True)
+    adapter._seen_inbound = {}
+    caches = ("_platform_by_chat", "_dm_user_by_chat", "_scope_by_chat",
+              "_chat_type_by_chat", "_last_inbound_ts_by_chat")
+    for name in caches:
+        setattr(adapter, name, {"channel-a": "original-trusted-value"})
+    before = {name: dict(getattr(adapter, name)) for name in caches}
+    adapter._stamp_slack_session_thread = Mock()
+    adapter._localize_inbound_media = adapter._consume_prompt_response = forbidden
+    adapter.handle_message = AsyncMock()
+    trigger = event(user_id="unexpected-recipient")
+    if denial == "unknown":
+        trigger.source.scope_id = "unregistered-workspace"
+    elif denial == "missing-workspace":
+        trigger.source.scope_id = None
+    elif denial == "revoked":
+        corpus.raw["routes"] = []
+        corpus.save()
+    elif denial == "unauthorized":
+        runner._is_user_authorized_for_source.return_value = False
+    else:
+        adapter._client_context_admission = None
+    await adapter._on_inbound(trigger)
+    assert {name: getattr(adapter, name) for name in caches} == before
+    assert adapter._seen_inbound == {}
+    adapter._stamp_slack_session_thread.assert_not_called()
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("question_type", ["text", "attachment", "prompt"])
 async def test_real_relay_ingress_never_downloads_or_resolves_prompts(runner, wire, question_type):
     from gateway.relay.adapter import RelayAdapter
 
     adapter = object.__new__(RelayAdapter)
-    adapter.client_context_enabled = True
+    runner._wire_adapter_handlers(adapter, authorization_check=lambda *a: True)
     adapter._seen_inbound = {}
     adapter._capture_scope = adapter._stamp_slack_session_thread = lambda e: None
     adapter._localize_inbound_media = adapter._consume_prompt_response = forbidden

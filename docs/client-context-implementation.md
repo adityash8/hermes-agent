@@ -229,3 +229,16 @@ parent's measured byte size, not its private contents. No live human-authored Sl
 round trip, production activation, full repository suite or static type-check pass
 is claimed. Parent must include the new native helper when packaging the existing
 uncommitted implementation.
+
+## Parent final review repair
+
+Independent review found relay reply-routing caches and replay state changed before
+admission. Admission now runs first; denied, revoked, missing-identity, unauthorized,
+and unwired events return before either mutation. Five behavioral tests retain the
+real `_capture_scope` implementation and assert existing recipient caches and replay
+state remain unchanged. The scoped relay test now wires the real runner callback.
+
+Parent canonical union after repair: **747 passed, 0 failed, 1 skipped across 30 files**,
+including 131 scoped tests. This is targeted regression acceptance, not the full suite.
+Parent separately exercised actual Codewords/CookUnity local records through the real
+OpenAI Codex provider with synthetic identities; no live Slack round trip is claimed.
