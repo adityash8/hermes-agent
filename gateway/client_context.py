@@ -410,7 +410,9 @@ def main(argv: list[str] | None = None) -> int:
             for route in registry.routes.values():
                 source = SessionSource(Platform.SLACK, route["chat_id"], scope_id=route["scope_id"], user_id="operator", chat_type="channel")
                 snapshot(registry, source, "validate sources")
-            print(json.dumps({"valid": True, "routes": len(registry.routes), "sources": len(registry.sources)}))
+            print(json.dumps({"valid": True, "routes": len(registry.routes), "sources": len(registry.sources),
+                              "approved_analytics_grants": sum(g.status == "approved" for g in registry.analytics),
+                              "analytics_credentials_checked": False, "activation": "not_performed"}))
             return 0
         source = SessionSource(Platform.SLACK, args.channel, scope_id=args.workspace, user_id=args.user, chat_type=args.chat_type)
         evidence = snapshot(registry, source, args.question)

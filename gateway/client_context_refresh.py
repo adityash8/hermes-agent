@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -125,6 +126,8 @@ def review(manifest: str, candidate_root: str, decisions: str, output: str) -> N
     refreshed = copy.deepcopy({"version": 1, "root": candidate_root,
         "sources": list(registry.sources.values()), "routes": list(registry.routes.values()),
         "owner_private": list(registry.owners.values())})
+    if registry.analytics:
+        refreshed["analytics"] = [asdict(grant) for grant in registry.analytics]
     for record in refreshed["sources"]:
         sid = record["id"]
         if sid not in by_id:

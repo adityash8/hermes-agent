@@ -1,5 +1,191 @@
 # Scoped client context implementation
 
+## EZ-831 bounded GA4 extension (2026-09-08)
+
+Implemented in the isolated continuation worktree. **Live activation remains gated.**
+No live credentials, customer records, configuration, grants, services, live checkout,
+Slack messages, deployments or upstream changes were accessed or modified.
+[Verification receipt](ez831-verification.md) contains the exact local test commands.
+The EZ-826 material below is historical baseline documentation.
+
+### Capability matrix
+
+| Protected-turn capability | Status | Exact scope |
+|---|---|---|
+| `scoped_source_read` | Preserved | Current explicit hash-bound source grants only |
+| `scoped_history_read` | Preserved | Explicit approved decision records and bounded scoped conversation history |
+| `scoped_ga4_daily_report` | Implemented, synthetic execution verified | GA4 ordinary property; date dimension; `sessions`, `activeUsers`, `screenPageViews` |
+| GA4 Admin property lookup | Executor-only | Identity verification before and after reporting; no model-facing account discovery |
+| Google Ads, Search Console, Meta Ads, Mixpanel, Amplitude, PostHog, BigQuery | Unsupported | No scoped executors for these services |
+| Arbitrary GA4 reports, real-time, event/user details, segments, dimensions, filters, exports | Unsupported | No schema or dispatch path |
+| General Jarvis tools, MCP tools, browser, terminal, files outside grants, global memory/history | Unsupported in protected turns | Owner/unprotected paths retain existing behavior |
+| Source/grant promotion, writes, live activation | Unsupported | Operator review and separate parent-owned activation required |
+
+The current client requirements are Codewords and CookUnity. Both can use this
+same connector **only if** the operator supplies a separately reviewed GA4
+account/property/route binding and an authorized credential. No real account IDs,
+GA4 availability, credentials, or remote results for either client were checked.
+This increment does not restore every general analytics or Jarvis capability.
+
+### Account-bound execution
+
+`gateway/client_context_analytics.py` adds one fixed executor using the installed
+`httpx` dependency. Research found no existing GA4/GSC/Ads execution helper to
+reuse. The existing Microsoft Graph client demonstrates transport injection and
+executor-side bearer credentials, but its arbitrary URLs, write methods and
+pagination are incompatible with this boundary. Mixpanel/Amplitude MCP catalog
+entries do not provide account/client/audience isolation. No global registration,
+MCP discovery, generic dispatch or AIAgent fallback was added. Official Hermes
+[toolsets](https://hermes-agent.nousresearch.com/docs/reference/toolsets-reference)
+and [MCP documentation](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp/)
+are the permission-model references.
+
+The operation is exposed only through the intersection of:
+
+1. An unexpired approved analytics manifest grant matching the exact authenticated
+   workspace/channel and route client/audience.
+2. `read_tools.allow` containing `scoped_ga4_daily_report` with a valid generation.
+3. The existing source-effective **`web`** toolset, intersected with platform base
+   permissions, channel override and disabled toolsets. `web` alone grants nothing.
+
+The model provides an exact grant/account/property/client/audience echo and two
+absolute dates. Immutable executor bindings determine the HTTP resource and secret
+slot. Independent enums are not combined across accounts; multiple grants use
+complete per-grant schema alternatives. Unknown arguments, duplicate JSON keys,
+SQL, URLs, paths, tool names, write methods, pagination, filters and arbitrary
+metrics reject before any analytics I/O. The date window is visible in the schema.
+
+Each execution performs these exact requests, without retries or redirects:
+
+```text
+GET  https://analyticsadmin.googleapis.com/v1beta/properties/{bound_property_id}
+POST https://analyticsdata.googleapis.com/v1beta/properties/{bound_property_id}:runReport
+GET  https://analyticsadmin.googleapis.com/v1beta/properties/{bound_property_id}
+```
+
+The sole POST is Google's read-only
+[`runReport`](https://developers.google.com/analytics/devguides/reporting/data/v1/rest/v1beta/properties/runReport)
+RPC. Its fixed body specifies `date`, the three metrics above, `limit: "31"`, and
+one date range. Dates cover at most 31 completed days inside an operator-approved
+window of at most 366 days. No request-body property override or next-page request
+is accepted. Daily `activeUsers` must not be summed as distinct users for a period.
+
+Both Admin responses must identify the bound property, account and parent account,
+ordinary property type, configured timezone and no deletion/expiry marker.
+[Google's property schema](https://developers.google.com/analytics/devguides/config/admin/v1/rest/v1beta/properties)
+is authoritative. Display names and all other Admin fields are discarded.
+`runReport` does **not** echo account/property identity. Fixed authenticated Google
+routing plus the two Admin checks is the account assurance; it is not independent
+cryptographic proof that report data originated in that account. An incorrectly
+approved operator binding or a dishonest provider remains a trust limitation.
+
+Report validation accepts only the expected kind, exact metric/dimension headers,
+integer metrics, unique in-window dates, complete row-count agreement, and the
+configured timezone. Unexpected metadata, sampling, active restrictions,
+thresholding or data loss deny; malformed types, nonfinite/negative/text metrics,
+oversized responses and HTTP errors deny. Empty reports can return zero rows;
+missing dates are not fabricated as zero. Returned currency codes, if present, are
+validated but not exposed because no monetary metric is supported. See
+[response metadata](https://developers.google.com/analytics/devguides/reporting/data/v1/rest/v1beta/ResponseMetaData).
+
+HTTP uses TLS verification, fixed Google origins, `trust_env=False`, five-second
+network timeouts, no redirects, and at most 65,536 response bytes per request.
+Compressed responses are rejected. Grant/config/source/run-generation checks run
+before/after each HTTP exchange and on every received chunk, then before provider
+continuation and final release. Existing 30-second turn, four-round, eight-call,
+and aggregate prompt/history budgets remain. Cancellation stops later requests;
+an in-flight blocking read can remain until its network timeout, but its result
+cannot continue or deliver. No automatic OAuth refresh or credential pool fallback
+is provided. Expired/missing tokens and service/quota errors fail closed.
+
+Only normalized daily numbers, dates, bound IDs, timezone and retrieval timestamp
+enter the tool result. Results are explicitly observations, not decision approvals
+or real-time metrics. Provider errors, raw metadata and tokens are never forwarded.
+The existing final-text safeguards remain active. Retained results are dated
+historical observations: follow-ups may reuse them; they are not silently refreshed.
+Any manifest/policy/source change invalidates the existing scoped history seal.
+
+### Manifest extension and offline operator validation
+
+Version 1 optionally accepts an `analytics` array (absent/empty means no analytics).
+The following is a **synthetic schema example**, not an authorized or active grant:
+
+```json
+{
+  "id": "synthetic-ga4-a",
+  "scope_id": "workspace-synthetic",
+  "chat_id": "channel-synthetic",
+  "client": "client-a",
+  "audience": "internal",
+  "account_id": "101",
+  "property_id": "1001",
+  "credential_slot": "SYNTHETIC_A",
+  "time_zone": "UTC",
+  "start_date": "2026-09-01",
+  "end_date": "2026-09-07",
+  "expires_at": "2026-10-01T00:00:00Z",
+  "operation": "scoped_ga4_daily_report",
+  "status": "proposed",
+  "approval_evidence": null,
+  "sharing_evidence": null
+}
+```
+
+Every field is required. IDs must be bounded identifiers; GA account/property IDs
+are positive decimal strings; credential slots are uppercase bounded identifiers.
+The referenced workspace/channel route must exist and match client/audience.
+Grant expiry cannot exceed route expiry. A property ID or credential slot cannot
+cross client/account ownership within the manifest. Up to 64 grants are accepted.
+Shared routes require explicit sharing evidence on approved analytics grants.
+A proposal must have null approval/sharing evidence and exposes no tool. Approved
+grants need a nonempty operator approval attestation; these references are trusted
+operator assertions, not external approval verification. Expired approved grants
+fail the affected route's snapshot before provider input.
+
+Credentials are looked up **only during executor execution** using
+`CLIENT_CONTEXT_GA4_{credential_slot}_ACCESS_TOKEN`. An installed profile scope is
+authoritative; a missing scoped value cannot borrow the global environment. An
+unscoped process uses the existing `agent.secret_scope.get_secret` semantics,
+including failure under multiplexing. No `.env` file is opened by this connector,
+and no credential names/values enter model schemas. A separately operated credential
+source must provide a current token with `analytics.readonly` access and permissions
+for the bound property through both Admin and Data APIs. This work creates none.
+
+Offline validation remains:
+
+```bash
+python -m gateway.client_context validate --manifest /absolute/staged/manifest.json
+```
+
+It validates route/source bytes, hashes, account bindings, grant status/expiry and
+schema. Its JSON receipt counts approved analytics grants and explicitly reports
+`analytics_credentials_checked: false` and `activation: "not_performed"`.
+It performs no analytics network calls or provider calls. Source refresh proposals
+remain proposals. `client_context_refresh review` preserves analytics grants
+exactly; source review cannot approve, broaden or renew them. Existing manifest
+source IDs are the entire local source coverage. No automatic source discovery,
+deep client report access, global history search or source approval expansion occurs.
+
+### Deployment checklist (parent-owned; none performed here)
+
+- Review the code, verification receipt and local diff, then merge this branch via
+  the parent. Do not apply or reset over the dirty live checkout.
+- Confirm the real Codewords/CookUnity GA4 availability and intended account,
+  ordinary property, timezone, audience, date range, and explicitly approved
+  source coverage. Keep deeper client reports ungranted.
+- Stage separate operator-reviewed grants, approval/sharing evidence and credential
+  slots. Arrange current read-only tokens outside this code change. Validate the
+  staged manifest offline; review the exact tool-policy intersection.
+- Obtain separate authorization for live activation and controlled reads. No
+  live config/grant changes, service restart or deployment is authorized by this task.
+- After authorized activation, verify a genuine authenticated human inbound turn,
+  account metadata and bounded report, cross-client denial, source/grant revocation,
+  owner regression and dated follow-up history. Synthetic tests do not replace this.
+- Roll back by disabling the scoped operation or removing its approved grant under
+  operator control. Observed policy change clears retained history on the next
+  boundary; restart also discards the in-memory cache. No background monitor is added.
+
+
 ## EZ-826 local tool-preserving extension (2026-09-08)
 
 Implemented locally; activation remains gated. No configuration, live grants,

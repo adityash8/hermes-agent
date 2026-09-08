@@ -190,13 +190,17 @@ class Registry:
     sources: dict[str, dict]
     routes: dict[tuple[str, str], dict]
     owners: dict[tuple[str, str], dict]
+    analytics: tuple = ()
 
 
 def load_registry(path: str) -> Registry:
     absolute_path(path)
     data, identity = read_file(str(Path(path).parent), Path(path).name, MAX_MANIFEST)
     raw = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_object, parse_constant=_reject_json_constant)
-    fields(raw, {"version", "root", "routes", "owner_private", "sources"})
+    expected = {"version", "root", "routes", "owner_private", "sources"}
+    if isinstance(raw, dict) and "analytics" in raw:
+        expected.add("analytics")
+    fields(raw, expected)
     require(type(raw["version"]) is int and raw["version"] == 1)
     root = absolute_path(raw["root"])
     sources = {}
@@ -263,7 +267,10 @@ def load_registry(path: str) -> Registry:
         require(owner["chat_type"] == "dm")
         timestamp(owner["expires_at"])
         owners[key] = owner
-    return Registry(path, hashlib.sha256(data).hexdigest(), identity, root, sources, routes, owners)
+    from gateway.client_context_analytics import parse_grants
+
+    analytics = parse_grants(raw.get("analytics", []), routes)
+    return Registry(path, hashlib.sha256(data).hexdigest(), identity, root, sources, routes, owners, analytics)
 
 
 def authorize(registry: Registry, source, now: datetime) -> dict | None:
@@ -297,6 +304,9 @@ def snapshot(registry: Registry, source, question: str, now: datetime | None = N
     now = now or datetime.now(timezone.utc)
     route = authorize(registry, source, now)
     require(route is not None)
+    from gateway.client_context_analytics import route_grants
+
+    route_grants(registry, source, now)
     require(isinstance(question, str) and 0 < len(question.encode("utf-8")) <= MAX_QUESTION)
     require(not any(ord(c) < 32 and c not in "\n\t\r" for c in question))
     granted = set(route["source_ids"])
@@ -349,7 +359,7 @@ def snapshot(registry: Registry, source, question: str, now: datetime | None = N
     packet = json.dumps({
         "evidence": records,
         "limitations": (
-            "no live verification or global transcripts; future records unavailable; "
+            "local source metrics are historical and not live-verified; no global transcripts; future records unavailable; "
             "only supplied bounded conversation history and granted approved decision history via scoped tools"
             if include_history else
             "no live verification; excluded historical and future records are unavailable; no conversation history"
