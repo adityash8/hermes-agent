@@ -2207,6 +2207,10 @@ class BasePlatformAdapter(ABC):
         """Set the incoming-message handler (MessageEvent -> optional response str)."""
         self._message_handler = handler
 
+    # Set by the gateway when binding adapters. Native Slack checks before enrichment.
+    client_context_enabled: bool = False
+    _client_context_admission: Optional[Callable[[Any], Awaitable[str]]] = None
+
     def set_platform_event_handler(
         self, handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]]) -> None:
         """Install the gateway-owned normalized platform-event boundary (stable dicts + internal
@@ -3826,6 +3830,9 @@ class BasePlatformAdapter(ABC):
         image URLs → residual directives → bare local paths (skipped for ephemeral notices so config
         paths stay text; unknown-extension MEDIA tags survive for the bare-path detector). History
         dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is recovered."""
+        from gateway.client_context import ScopedReply
+        if isinstance(response, ScopedReply):
+            return _ExtractedResponse(response, [], [], [], False, response)
         # Captured before extract_media strips it: images then go via send_document (no recompression).
         force_document = "[[as_document]]" in response
         pre_extract = response
@@ -3938,7 +3945,8 @@ class BasePlatformAdapter(ABC):
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None
-                if self._wants_auto_tts(
+                from gateway.client_context import ScopedReply
+                if not isinstance(response, ScopedReply) and self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):
                     _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content)
                 # TTS plays before text; generated files are removed afterwards.
@@ -3996,7 +4004,11 @@ class BasePlatformAdapter(ABC):
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._fire_post_delivery_callback(session_key, interrupt_event)
+            if getattr(event, "_client_context_required", False) is True:
+                self.pop_post_delivery_callback(
+                    session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None))
+            else:
+                await self._fire_post_delivery_callback(session_key, interrupt_event)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)

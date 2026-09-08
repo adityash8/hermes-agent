@@ -1182,6 +1182,10 @@ class GatewayInboundMixin:
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
+        from gateway.client_context import handle_ingress
+        handled, result = await handle_ingress(self, event)
+        if handled:
+            return result
         from gateway.run import _AGENT_PENDING_SENTINEL
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:

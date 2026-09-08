@@ -716,6 +716,10 @@ class RelayAdapter(BasePlatformAdapter):
 
     async def _on_inbound(self, event) -> None:
         """Bridge a connector-delivered MessageEvent into the normal adapter path."""
+        from gateway.client_context import adapter_admission
+        mode = await adapter_admission(self, event.source)
+        if mode == "deny":
+            return  # Never let denied/revoked input mutate reply-routing or replay state.
         # Inbound replay dedupe: the relay leg is at-least-once — on WS re-handshake
         # the connector replays its durable buffer, and a long turn straddling a
         # quiet socket drop got re-run (final answer 2-5x). Platform message identity
@@ -729,6 +733,12 @@ class RelayAdapter(BasePlatformAdapter):
             self._evict_oldest(self._seen_inbound, self._SEEN_INBOUND_MAX)
         self._capture_scope(event)
         self._stamp_slack_session_thread(event)
+        if mode == "scoped":
+            # Scoped text/questions must reach the gateway before prompt
+            # resolution or any attachment download. Other fronted platforms are unchanged.
+            event._client_context_required = True
+            await self.handle_message(event)
+            return
         # A structured prompt answer resolves its waiting primitive and is CONSUMED —
         # never also dispatched as chat.
         if await self._consume_prompt_response(event):

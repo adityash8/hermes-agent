@@ -1918,6 +1918,10 @@ class GatewayTurnMixin:
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        from gateway.client_context import handle_turn
+        handled, result = await handle_turn(self, event, source, _quick_key, run_generation)
+        if handled:
+            return result
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
