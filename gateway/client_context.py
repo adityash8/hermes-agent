@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 from gateway.client_context_policy import (
     ContextDenied,
+    ContextChanged,
     Options,
     authorize,
     load_registry,
@@ -100,26 +101,65 @@ def safe_output(text: object) -> ScopedReply:
     return ScopedReply(html.escape(text.strip(), quote=False).replace("@", "@\u200b"))
 
 
-def _responses_text(final) -> str:
+def _responses_message(final, *, allow_tools=False) -> dict:
     """Validate the full Responses result, including items generic aux shims discard."""
     require(final.status == "completed" and not final.error and not final.incomplete_details)
-    parts = []
+    parts, calls, replay = [], [], []
     for item in final.output:
         if item.type == "reasoning":
-            continue  # Private reasoning is neither evidence nor user-visible text.
+            if allow_tools:
+                from agent.codex_responses_adapter import _capture_encrypted_item
+
+                encrypted = _capture_encrypted_item(item, "reasoning", None)
+                if encrypted is not None:
+                    encrypted.pop("id", None)  # store=False: no server-side item lookup.
+                    replay.append(encrypted)
+            continue  # Private reasoning stays in grant-scoped protocol replay only.
+        if item.type == "function_call" and allow_tools:
+            require(item.status in {None, "completed"})
+            calls.append({"id": item.call_id, "type": "function", "function": {
+                "name": item.name, "arguments": item.arguments,
+            }})
+            replay.append({"type": "function_call", "call_id": item.call_id,
+                           "name": item.name, "arguments": item.arguments})
+            continue
         require(item.type == "message" and item.role == "assistant" and item.status == "completed")
+        message_parts = []
         for part in item.content:
             require(part.type == "output_text" and isinstance(part.text, str))
             parts.append(part.text)
-    return "".join(parts)
+            message_parts.append(part.text)
+        replay.append({"role": "assistant", "content": "".join(message_parts)})
+    return {"role": "assistant", "content": "".join(parts), "tool_calls": calls,
+            "_responses_items": replay}
 
 
-def complete(opts: Options, packet: str) -> ScopedReply:
+def _responses_input(messages: list[dict]) -> list[dict]:
+    result = []
+    for message in messages[1:]:
+        if "_responses_items" in message:
+            result.extend(message["_responses_items"])
+        elif message["role"] == "tool":
+            result.append({"type": "function_call_output", "call_id": message["tool_call_id"],
+                           "output": message["content"]})
+        else:
+            if message.get("content"):
+                result.append({"role": message["role"], "content": message["content"]})
+            for call in message.get("tool_calls", []):
+                result.append({"type": "function_call", "call_id": call["id"], **call["function"]})
+    return result
+
+
+def complete(opts: Options, packet: str, *, messages=None, tools=None, before_request=None):
     """Only a concrete HTTP SDK client may execute; no auxiliary fallback/task overrides."""
     from openai import OpenAI
 
     from agent.auxiliary_client import resolve_provider_client
 
+    scoped_round = messages is not None
+    messages = messages if scoped_round else request_messages(packet)
+    tools = tools or []
+    tool_choice = "auto" if tools else "none"
     client, model = resolve_provider_client(
         opts.provider, model=opts.model, raw_codex=True, api_mode="chat_completions",
     )
@@ -142,17 +182,21 @@ def complete(opts: Options, packet: str) -> ScopedReply:
                 guard.on_event(event)
                 if event.type == "response.completed":
                     completed = True
-                if event.type == "response.output_text.delta":
+                if event.type in {"response.output_text.delta", "response.function_call_arguments.delta"}:
                     output_bytes += len(event.delta.encode("utf-8"))
                     if output_bytes > MAX_OUTPUT:
                         # The shared consumer only propagates its control-flow exceptions.
                         raise InterruptedError("response exceeds text limit")
             try:
                 guard.start()
+                if before_request is not None:
+                    before_request()
                 stream = client.responses.create(
-                    model=model, instructions=SYSTEM,
-                    input=[{"role": "user", "content": packet}],
-                    tools=[], tool_choice="none", store=False, stream=True, timeout=TIMEOUT,
+                    model=model, instructions=messages[0]["content"],
+                    input=_responses_input(messages),
+                    tools=[{"type": "function", **t["function"]} for t in tools],
+                    tool_choice=tool_choice, store=False, stream=True, timeout=TIMEOUT,
+                    **({"include": ["reasoning.encrypted_content"]} if tools else {}),
                 )
                 guard.adopt_stream(stream)
                 try:
@@ -163,28 +207,37 @@ def complete(opts: Options, packet: str) -> ScopedReply:
                     stream.close()
                     guard.release_stream(stream)
                 require(completed and final is not None and not guard.timed_out.is_set())
-                text = _responses_text(final)
+                message = _responses_message(final, allow_tools=bool(tools))
             finally:
                 guard.finish()
         else:
+            if before_request is not None:
+                before_request()
             result = client.chat.completions.create(
-                model=model, messages=request_messages(packet), tools=[], tool_choice="none",
+                model=model, messages=messages, tools=tools, tool_choice=tool_choice,
                 stream=False, max_completion_tokens=1200, timeout=TIMEOUT,
             )
             require(len(result.choices) == 1)
             choice = result.choices[0]
             message = choice.message
-            require(choice.finish_reason == "stop" and message.role == "assistant")
-            require(not message.tool_calls and not message.function_call and not message.refusal)
+            require(message.role == "assistant")
+            require(choice.finish_reason == ("tool_calls" if message.tool_calls else "stop"))
+            require(not message.tool_calls or bool(tools))
+            require(not message.function_call and not message.refusal)
             require(not getattr(message, "audio", None))
-            text = message.content
-        return safe_output(text)
+            message = {"role": "assistant", "content": message.content,
+                       "tool_calls": [c.model_dump() for c in message.tool_calls or []]}
+        if scoped_round:
+            return message
+        require(not message["tool_calls"])
+        return safe_output(message["content"])
     finally:
         client.close()
 
 
 def _prepare(opts: Options, source, question: str):
-    return snapshot(load_registry(opts.manifest), source, question)
+    return snapshot(load_registry(opts.manifest), source, question,
+                    include_history=bool(opts.tool_generation))
 
 
 async def answer(opts: Options, source, question: str):
@@ -197,9 +250,14 @@ async def handle_turn(runner, event, source, key: str, generation: int):
     """Returns (handled, text); the generation check also applies to denials/failures."""
     forced = getattr(event, "_client_context_required", False) is True
     if not forced and not applies(getattr(runner, "config", None), source):
+        if getattr(source.platform, "value", source.platform) == "slack":
+            from gateway.client_context_turn import clear_history
+
+            clear_history(runner)
         return False, None
     event._client_context_required = True
     reply, evidence, opts = ScopedReply(DENIED), None, None
+    scoped_validate = None
     question = event.text
     # replace() runs SessionSource.__post_init__, which fills a missing scope_id
     # from the deprecated guild_id alias. Admission must preserve missing identity.
@@ -217,7 +275,17 @@ async def handle_turn(runner, event, source, key: str, generation: int):
         require(getattr(event.message_type, "value", event.message_type) in {"text", "command"})
         require(not event.prompt_response)
         require(runner._is_user_authorized_for_source(source))
-        reply, evidence = await answer(opts, source, question)
+        if opts.tool_generation:
+            from gateway.client_context_turn import run_scoped_turn
+
+            reply, evidence, scoped_validate = await run_scoped_turn(runner, event, source, key, generation, opts)
+        else:
+            from gateway.client_context_turn import clear_history
+
+            clear_history(runner)
+            reply, evidence = await answer(opts, source, question)
+    except ContextChanged:
+        reply = None
     except ContextDenied:
         reply = ScopedReply(DENIED)
     except Exception:
@@ -226,7 +294,14 @@ async def handle_turn(runner, event, source, key: str, generation: int):
     finally:
         if not passthrough:
             await runner._hmwa_stop_typing_for_turn(event, source)
+    if reply is None or reply in {DENIED, FAILED}:
+        from gateway.client_context_turn import clear_history
+
+        clear_history(runner)
     if not runner._is_session_run_current(key, generation):
+        from gateway.client_context_turn import clear_history
+
+        clear_history(runner)
         runner._hmwa_discard_stale_result(source, key, generation)
         return True, None
     if evidence is not None:
@@ -235,9 +310,18 @@ async def handle_turn(runner, event, source, key: str, generation: int):
             await asyncio.to_thread(revalidate, opts, evidence, source, question)
             require(configured(runner.config) == opts)
             require(event.source == source and runner._is_user_authorized_for_source(source))
+            require(not event.source.profile_route_rejected and not event.source.is_bot)
+            if scoped_validate is not None:
+                await scoped_validate()
         except Exception:
+            from gateway.client_context_turn import clear_history
+
+            clear_history(runner)
             return True, None  # Revoked/changed during completion: discard, do not summarize it.
     if not runner._is_session_run_current(key, generation):
+        from gateway.client_context_turn import clear_history
+
+        clear_history(runner)
         runner._hmwa_discard_stale_result(source, key, generation)
         return True, None
     # Never run a legacy post-delivery callback for an isolated answer.
@@ -250,6 +334,10 @@ async def handle_ingress(runner, event):
     source = event.source
     forced = getattr(event, "_client_context_required", False) is True
     if not forced and not applies(getattr(runner, "config", None), source):
+        if getattr(source.platform, "value", source.platform) == "slack":
+            from gateway.client_context_turn import clear_history
+
+            clear_history(runner)
         return False, None
     event._client_context_required = True
     try:
@@ -261,6 +349,9 @@ async def handle_ingress(runner, event):
             event._client_context_required = False
             return False, None  # Full workspace/channel/requester/DM owner match only.
     except Exception:
+        from gateway.client_context_turn import clear_history
+
+        clear_history(runner)
         await runner._hmwa_stop_typing_for_turn(event, source)
         return True, ScopedReply(DENIED)
 

@@ -1,5 +1,178 @@
 # Scoped client context implementation
 
+## EZ-826 local tool-preserving extension (2026-09-08)
+
+Implemented locally; activation remains gated. No configuration, live grants,
+profiles, credentials, running services, external accounts or deployments changed.
+The earlier pilot receipt below is historical; the extension adds only the bounded
+capabilities described here.
+
+### Working capability
+
+The original authenticated ingress and pre-provider turn seam are preserved.
+`client_context_turn.py` provides a dedicated loop; it never constructs an AIAgent,
+restores normal sessions, loads identity/memory/context files, dispatches global
+tools, refreshes MCP agents or persists session tool prefixes.
+
+Two **local record readers** are available when explicitly permitted:
+
+| Function | Normal source-effective toolset required | Capability |
+|---|---|---|
+| `scoped_source_read` | `file` | One current, hash-bound granted source record |
+| `scoped_history_read` | `session_search` | One explicitly granted approved decision record, including superseded history |
+
+These are scoped substitutes for read capabilities, not the ordinary file or
+session-search executors. Their source/account arguments are exact validated
+`source_id`, `account_id`, `client`, and `audience` fields. `account_id` is the
+authenticated Slack workspace scope, not an arbitrary analytics account. Every
+executor call checks both function allowlisting and all four arguments. Paths,
+foreign accounts, extra fields, duplicate JSON keys and ungranted IDs deny.
+
+Read schemas derive from the normal `_resolve_turn_toolsets` result intersected
+with the platform's base permissions and a static two-function allowlist. Adapter
+overrides can narrow this set. Missing/empty/malformed platform lists, resolver
+failures and disabled toolsets grant no tools. Adding a global MCP tool or a global
+handler with a matching name cannot change the scoped executor. Schemas and valid
+names come from one immutable local surface. Policy is recomputed at each boundary;
+drift aborts the active turn, and the next turn constructs a fresh surface.
+
+The existing gateway setting optionally accepts the following additional field.
+This is a schema example only; **no configuration was edited or activated**:
+
+```json
+"read_tools": {
+  "generation": "reviewed-policy-v1",
+  "allow": ["scoped_source_read", "scoped_history_read"]
+}
+```
+
+Absent or malformed read policy retains source-only Q&A with no read tools or
+conversation history. Valid empty `allow` grants no tools. Provider/model remain
+explicit. Ordinary owner DMs and unprotected behavior retain their original paths.
+
+The scoped cache retains the exact validated message sequence for at most four
+successful turns in each of 64 conversations, exclusively in memory. This includes
+authorized evidence, tool calls/results and scoped provider replay. Follow-ups
+append to the existing prompt prefix without rewriting it. A turn or serialized
+payload budget overflow starts a completely fresh scoped conversation; individual
+messages are never trimmed from a retained prefix. Retained messages are capped at
+196,608 bytes per conversation, and outbound messages plus schemas share that cap.
+Keys bind workspace, channel, thread,
+requester, chat type, profile/relay identity, route/client/audience, manifest digest
+and file identities, source identities, tool generation/effective policy and
+provider/model. Policy mismatch, observed disable/downgrade, failed authorization,
+revocation, cancellation, stale run generation and failed turns clear relevant
+history (failure paths conservatively clear the entire scoped cache). Restart
+also discards it. This is not continuous monitoring of changes between requests.
+
+Cross-thread material comes only from explicitly granted decision records with
+approved metadata. Ordinary transcripts are never searched or imported. Superseded
+approved records are labeled historical; observations/proposals cannot become
+approved history. Future records are excluded. Expired granted historical records
+deny before any source-content read. The full current evidence plus approved
+history snapshot shares the existing 98,304-byte limit.
+
+The loop allows four provider rounds and eight total read calls, bounded by a
+30-second turn deadline. It revalidates authorization, source state, run generation,
+configuration, effective tool policy, manifest and source bytes before/after each
+tool and provider round, immediately before the SDK request after provider
+resolution, and again before returning an answer. Revoked/changed results are
+discarded. A cancelled or timed-out resolver worker cannot initiate a later
+request. Requests already in flight can finish, but cannot continue or deliver.
+Retained tool results and opaque reasoning remain confined to that grant-scoped
+conversation and are cleared with it; nothing is written to normal session storage.
+
+Explicit OpenAI/OpenRouter Chat Completions and raw OpenAI Codex Responses use the
+existing concrete HTTP SDK restriction. Codex encrypted reasoning is requested and
+replayed only inside the same bounded scoped conversation, using the existing capture helper;
+no server-stored response lookup or normal agent fallback is used. Existing
+`safe_output` text/media/path/mention safeguards apply to final answers.
+
+### Reviewed source refresh
+
+`python -m gateway.client_context_refresh` provides an offline operator workflow.
+The candidate root must be a separate complete local source tree with the same
+relative paths. `propose` emits changed hashes with proposed status and null
+approval/sharing attestations. It cannot modify the active manifest or source tree.
+
+```text
+python -m gateway.client_context_refresh propose --manifest ABS_MANIFEST \
+  --candidate-root ABS_CANDIDATE_ROOT --output ABS_PROPOSAL
+python -m gateway.client_context_refresh review --manifest ABS_MANIFEST \
+  --candidate-root ABS_CANDIDATE_ROOT --decisions ABS_DECISIONS --output ABS_REVIEWED_MANIFEST
+```
+
+The decisions JSON binds both proposal digests and every changed source:
+
+```json
+{
+  "base_digest": "digest-from-proposal",
+  "candidate_digest": "digest-from-proposal",
+  "reviews": [{
+    "id": "decision-a",
+    "sha256": "new-source-sha256",
+    "review_evidence": "operator-review-id",
+    "approval_evidence": "new-approval-id",
+    "sharing_evidence": "new-sharing-id",
+    "observed_at": "2026-09-08T00:00:00Z",
+    "effective_at": "2026-09-08T00:00:00Z",
+    "expires_at": "2027-01-01T00:00:00Z"
+  }]
+}
+```
+
+Approval/sharing references must be new for changed approved/shared bytes; otherwise
+the corresponding field must be null. They remain trusted operator attestations,
+not remote approval verification. Every changed record, including ungranted records,
+requires explicit review. Source dates require explicit review; grants and owner
+bindings cannot be renewed or broadened. Record status stays unchanged, so a
+proposal cannot gain approved status through refresh. Snapshot validation includes
+approved historical sources, and hashes are rechecked before artifact publication.
+Exclusive descriptor-relative writes reject existing outputs, links and outputs in
+either source tree. `review` only creates a **separate reviewed manifest**; there is
+no promotion/activation command.
+
+### Omissions and acceptance limits
+
+This is bounded local retrieval, **not general analytics integration**. It has no
+GA4/Ads/Search Console connectors, remote account queries, arbitrary MCP/file/network
+tools, live metrics, global transcript search, writable memory, delegation, actions,
+automatic approval, automatic grant renewal or automatic activation. Current source
+records remain in the initial evidence packet; reads do not introduce an unbounded
+search index. An operator must stage local source copies and review refresh evidence.
+
+Verification uses real runtime imports, the HTTP SDK, synthetic identities, temporary
+source trees, and mock HTTP transport through `scripts/run_tests.sh`. It proves local
+contracts, not live Slack/provider compatibility or live analytics access. Static
+type checking is unavailable in the existing venv (`python -m ty`: no module named
+ty); no dependency was installed.
+
+### EZ-826 verification receipt
+
+The official runner passed **648 tests across 20 files, zero failures**, with
+`--file-retries 0 -j 4`. This includes 131 existing scoped boundary tests, 79 new
+executor/history/provider cases, 29 refresh cases, and Slack, relay, owner,
+toolset-resolution and MCP-refresh regressions. Log: `/tmp/ez826-regressions.txt`.
+The file set is the earlier 16-file pilot regression list below plus
+`test_client_context_turn.py`, `test_client_context_refresh.py`,
+`test_webhook_route_toolsets.py`, and `tests/tools/test_refresh_agent_mcp_tools.py`.
+
+Ruff on `gateway/client_context*.py` and `tests/gateway/test_client_context*.py`,
+Python compileall on changed Python, and `git diff --check` all pass. An independent
+review approved the implementation after fixes for history downgrade/restore,
+source-state comparison, stale provider workers and historical-source refresh
+validation. The review independently ran the new suites (99 passes before the
+last protocol/registry/generation and prefix-budget cases were added) and the existing scoped
+suite (131 passes). The final 648-test run includes all final code changes.
+
+No live provider/Slack run, full repository suite or remote CI pass is claimed.
+The initial worktree HEAD is the implementation baseline. Its comparison with local
+`origin/main` includes substantial preexisting divergence; no unrelated files were
+reconciled. Preexisting untracked `research.md`, `tasks/` and
+`.client-context-test-tmp/` remain untouched and outside the scoped change.
+
+## Earlier pilot implementation receipt (historical)
+
 Status: the four findings in the parent review are fixed and locally verified
 (2026-09-08). Work remains isolated to this worktree. This continuation used no live
 Slack/provider calls, real client source reads, external mutations, child agents,

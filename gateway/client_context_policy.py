@@ -31,6 +31,10 @@ class ContextDenied(ValueError):
     """A policy or evidence check failed. Never expose exception details to a peer."""
 
 
+class ContextChanged(ContextDenied):
+    """An admitted scoped turn lost authorization; discard its output entirely."""
+
+
 def require(condition: object) -> None:
     if not condition:
         raise ContextDenied("client context unavailable")
@@ -150,18 +154,31 @@ class Options:
     manifest: str
     provider: str
     model: str
+    tool_generation: str = ""
+    read_tools: tuple[str, ...] = ()
 
 
 def options(value: object) -> Options | None:
     # None is malformed. Only absence (handled by GatewayConfig) or explicit false is off.
     if isinstance(value, dict) and set(value) == {"enabled"} and value["enabled"] is False:
         return None
-    cfg = fields(value, {"enabled", "manifest", "provider", "model"})
+    expected = {"enabled", "manifest", "provider", "model"}
+    if isinstance(value, dict) and "read_tools" in value:
+        expected.add("read_tools")
+    cfg = fields(value, expected)
     require(cfg["enabled"] is True)
     require(cfg["provider"] in {"openai", "openai-codex", "openrouter"})
     require(isinstance(cfg["model"], str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,159}", cfg["model"]))
     require(cfg["model"].lower() not in {"auto", "default"})
-    return Options(absolute_path(cfg["manifest"]), cfg["provider"], cfg["model"])
+    generation, allowed = "", ()
+    if "read_tools" in cfg:
+        try:
+            tool_policy = fields(cfg["read_tools"], {"generation", "allow"})
+            generation = identifier(tool_policy["generation"])
+            allowed = tuple(sorted(identifiers(tool_policy["allow"], 16)))
+        except ContextDenied:
+            generation, allowed = "", ()  # Malformed policy grants no capability.
+    return Options(absolute_path(cfg["manifest"]), cfg["provider"], cfg["model"], generation, allowed)
 
 
 @dataclass(frozen=True)
@@ -272,9 +289,11 @@ class Snapshot:
     registry_identity: tuple
     file_identities: tuple
     packet: str
+    history_packet: str = ""
 
 
-def snapshot(registry: Registry, source, question: str, now: datetime | None = None) -> Snapshot:
+def snapshot(registry: Registry, source, question: str, now: datetime | None = None,
+             *, include_history: bool = False) -> Snapshot:
     now = now or datetime.now(timezone.utc)
     route = authorize(registry, source, now)
     require(route is not None)
@@ -303,12 +322,17 @@ def snapshot(registry: Registry, source, question: str, now: datetime | None = N
             key = record["decision_key"]
             require(key not in approved)
             approved.add(key)
-    for sid in current:
+    historical = {
+        sid for sid in effective - current
+        if include_history and registry.sources[sid]["kind"] == "decision"
+        and registry.sources[sid]["status"] == "approved"
+    }
+    for sid in current | historical:
         record = registry.sources[sid]
         require(timestamp(record["observed_at"]) <= now < timestamp(record["expires_at"]))
     # All grant/lifecycle checks above precede the FIRST source-content read.
-    records, identities = [], []
-    for sid in sorted(current):
+    records, history, identities = [], [], []
+    for sid in sorted(current | historical):
         record = registry.sources[sid]
         data, identity = read_file(registry.root, record["path"], MAX_FILE)
         require(hashlib.sha256(data).hexdigest() == record["sha256"])
@@ -317,17 +341,28 @@ def snapshot(registry: Registry, source, question: str, now: datetime | None = N
         safe = {k: record[k] for k in ("id", "kind", "status", "source_ref", "observed_at", "effective_at", "expires_at", "decision_key")}
         safe["freshness"] = "historical; needs_live_verification" if record["kind"] == "metric" else "dated_evidence"
         safe["content"] = content
-        records.append(safe)
+        if sid in current:
+            records.append(safe)
+        if include_history and record["kind"] == "decision" and record["status"] == "approved":
+            history.append({**safe, "lifecycle": "current" if sid in current else "superseded"})
         identities.append((sid, identity))
     packet = json.dumps({
         "evidence": records,
-        "limitations": "no live verification; excluded historical and future records are unavailable; no conversation history",
+        "limitations": (
+            "no live verification or global transcripts; future records unavailable; "
+            "only supplied bounded conversation history and granted approved decision history via scoped tools"
+            if include_history else
+            "no live verification; excluded historical and future records are unavailable; no conversation history"
+        ),
         "question": question,
     }, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     require(len(packet.encode("utf-8")) <= MAX_PACKET)
-    return Snapshot(registry.digest, registry.identity, tuple(identities), packet)
+    history_packet = json.dumps(history, ensure_ascii=True, sort_keys=True) if include_history else ""
+    require(len(packet.encode("utf-8")) + len(history_packet.encode("utf-8")) <= MAX_PACKET)
+    return Snapshot(registry.digest, registry.identity, tuple(identities), packet, history_packet)
 
 
 def revalidate(opts: Options, original: Snapshot, source, question: str) -> None:
-    current = snapshot(load_registry(opts.manifest), source, question)
+    current = snapshot(load_registry(opts.manifest), source, question,
+                       include_history=bool(opts.tool_generation))
     require(current == original)
