@@ -78,6 +78,26 @@ async def test_real_gateway_read_and_followup_preserve_only_scoped_context(runne
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("skip", ["ignored", "paused", "busy", "lease"])
+async def test_skipped_ingress_invalidates_prior_history(runner, extended, wire, monkeypatch, skip):
+    read_then_answer(wire)
+    assert await runner._handle_message(event())
+    assert runner._client_context_history
+    captured = len(wire.captured)
+    if skip == "ignored":
+        monkeypatch.setattr("gateway.run._is_slack_ignored_channel", lambda *a: True)
+    elif skip == "paused":
+        monkeypatch.setattr("agent.estop.paused_reply", lambda: "paused")
+    elif skip == "busy":
+        monkeypatch.setattr(runner, "_is_session_running", lambda *a: True)
+    else:
+        monkeypatch.setattr(runner, "_claim_active_session_slot", lambda *a: (None, "limit"))
+    await runner._handle_message(event())
+    assert not runner.__dict__.get("_client_context_history")
+    assert len(wire.captured) == captured
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("budget", ["turns", "bytes"])
 async def test_history_budget_resets_entire_prefix_before_next_provider(runner, extended, wire, monkeypatch, budget):
     if budget == "bytes":

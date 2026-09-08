@@ -357,19 +357,24 @@ async def handle_ingress(runner, event):
 
     from agent.estop import paused_reply
     from gateway.run import _AGENT_PENDING_SENTINEL, _is_slack_ignored_channel
+    from gateway.client_context_turn import clear_history
 
     if _is_slack_ignored_channel(runner.config, source.chat_id):
+        clear_history(runner)
         return True, None
     if paused_reply() or any(getattr(runner, flag, False) for flag in (
         "_draining", "_external_drain_active", "_startup_restore_in_progress",
     )):
+        clear_history(runner)
         await runner._hmwa_stop_typing_for_turn(event, source)
         return True, ScopedReply(FAILED)
     key = runner._session_key_for_source(source)
     if runner._is_session_running(key):
+        clear_history(runner)
         return True, ScopedReply("a source question is already running. please resend when it finishes.")
     lease, limit = runner._claim_active_session_slot(key, source)
     if limit is not None:
+        clear_history(runner)
         return True, ScopedReply(FAILED)
     state = runner._session_state(key)
     state.turn.lease = lease
