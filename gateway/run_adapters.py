@@ -1037,6 +1037,11 @@ class GatewayAdapterLifecycleMixin:
         """Install the runner callbacks every adapter needs (defaults = primary handlers;
         secondary wiring passes profile-scoped variants). ``set_reaction_handler`` is optional."""
         adapter.set_message_handler(message_handler or self._primary_message_handler())
+        from gateway.client_context import admission, applies
+        from types import SimpleNamespace
+        # A relay adapter can front Slack even when its primary platform is different.
+        adapter.client_context_enabled = applies(getattr(self, "config", None), SimpleNamespace(platform=Platform.SLACK))
+        adapter._client_context_admission = lambda source: admission(self, source)
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
         adapter.set_busy_session_handler(busy_session_handler or self._handle_active_session_busy_message)
@@ -1368,6 +1373,9 @@ class GatewayAdapterLifecycleMixin:
 
     async def _handle_gateway_platform_event(self, event: dict, source) -> None:
         """Authorize and publish one normalized adapter event to plugin hooks."""
+        from gateway.client_context import admission
+        if await admission(self, source) != "legacy":
+            return
         # Observer failures must never break the adapter's update loop.
         with _log_suppressed(logging.DEBUG, "gateway_platform_event hook dispatch failed", exc_info=True):
             from hermes_cli.lifecycle import has_hook, invoke_hook

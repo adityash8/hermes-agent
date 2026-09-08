@@ -545,6 +545,8 @@ class GatewayConfig:
     reset_by_platform: Dict[Platform, SessionResetPolicy] = field(default_factory=dict)
     reset_triggers: List[str] = field(default_factory=lambda: ["/new", "/reset"])
     quick_commands: Dict[str, Any] = field(default_factory=dict)  # slash commands that bypass the agent loop
+    # Preserve malformed present values: client-context admission must deny, never coerce off.
+    client_context: Any = field(default_factory=lambda: {"enabled": False})
     sessions_dir: Path = field(default_factory=lambda: get_hermes_home() / "sessions")
     # Legacy sessions.json mirror of the routing index (primary: state.db) for external tooling / downgrades.
     # The primary copy lives in state.db (gateway_routing table, #9006). Default True for backward
@@ -666,6 +668,7 @@ class GatewayConfig:
             "reset_by_platform": {p.value: v.to_dict() for p, v in self.reset_by_platform.items()},
             "reset_triggers": self.reset_triggers,
             "quick_commands": self.quick_commands,
+            "client_context": self.client_context,
             "sessions_dir": str(self.sessions_dir),
             **{name: getattr(self, name) for name in self._SCALAR_DICT_FIELDS},
             "streaming": self.streaming.to_dict(),
@@ -749,6 +752,7 @@ class GatewayConfig:
             reset_by_platform=by_platform("reset_by_platform", SessionResetPolicy.from_dict),
             reset_triggers=data.get("reset_triggers", ["/new", "/reset"]),
             quick_commands=_coerce_dict(data.get("quick_commands", {})),
+            client_context=pick("client_context") if "client_context" in data or "client_context" in nested_gateway else {"enabled": False},
             sessions_dir=Path(data["sessions_dir"]) if "sessions_dir" in data else get_hermes_home() / "sessions",
             **{name: _coerce_bool(data.get(name), default) for name, default in _TOPLEVEL_BOOL_DEFAULTS.items()},
             stt_enabled=_coerce_bool(stt_setting("stt_enabled", "enabled"), True),
@@ -798,6 +802,8 @@ def load_gateway_config() -> GatewayConfig:
     try:
         config_loader.load_yaml_layer(_home, gw_data)
     except Exception as e:
+        # A failed config read cannot prove the isolation feature was absent/off.
+        gw_data.setdefault("client_context", {})
         logger.warning(
             # DingTalk settings → env vars: migrated to the dingtalk plugin's apply_yaml_config_fn hook
             # (plugins/platforms/dingtalk/adapter.py). #41112 / #3823.

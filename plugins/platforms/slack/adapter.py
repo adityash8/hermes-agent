@@ -44,9 +44,11 @@ from gateway.platforms.base import (
 try:  # sibling module; support both package and flat plugin-dir import
     from .deletion import SlackDeletionMixin, deletion_guard
     from .block_kit import render_blocks, sanitize_blocks
+    from .client_context import admit_event, dispatch_scoped, interaction_is_legacy
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from deletion import SlackDeletionMixin, deletion_guard  # ty: ignore[unresolved-import]
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from client_context import admit_event, dispatch_scoped, interaction_is_legacy  # ty: ignore[unresolved-import]
 
 
 logger = logging.getLogger(__name__)
@@ -1436,7 +1438,7 @@ class SlackAdapter(SlackDeletionMixin):
 
         def _reaction(removed: bool):
             async def _handler(event, body):
-                await self._handle_slack_reaction(event, removed=removed)
+                await self._handle_slack_reaction(event, removed=removed, body=body)
 
             return _handler
 
@@ -1526,6 +1528,9 @@ class SlackAdapter(SlackDeletionMixin):
         # vars captured as default args (``_cb=_cb``) would be silently clobbered at dispatch.
         def _make_wrapper(cb, plugin_name):
             async def _wrapped(ack, body, action):
+                if not await interaction_is_legacy(self, body):
+                    await ack()
+                    return
                 try:
                     await cb(ack, body, action)
                 except Exception as exc:  # pragma: no cover - defensive
@@ -3466,6 +3471,9 @@ class SlackAdapter(SlackDeletionMixin):
     async def _handle_assistant_thread_lifecycle_event(
         self, event: dict, body: Optional[dict] = None) -> None:
         """Handle Slack Assistant lifecycle events that carry user/thread identity."""
+        mode, _ = await admit_event(self, event.get("assistant_thread") or {}, body)
+        if mode != "legacy":
+            return
         metadata = self._extract_assistant_thread_metadata(event, body)
         self._cache_assistant_thread_metadata(metadata)
         thread_ts = metadata.get("thread_ts", "")
@@ -3482,6 +3490,8 @@ class SlackAdapter(SlackDeletionMixin):
 
     async def _handle_app_context_changed(self, event: dict, body: Optional[dict] = None) -> None:
         """Cache the current Agent-view context without entering the agent loop."""
+        if (await admit_event(self, event, body))[0] != "legacy":
+            return
         # context_channel_id is what the user is viewing, not our DM: never write it into
         # _channel_team (Slack Connect ids span workspaces and would misroute later sends).
         self._cache_agent_view_context(self._agent_view_event_fields(event, body))
@@ -3498,6 +3508,8 @@ class SlackAdapter(SlackDeletionMixin):
 
     async def _handle_app_home_opened(self, event: dict, body: Optional[dict] = None) -> None:
         """Handle Slack Agent DM-open lifecycle events without producing replies."""
+        if (await admit_event(self, event, body))[0] != "legacy":
+            return
         if event.get("tab") != "messages":
             return
         channel_id = event.get("channel") or event.get("channel_id") or ""
@@ -3525,12 +3537,15 @@ class SlackAdapter(SlackDeletionMixin):
         "heavy_check_mark": "✅", "x": "❌", "no_entry": "⛔", "warning": "⚠️", "rotating_light": "🚨",
         "eyes": "👀", "rocket": "🚀", "tada": "🎉", "fire": "🔥", "wave": "👋"}
 
-    async def _handle_slack_reaction(self, event: dict, removed: bool = False) -> None:
+    async def _handle_slack_reaction(self, event: dict, removed: bool = False, body: Optional[dict] = None) -> None:
         """Forward reactions as a synthetic ``reaction:<added|removed>:<emoji>`` message
         (Feishu/Photon convention) from the reactor in the reacted-to thread, so the normal auth
         gate applies. Hooks fire for every non-self reaction; agent routing is opt-in via
         ``reaction_triggers`` and, without an explicit allowlist, only on the bot's own messages."""
         item = event.get("item") or {}
+        mode, admitted_source = await admit_event(self, {**event, "channel": item.get("channel")}, body)
+        if mode != "legacy":
+            return
         if item.get("type") != "message":
             return
         channel_id = item.get("channel")
@@ -3542,7 +3557,7 @@ class SlackAdapter(SlackDeletionMixin):
         # Self-reactions (e.g. :eyes: lifecycle marker) would feed back.
         if self._bot_user_id and user_id == self._bot_user_id:
             return
-        team_id = self._channel_team.get(channel_id) or ""
+        team_id = admitted_source.scope_id if admitted_source else self._channel_team.get(channel_id) or ""
         if not team_id and self._team_clients:
             team_id = next(iter(self._team_clients))
         client = self._team_clients.get(team_id) if team_id else None
@@ -3689,6 +3704,8 @@ class SlackAdapter(SlackDeletionMixin):
     async def _handle_slack_file_shared(self, event: dict, body: Optional[dict] = None) -> None:
         """Fallback for file shares never delivered as message.files (``file_shared`` has only a
         file ID → ``files.info``). Video only: other uploads arrive on the message event."""
+        if (await admit_event(self, event, body))[0] != "legacy":
+            return
         channel_id = event.get("channel_id") or event.get("channel") or ""
         if self._is_ignored_channel(channel_id):
             logger.info(
@@ -3866,7 +3883,7 @@ class SlackAdapter(SlackDeletionMixin):
     async def _channel_gate_allows(
         self, *, channel_id: str, routing_text: str, bot_uid: str, is_mentioned: bool,
         is_thread_reply: bool, event_thread_ts, user_id: str, team_id: str, is_dm: bool,
-        force_process: bool) -> bool:
+        force_process: bool, allow_thread_lookup: bool = True) -> bool:
         """Channel/MPIM gate: respond in a free-response channel (still gated by
         ``thread_require_mention``), when @mentioned, or when a wake check passes. Always silent
         outside ``allowed_channels`` or when addressed to another user; ``force_process`` skips only
@@ -3899,6 +3916,8 @@ class SlackAdapter(SlackDeletionMixin):
         if free_channel:
             return True
         if not is_mentioned:
+            if not allow_thread_lookup:
+                return False
             return await self._should_wake_on_unmentioned_message(
                 event_thread_ts=event_thread_ts, channel_id=channel_id, user_id=user_id,
                 team_id=team_id, is_thread_reply=is_thread_reply,
@@ -4227,6 +4246,12 @@ class SlackAdapter(SlackDeletionMixin):
 
     async def _handle_slack_message_impl(self, event: dict, payload: Optional[dict] = None) -> None:
         """Handle an incoming Slack message event."""
+        mode, source = await admit_event(self, event, payload)
+        if mode == "deny":
+            return
+        if mode == "scoped":
+            await dispatch_scoped(self, event, source)
+            return
         accepted = await self._prefilter_inbound(event, payload)
         if accepted is None:
             return
@@ -4770,6 +4795,8 @@ class SlackAdapter(SlackDeletionMixin):
         Returns ``(team_id, action_id, value, message, msg_ts, channel_id, user_name, user_id)`` or
         None (logged) when the user is not authorized."""
         await ack()
+        if not await interaction_is_legacy(self, body):
+            return None
         team_id = self._event_team_id({}, body)
         action_id, value, message, msg_ts, channel_id, user_name, user_id = (
             self._interaction_fields(body, action))

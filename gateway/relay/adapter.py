@@ -729,6 +729,13 @@ class RelayAdapter(BasePlatformAdapter):
             self._evict_oldest(self._seen_inbound, self._SEEN_INBOUND_MAX)
         self._capture_scope(event)
         self._stamp_slack_session_thread(event)
+        from gateway.client_context import adapter_admission
+        if await adapter_admission(self, event.source) != "legacy":
+            # Scoped text/questions and denials must reach the gateway before prompt
+            # resolution or any attachment download. Other fronted platforms are unchanged.
+            event._client_context_required = True
+            await self.handle_message(event)
+            return
         # A structured prompt answer resolves its waiting primitive and is CONSUMED —
         # never also dispatched as chat.
         if await self._consume_prompt_response(event):

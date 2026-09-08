@@ -601,6 +601,15 @@ class GatewayBusySessionMixin:
             logger.debug("Failed to send busy-ack: %s", e)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        from gateway.client_context import admission
+        mode = await admission(self, event.source)
+        if getattr(event, "_client_context_required", False) is True and mode != "scoped":
+            return True
+        if mode == "deny":
+            return True
+        if mode == "scoped":
+            # Let the adapter queue a fresh question. Never steer an agent or resolve approvals.
+            return False
         # Same authorization gate as the cold path, else unauthorized users in shared threads
         # inject messages into a session they don't own.
         from gateway.run import _AGENT_PENDING_SENTINEL
