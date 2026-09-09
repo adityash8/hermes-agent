@@ -1,0 +1,49 @@
+{
+  "note": "Append these to hermes-agent---flagged-vulnerabilities.json automation memory",
+  "findings": [
+    {
+      "severity": "high",
+      "location": "hermes_cli/web_server.py",
+      "title": "Managed-files write APIs bypass #57505 sensitive-path guard, allowing overwrite of .env and SSH keys",
+      "description": "PR #57505 added _is_sensitive_path() to managed-files READ/LIST/DOWNLOAD only. Writers (upload, stream upload, mkdir, delete) omit the guard; the module docstring states write was left unprotected. With default local FilesPolicy (locked_root=None), absolute/tilde paths under $HOME are allowed, so dashboard JWT holders can overwrite .env, auth.json, and ~/.ssh/authorized_keys while the parallel read path correctly returns 403 for the same paths.",
+      "impact": "An authenticated dashboard user can replace Hermes credentials or plant SSH authorized_keys despite the sensitive-path protection that blocks reading those same files \u2014 credential injection and host persistence from the dashboard files UI.",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-ca846700-2c2e-5723-8891-e27f91ee9277",
+      "commit_hash": "34d6095e41c1c595fe2f458923f3a85e9081a414",
+      "detected_at_pst": "2026-08-27T11:39:00-07:00",
+      "reported_link": "",
+      "attack_path": "1. Obtain a dashboard JWT (loopback token or stolen session).\n2. Confirm GET /api/files/read?path=<home>/.hermes/.env returns 403 (sensitive-path guard works on read).\n3. POST /api/files/upload with the same path and attacker-controlled body; receive 200 and overwrite .\n4. Optionally POST /api/files/upload-stream, POST /api/files/mkdir, or DELETE /api/files/delete for the same class of paths under unlocked local policy.",
+      "evidence": [
+        "hermes_cli/web_server.py:1791-1810",
+        "hermes_cli/web_server.py:2477-2514",
+        "hermes_cli/web_server.py:2542-2560",
+        "hermes_cli/web_server.py:2576-2600",
+        "SECURITY_AUDIT_INJECTION_2026-08-27.md"
+      ],
+      "remediation": "Call _is_sensitive_path (and ideally agent.file_safety write denylist) in upload_managed_file, upload_managed_file_stream, create_managed_directory, and delete_managed_file before open()/unlink()/mkdir. Add tests mirroring test_api_files_read_blocks_sensitive_env_file for upload/delete/mkdir.",
+      "poc_video_notes": "Reproduced under isolated HOME/HERMES_HOME: GET /api/files/read on .env returned 403; POST /api/files/upload overwrote .env with 200; ~/.ssh/authorized_keys upload also 200 under unlocked local FilesPolicy."
+    },
+    {
+      "severity": "medium",
+      "location": "hermes_cli/web_routers/mcp.py; tools/mcp_tool.py",
+      "title": "MCP dashboard add/test probes attacker-controlled HTTP URLs without SSRF controls",
+      "description": "POST /api/mcp/servers and POST /api/mcp/servers/{name}/test pass user-supplied url into httpx HEAD/GET/POST via _probe_single_server with no is_safe_url or create_ssrf_safe_* client. Distinct from the already-reported provider-probe SSRF. MCP stdio command launch is intentional operator RCE and out of scope; this finding covers HTTP/SSE URL probing only.",
+      "impact": "A dashboard JWT holder can coerce the Hermes host to request IMDS or internal HTTP services; probe errors and response bodies surface in the test/save API response, enabling metadata or internal service data leakage.",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-ca846700-2c2e-5723-8891-e27f91ee9277",
+      "commit_hash": "34d6095e41c1c595fe2f458923f3a85e9081a414",
+      "detected_at_pst": "2026-08-27T11:39:00-07:00",
+      "reported_link": "",
+      "attack_path": "1. Authenticate to the dashboard.\n2. POST /api/mcp/servers with transport http and url http://169.254.169.254/latest/meta-data/iam/security-credentials/ (or POST .../test for an existing server).\n3. Server issues outbound HEAD then POST initialize to that URL via plain httpx.\n4. Attacker observes reachability and any returned body/errors from the probe response.",
+      "evidence": [
+        "tools/mcp_tool.py:2618-2686",
+        "hermes_cli/web_routers/mcp.py",
+        "SECURITY_AUDIT_INJECTION_2026-08-27.md"
+      ],
+      "remediation": "Reject unsafe URLs with is_safe_url before probe/connect; use create_ssrf_safe_async_client for HTTP MCP transports at config save and test time.",
+      "poc_video_notes": "PoC loopback HTTP server received HEAD + POST /latest/meta-data/iam/security-credentials/ from _save_mcp_server and _probe_single_server under isolated HERMES_HOME."
+    }
+  ]
+}
