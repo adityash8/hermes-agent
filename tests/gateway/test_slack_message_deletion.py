@@ -265,4 +265,20 @@ async def test_deleted_surface_at_task_start_finalizes_session():
     assert session_key not in adapter._session_tasks
     assert session_key not in adapter._text_debounce_store()
     assert timer.cancelled()
+
+@pytest.mark.asyncio
+async def test_failed_delete_call_drops_cleanup_receipt():
+    """A chat.delete that raised confirmed nothing. If its cleanup receipt survived, a later
+    external deletion of that message would be read as our own cleanup and the surface would
+    stay writable."""
+    adapter, client = make_adapter()
+    assert (await adapter.send_or_update_status("C1", "progress", "working", metadata=META)).success
+    client.chat_delete.side_effect = RuntimeError("connection reset")
+    assert not await adapter.delete_message("C1", "101.000001")
+    key = adapter._sent_surface(adapter._deletion_key("C1"), "101.000001")
+    assert not adapter._is_cleanup(key, "101.000001")
+    client.chat_delete.side_effect = None
+    client.reset_mock()
+    await adapter._handle_slack_message(deletion())
+    assert not (await adapter.send("C1", "fallback", metadata=META)).success
     assert not client.mock_calls
