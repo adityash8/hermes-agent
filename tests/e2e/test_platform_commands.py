@@ -29,8 +29,11 @@ class TestSlashCommands:
 
         send.assert_called_once()
         response_text = send.call_args[1].get("content") or send.call_args[0][1]
-        assert "/new" in response_text
-        assert "/status" in response_text
+        # Slack help lists every command under the single Jarvis slash app ("/jarvis new"),
+        # the other platforms list bare commands ("/new").
+        prefix = "/jarvis " if platform == Platform.SLACK else "/"
+        assert f"{prefix}new" in response_text
+        assert f"{prefix}status" in response_text
 
     @pytest.mark.asyncio
     async def test_status_shows_session_info(self, adapter, platform):
