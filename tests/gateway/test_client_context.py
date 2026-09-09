@@ -1083,6 +1083,6 @@ async def test_each_deny_path_logs_exactly_one_static_record(runner, wire, nativ
     records = [r for r in caplog.records if r.name.endswith("client_context")]
     assert len(records) == 1 and records[0].levelno == logging.WARNING
     message = records[0].getMessage()
-    assert chat in message and "denied" in message or "failed" in message
+    assert chat in message and ("denied" in message or "failed" in message)
     assert "secret" not in message and "TOKEN_SYNTHETIC" not in message and "Traceback" not in message
     assert records[0].exc_info is None
