@@ -7,6 +7,7 @@ import asyncio
 import copy
 import html
 import json
+import logging
 import re
 import sys
 from datetime import datetime, timezone
@@ -22,6 +23,8 @@ from gateway.client_context_policy import (
     revalidate,
     snapshot,
 )
+
+logger = logging.getLogger(__name__)
 
 TIMEOUT = 30.0
 MAX_OUTPUT = 6000
@@ -76,6 +79,8 @@ async def admission(runner, source) -> str:
         opts = await asyncio.to_thread(route_options, runner.config, source)
         return "legacy" if opts is None else "scoped"
     except Exception:
+        # Static text only: the exception may carry manifest paths or provider details.
+        logger.warning("client context denied at admission for chat %s", getattr(source, "chat_id", None))
         return "deny"
 
 
@@ -85,7 +90,10 @@ async def adapter_admission(adapter, source) -> str:
     callback = getattr(adapter, "_client_context_admission", None)
     if callback is not None:
         return await callback(source)
-    return "deny" if adapter.client_context_enabled else "legacy"
+    if adapter.client_context_enabled:
+        logger.warning("client context denied: no admission callback for chat %s", source.chat_id)
+        return "deny"
+    return "legacy"
 
 
 def request_messages(packet: str) -> list[dict[str, str]]:
@@ -285,11 +293,14 @@ async def handle_turn(runner, event, source, key: str, generation: int):
             clear_history(runner)
             reply, evidence = await answer(opts, source, question)
     except ContextChanged:
+        logger.warning("client context turn discarded: authorization changed for chat %s", source.chat_id)
         reply = None
     except ContextDenied:
+        logger.warning("client context turn denied for chat %s", source.chat_id)
         reply = ScopedReply(DENIED)
     except Exception:
         # Provider errors can contain credentials, private paths and request bodies.
+        logger.warning("client context turn failed for chat %s", source.chat_id)
         reply = ScopedReply(FAILED)
     finally:
         if not passthrough:
@@ -316,6 +327,7 @@ async def handle_turn(runner, event, source, key: str, generation: int):
         except Exception:
             from gateway.client_context_turn import clear_history
 
+            logger.warning("client context turn discarded: revalidation failed for chat %s", source.chat_id)
             clear_history(runner)
             return True, None  # Revoked/changed during completion: discard, do not summarize it.
     if not runner._is_session_run_current(key, generation):
@@ -351,6 +363,7 @@ async def handle_ingress(runner, event):
     except Exception:
         from gateway.client_context_turn import clear_history
 
+        logger.warning("client context denied at ingress for chat %s", source.chat_id)
         clear_history(runner)
         await runner._hmwa_stop_typing_for_turn(event, source)
         return True, ScopedReply(DENIED)

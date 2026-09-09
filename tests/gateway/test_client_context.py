@@ -5,6 +5,7 @@ import copy
 import hashlib
 import importlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -1056,3 +1057,32 @@ async def test_unknown_route_directly_after_admission_never_uses_legacy(runner, 
     runner._handle_message_with_agent = replace_grant
     assert await runner._handle_message(event()) == cc.DENIED
     assert not wire.captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["admission", "turn-denied", "turn-failed", "malformed-slack-event"])
+async def test_each_deny_path_logs_exactly_one_static_record(runner, wire, native_owner, caplog, path):
+    from plugins.platforms.slack.client_context import admit_event
+
+    caplog.set_level(logging.INFO)
+    if path == "admission":
+        runner._is_user_authorized_for_source.return_value = False
+        assert await cc.admission(runner, event().source) == "deny"
+        chat = "channel-a"
+    elif path == "turn-denied":
+        assert await runner._handle_message(event(chat_id="foreign-channel")) == cc.DENIED
+        chat = "foreign-channel"
+    elif path == "turn-failed":
+        wire.state.error = True
+        assert await runner._handle_message(event()) == cc.FAILED
+        chat = "channel-a"
+    else:
+        adapter, _ = native_owner
+        assert await admit_event(adapter, {"channel": "Downer"}, {"team_id": "workspace-synthetic"}) == ("deny", None)
+        chat = "Downer"
+    records = [r for r in caplog.records if r.name.endswith("client_context")]
+    assert len(records) == 1 and records[0].levelno == logging.WARNING
+    message = records[0].getMessage()
+    assert chat in message and "denied" in message or "failed" in message
+    assert "secret" not in message and "TOKEN_SYNTHETIC" not in message and "Traceback" not in message
+    assert records[0].exc_info is None
