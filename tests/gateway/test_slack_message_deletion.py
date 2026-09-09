@@ -1,5 +1,6 @@
 """Deletion is an exact-surface stop, not an invitation to recreate a reply."""
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -210,3 +211,26 @@ async def test_missing_or_inflight_writes_cannot_resurrect_a_deleted_surface(tra
     assert client.chat_postMessage.await_count == (2 if transport.startswith("late") else 1)
     if transport != "late_post_after_summon":
         assert not (await adapter.send("C1", "final fallback", metadata=META)).success
+
+
+@pytest.mark.asyncio
+async def test_deleted_surface_send_is_not_retried_or_downgraded(caplog):
+    """The retry wrapper must not treat a deleted surface as a formatting failure: one guarded
+    send, no plain-text fallback, no Slack call, and no WARNING/ERROR noise per attempt."""
+    adapter, client = make_adapter()
+    assert (await adapter.send_or_update_status("C1", "progress", "working", metadata=META)).success
+    await adapter._handle_slack_message(deletion())
+    client.reset_mock()
+    guarded_send, attempts = adapter.send, []
+
+    async def counting_send(*args, **kwargs):
+        attempts.append(kwargs.get("content"))
+        return await guarded_send(*args, **kwargs)
+
+    adapter.send = counting_send
+    with caplog.at_level(logging.DEBUG):
+        result = await adapter._send_with_retry("C1", "final", metadata=META)
+    assert not result.success and result.error_kind == "not_found"
+    assert attempts == ["final"]
+    assert not client.mock_calls
+    assert not [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]

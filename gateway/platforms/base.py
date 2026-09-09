@@ -3218,6 +3218,10 @@ class BasePlatformAdapter(ABC):
         result = await _send(content)
         if result.success:
             return result
+        if result.error_kind == "not_found":
+            # A gone chat/thread/message: neither a retry nor a plain-text fallback can reach it.
+            logger.debug("[%s] Send target gone, not retrying: %s", self.name, result.error)
+            return result
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
         # Timeouts: not safe to retry (may have delivered) and not a formatting error.
