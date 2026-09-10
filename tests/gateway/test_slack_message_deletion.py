@@ -1,5 +1,6 @@
 """Deletion is an exact-surface stop, not an invitation to recreate a reply."""
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -210,3 +211,25 @@ async def test_missing_or_inflight_writes_cannot_resurrect_a_deleted_surface(tra
     assert client.chat_postMessage.await_count == (2 if transport.startswith("late") else 1)
     if transport != "late_post_after_summon":
         assert not (await adapter.send("C1", "final fallback", metadata=META)).success
+
+
+@pytest.mark.asyncio
+async def test_unset_authorization_check_makes_the_deny_visible(caplog):
+    """Deny-by-default stays, but an unset check must not be silent: it denies every
+    summon forever, so it is warned once (surface ids only, never user or text)."""
+    adapter, _client = make_adapter()
+    assert (await adapter.send_or_update_status("C1", "progress", "working", metadata=META)).success
+    await adapter._handle_slack_message(deletion())
+    adapter._authorization_check = None
+    with caplog.at_level(logging.DEBUG, logger="plugins.platforms.slack.deletion"):
+        await adapter._handle_slack_message(mention("<@UBOT> unknown auth", ts="122.000001"))
+        await adapter._handle_slack_message(mention("<@UBOT> unknown auth", ts="122.000002"))
+    adapter.handle_message.assert_not_awaited()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                and "No authorization check registered" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "channel=C1" in warnings[0]
+    denials = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG
+               and "Deletion fence denied summon" in r.getMessage()]
+    assert len(denials) == 2 and all("channel=C1" in message for message in denials)
+    assert "UHUMAN" not in caplog.text and "unknown auth" not in caplog.text
