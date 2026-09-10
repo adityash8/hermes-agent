@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import types
 
 import pytest
@@ -84,6 +85,23 @@ def _refuse_to_fire_live_weapons(request):
             pytrace=False,
         )
     yield
+
+
+def test_exited_spawned_child_may_still_be_signalled():
+    """Ownership is recorded at spawn, not re-derived from the live parent
+    chain (EZ-1023). A child that has already exited can be reparented, so
+    walking parents() would refuse a SIGTERM the test itself is allowed to
+    send."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    proc.wait(timeout=5)
+    try:
+        os.kill(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
 
 
 def test_fail_closed_probe_reports_guard_active():
