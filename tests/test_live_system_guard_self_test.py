@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import types
 
 import pytest
@@ -278,18 +279,50 @@ def test_subprocess_killall_hermes_blocked():
 # ──────────────────── pass-through cases (must NOT raise) ──────
 
 
+def test_os_kill_allows_pid_that_vanishes_during_ownership_walk(monkeypatch):
+    """A PID whose psutil lookup succeeds but whose ancestry walk then raises
+    ``NoSuchProcess`` must be ALLOWED, not blocked.
 
+    This is a real race, not a hypothetical. ``Popen.send_signal`` polls the
+    child first and only calls ``os.kill`` when it still looks alive; under
+    parallel load the child can exit and be reaped in the gap, so by the time
+    the guard walks its ancestry the PID is gone. The guard already treats a
+    failed ``psutil.Process()`` lookup as a stale PID and allows it — the walk
+    one line later has to reach the same verdict, because the kill is a no-op
+    either way. Before the fix a blanket ``except Exception: return False``
+    turned that race into a spurious ``RuntimeError``, flaking every test that
+    terminates a real subprocess (tests/agent/lsp/test_client_e2e.py and
+    tests/agent/lsp/test_stale_diagnostics.py, ~4% of runs under load).
 
+    The signal target here is our own live child, so the delivered SIGTERM is
+    both harmless and observable: the exit status proves the guard let the real
+    ``os.kill`` through rather than merely declining to raise.
+    """
+    psutil = pytest.importorskip("psutil")
 
+    class _VanishedProcess:
+        """Lookup succeeds, ancestry walk raises — exactly what psutil does
+        when the target is reaped between the two calls."""
 
+        def __init__(self, pid):
+            self.pid = pid
 
+        def parents(self):
+            raise psutil.NoSuchProcess(self.pid)
 
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        monkeypatch.setattr(psutil, "Process", _VanishedProcess)
+        os.kill(child.pid, signal.SIGTERM)
+    finally:
+        monkeypatch.undo()
+        try:
+            status = child.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+            child.kill()
+            status = child.wait(timeout=10)
 
-
-
-
-
-
+    assert status == -signal.SIGTERM
 
 
 # ──────────────────── bypass marker ─────────────────────────────
