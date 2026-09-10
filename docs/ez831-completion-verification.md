@@ -193,10 +193,15 @@ refresh preserves analytics grants without approving or renewing them.
 ## Source coverage and exact activation checklist
 
 No real Codewords/CookUnity source inventory or remote capability availability was
-inspected. The local test corpus uses synthetic stable client IDs. Parent must:
+inspected. The local test corpus uses synthetic stable client IDs. Parent must
+(step 1 has since completed):
 
-1. Review this diff and receipt, stage/commit from an authorized session, and merge
-   without overwriting unrelated live-checkout changes. No deployment has occurred.
+1. **Completed.** This diff and receipt were committed from an authorized session as
+   `d3666d3edc` ("feat: complete scoped client context analytics and acceptance
+   (EZ-831)", 2026-09-08) and merged onto `jarvis/ez-807-slack-message-tools` by
+   `6789322d44` the same day, without overwriting unrelated live-checkout changes.
+   The merge has not reached `main`. No deployment has occurred; steps 2-8 below
+   remain outstanding.
 2. Inventory approved source coverage separately for each client's orientation,
    current research, decision history, scorecards and allowed deeper reports. Assign
    stable client IDs; record exact source paths/hashes, safe citations, observation/

@@ -1,9 +1,12 @@
 # EZ-831 implementation evidence
 
-Status: implemented and locally verified on the isolated continuation worktree,
-based on `3d65a02547` / `e7cc08f99b`. Live activation remains gated. Parent owns
-merge and Linear updates. No push, upstream PR, deploy, restart, Slack post, real
-credential/customer-data read, live grant/config edit or live API request occurred.
+Status: implemented, locally verified on the isolated continuation worktree based on
+`3d65a02547` / `e7cc08f99b`, and committed as `8f9b05454a` on 2026-09-08. Merge commit
+`6789322d44`, the same day, brought it onto `jarvis/ez-807-slack-message-tools` (also
+reachable as `jarvis/ez-831-live-candidate`); it is not on `main`. Live activation
+remains gated. No push, upstream PR, deploy, restart, Slack post, real
+credential/customer-data read, live grant/config edit or live API request occurred
+during the work this receipt records.
 
 ## Delivered capability
 
@@ -146,7 +149,12 @@ Staging the ten scoped implementation/test/document files was attempted with
 fatal: Unable to create '/Users/adityasheth/.hermes/hermes-agent/.git/worktrees/ez-831-direct/index.lock': Operation not permitted
 ```
 
-No workaround or security bypass was attempted. Changes remain **unstaged and
-uncommitted** in this isolated worktree. No commit or merge was attempted after
-this rejection. Parent must stage/commit/merge from an authorized session; the
-verified code and this receipt are the handoff.
+No workaround or security bypass was attempted at the time, and no commit or merge
+was attempted from that worktree. The handoff has since completed: the eight
+implementation, test and document files, including this receipt, were staged and
+committed from an authorized session as **`8f9b05454a`** ("feat: add account-bound
+GA4 reads to scoped context (EZ-831)", 2026-09-08), and merged onto
+`jarvis/ez-807-slack-message-tools` by **`6789322d44`** on 2026-09-08. That merge has
+not reached `main`, so `git ls-tree` on `main` still shows none of these files. The
+sandbox rejection above is kept as a record of what happened during verification; it
+no longer describes the state of the tree.
