@@ -296,20 +296,27 @@ class WebhookAdapter(BasePlatformAdapter):
         window.append(now)
         return True
 
-    def _record_delivery_id(self, delivery_id: str, now: float) -> bool:
+    @staticmethod
+    def _delivery_cache_key(route_name: str, delivery_id: str) -> str:
+        """Idempotency is per route. GitHub retries reuse an id on one URL;
+        the same header on a second route must not be treated as a duplicate."""
+        return f"{route_name}\n{delivery_id}"
+
+    def _record_delivery_id(self, delivery_id: str, now: float, *, route_name: str) -> bool:
         """Return True when this delivery should be processed."""
-        if (seen_at := self._seen_deliveries.get(delivery_id)) is not None and now - seen_at < self._idempotency_ttl:
+        key = self._delivery_cache_key(route_name, delivery_id)
+        if (seen_at := self._seen_deliveries.get(key)) is not None and now - seen_at < self._idempotency_ttl:
             return False
         if seen_at is not None:
-            self._seen_deliveries.pop(delivery_id, None)
-        self._seen_deliveries[delivery_id] = now
+            self._seen_deliveries.pop(key, None)
+        self._seen_deliveries[key] = now
         if len(self._seen_deliveries) > max(self._rate_limit * 2, 128):
             self._prune_seen_deliveries(now)
         return True
 
-    def _forget_delivery_id(self, delivery_id: str) -> None:
+    def _forget_delivery_id(self, delivery_id: str, *, route_name: str) -> None:
         """Drop a reservation that never reached dispatch so a later retry can run."""
-        self._seen_deliveries.pop(delivery_id, None)
+        self._seen_deliveries.pop(self._delivery_cache_key(route_name, delivery_id), None)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
@@ -544,7 +551,7 @@ class WebhookAdapter(BasePlatformAdapter):
         delivery_id = headers.get("X-GitHub-Delivery", headers.get(
             "svix-id", headers.get("X-Request-ID", str(int(time.time() * 1000)))))
         now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
+        if not self._record_delivery_id(delivery_id, now, route_name=route_name):
             logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
             return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
         # Script, prompt render and skill lookup read the profile's home (skills/, config); the runner
@@ -560,7 +567,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 if not keep:
                     # Timeout, crash, or explicit ignore: do not consume the
                     # delivery id, so GitHub/Svix can retry after recovery.
-                    self._forget_delivery_id(delivery_id)
+                    self._forget_delivery_id(delivery_id, route_name=route_name)
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
                     return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
                 payload = transformed_payload or payload

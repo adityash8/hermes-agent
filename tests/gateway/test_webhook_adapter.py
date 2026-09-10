@@ -575,6 +575,40 @@ class TestIdempotency:
             assert calls["n"] == 1
 
     @pytest.mark.asyncio
+    async def test_in_flight_script_does_not_block_other_route(self):
+        """A reservation on route A must not 200-duplicate the same delivery
+        on route B (Codex EZ-1029 review)."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def _blocking_script(_script, payload):
+            started.set()
+            release.wait(timeout=5)
+            return False, None
+
+        routes = {
+            "slow": {"secret": _INSECURE_NO_AUTH, "prompt": "test", "script": "true"},
+            "other": {"secret": _INSECURE_NO_AUTH, "prompt": "test"},
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._route_processor.run_route_script = _blocking_script
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"X-GitHub-Delivery": "delivery-shared"}
+            first = asyncio.create_task(cli.post("/webhooks/slow", json={"a": 1}, headers=headers))
+            await asyncio.to_thread(started.wait, 2)
+            assert started.is_set()
+            other = await cli.post("/webhooks/other", json={"a": 1}, headers=headers)
+            release.set()
+            ignored = await first
+            assert ignored.status == 200
+            assert (await ignored.json())["reason"] == "script"
+            assert other.status == 202
+            assert adapter.handle_message.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_filtered_event_does_not_pin_delivery_id_for_other_route(self):
         """A reject on route A must not consume the delivery id for route B
         (adapter-wide cache; Codex EZ-1029 review)."""
