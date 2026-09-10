@@ -81,7 +81,17 @@ def test_module_stub_does_not_shadow_installed_slack_bolt():
     installed SDKs before any test module is imported, which makes the guard
     above short-circuit. This pins that binding, and fails in a per-file run —
     the shape ``scripts/run_tests.sh`` actually uses — if it regresses.
+
+    A conftest outside this directory can stub ``sys.modules`` before the
+    gateway conftest is even imported (``tests/e2e/conftest.py`` does), and no
+    binding here can undo that; in that collection order this skips instead of
+    reporting a regression it did not cause.
     """
+    from tests.gateway.conftest import SLACK_STUBBED_BEFORE_GATEWAY_CONFTEST
+
+    if SLACK_STUBBED_BEFORE_GATEWAY_CONFTEST:
+        pytest.skip("Slack was stubbed before tests/gateway/conftest.py was imported")
+
     for name in ("slack_bolt", "slack_sdk"):
         if PathFinder.find_spec(name) is None:
             pytest.skip(f"{name} is not installed in this environment")

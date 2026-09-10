@@ -35,6 +35,7 @@ import ast
 import importlib
 import sys
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock
 
 import pytest
@@ -327,6 +328,17 @@ def _ensure_discord_mock() -> None:
     sys.modules["discord.ext.commands"] = commands_mod
 
 
+# ``True`` when something outside this directory already put Slack stubs in
+# ``sys.modules`` before this conftest was imported — ``tests/e2e/conftest.py``
+# does exactly that. Nothing here can undo it, so tests that pin the binding
+# below skip rather than fail. Captured at import time, before
+# ``_ensure_slack_sdks()`` runs.
+SLACK_STUBBED_BEFORE_GATEWAY_CONFTEST = any(
+    name in sys.modules and not isinstance(sys.modules[name], ModuleType)
+    for name in ("slack_sdk", "slack_bolt")
+)
+
+
 def _ensure_slack_sdks() -> None:
     """Bind the *installed* Slack SDKs before any test file's stub can win.
 
@@ -347,6 +359,11 @@ def _ensure_slack_sdks() -> None:
     ``already in sys.modules`` guard short-circuit and collection order stops
     deciding which implementation a test sees. When the extra is not installed
     there is nothing to bind and the per-file stubs take over as before.
+
+    This only reaches as far as this directory: a conftest *outside* it can
+    stub ``sys.modules`` before this file is imported (``tests/e2e/conftest.py``
+    does), and then ``import_module`` just hands back that stub. See
+    ``SLACK_STUBBED_BEFORE_GATEWAY_CONFTEST`` above.
     """
     for name in ("slack_sdk", "slack_bolt"):
         try:
