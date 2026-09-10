@@ -1061,9 +1061,11 @@ async def test_unknown_route_directly_after_admission_never_uses_legacy(runner, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "path", ["admission", "ingress-denied", "turn-denied", "turn-failed", "malformed-slack-event"]
+    "path",
+    ["admission", "adapter-no-callback", "ingress-denied", "turn-denied", "turn-failed",
+     "revalidation-failed", "malformed-slack-event"],
 )
-async def test_each_deny_path_logs_exactly_one_static_record(runner, wire, native_owner, caplog, path):
+async def test_each_deny_path_logs_exactly_one_static_record(runner, corpus, wire, native_owner, caplog, path):
     from plugins.platforms.slack.client_context import admit_event
 
     caplog.set_level(logging.INFO)
@@ -1071,6 +1073,11 @@ async def test_each_deny_path_logs_exactly_one_static_record(runner, wire, nativ
         runner._is_user_authorized_for_source.return_value = False
         assert await cc.admission(runner, event().source) == "deny"
         chat, marker = "channel-a", "denied at admission"
+    elif path == "adapter-no-callback":
+        # A Slack adapter that turns client context on without wiring its admission callback
+        # must fail closed instead of silently handing the event to the legacy path.
+        assert await cc.adapter_admission(SimpleNamespace(client_context_enabled=True), event().source) == "deny"
+        chat, marker = "channel-a", "no admission callback"
     elif path == "ingress-denied":
         assert await runner._handle_message(event(chat_id="foreign-channel")) == cc.DENIED
         chat, marker = "foreign-channel", "denied at ingress"
@@ -1084,6 +1091,12 @@ async def test_each_deny_path_logs_exactly_one_static_record(runner, wire, nativ
         wire.state.error = True
         assert await runner._handle_message(event()) == cc.FAILED
         chat, marker = "channel-a", "turn failed"
+    elif path == "revalidation-failed":
+        # Ingress admits the route; a granted source file changes while the provider call is in
+        # flight, so the post-completion digest recheck rejects the answer instead of sending it.
+        wire.state.callback = lambda body: (corpus.root / "a.txt").write_text("edited midflight", encoding="utf-8")
+        assert await runner._handle_message(event()) is None
+        chat, marker = "channel-a", "revalidation failed"
     else:
         adapter, _ = native_owner
         assert await admit_event(adapter, {"channel": "Downer"}, {"team_id": "workspace-synthetic"}) == ("deny", None)
