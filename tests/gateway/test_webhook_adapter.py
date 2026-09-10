@@ -574,6 +574,26 @@ class TestIdempotency:
             assert adapter.handle_message.await_count == 1
             assert calls["n"] == 1
 
+    @pytest.mark.asyncio
+    async def test_script_failure_releases_delivery_id_for_retry(self):
+        """A timed-out or failing script must not pin the delivery id for the
+        idempotency TTL, or GitHub cannot recover (EZ-1029 review)."""
+        routes = {"fail": {"secret": _INSECURE_NO_AUTH, "prompt": "test", "script": "true"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._route_processor.run_route_script = lambda *_a, **_k: (False, None)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"X-GitHub-Delivery": "delivery-retry"}
+            first = await cli.post("/webhooks/fail", json={"a": 1}, headers=headers)
+            assert first.status == 200
+            assert (await first.json())["reason"] == "script"
+            adapter._route_processor.run_route_script = lambda *_a, **_k: (True, {"a": 1})
+            second = await cli.post("/webhooks/fail", json={"a": 1}, headers=headers)
+            assert second.status == 202
+            assert adapter.handle_message.await_count == 1
+
 
 # ===================================================================
 # Rate limiting

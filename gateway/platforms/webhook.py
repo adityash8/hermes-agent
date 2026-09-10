@@ -307,6 +307,10 @@ class WebhookAdapter(BasePlatformAdapter):
             self._prune_seen_deliveries(now)
         return True
 
+    def _forget_delivery_id(self, delivery_id: str) -> None:
+        """Drop a reservation that never reached dispatch so a later retry can run."""
+        self._seen_deliveries.pop(delivery_id, None)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
 
@@ -551,6 +555,9 @@ class WebhookAdapter(BasePlatformAdapter):
                 keep, transformed_payload = await asyncio.to_thread(
                     self._route_processor.run_route_script, script, payload)
                 if not keep:
+                    # Timeout, crash, or explicit ignore: do not consume the
+                    # delivery id, so GitHub/Svix can retry after recovery.
+                    self._forget_delivery_id(delivery_id)
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
                     return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
                 payload = transformed_payload or payload
