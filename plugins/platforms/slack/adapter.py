@@ -2238,7 +2238,13 @@ class SlackAdapter(SlackDeletionMixin):
             return False
         except Exception as e:
             # The call confirmed nothing, so the receipt must not survive: a later external
-            # deletion of this message would otherwise be read as our own cleanup.
+            # deletion of this message would otherwise be read as our own cleanup, and the
+            # human's delete — their way of telling this thread to stop — would be ignored.
+            # The accepted cost runs the other way: if Slack did delete the message and only
+            # the response was lost, the message_deleted event now mutes the surface, and the
+            # owner has to mention Jarvis again to revive it. Both are guesses about an
+            # ambiguous outcome; only one of them lets the agent keep writing into a thread
+            # somebody tried to shut down.
             self._forget_cleanup(key, message_id)
             response = getattr(e, "response", None)
             if hasattr(response, "get") and response.get("error") == "message_not_found":
