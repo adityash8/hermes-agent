@@ -1107,3 +1107,35 @@ async def test_each_deny_path_logs_exactly_one_static_record(runner, corpus, wir
     assert chat in message and marker in message
     assert "secret" not in message and "TOKEN_SYNTHETIC" not in message and "Traceback" not in message
     assert records[0].exc_info is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "chat", "marker"),
+    [("dm-disabled", "Downer", "denied by adapter restrictions"),
+     ("channel-not-allowed", "channel-a", "not an allowed channel")],
+)
+async def test_adapter_restriction_denies_log_exactly_one_static_info_record(
+        runner, native_owner, caplog, path, chat, marker):
+    """The two adapter-restriction denies are configured policy, not failures, so they log at INFO
+    while every other deny stays a WARNING. They still owe exactly one static record per deny,
+    naming the channel and nothing else."""
+    from plugins.platforms.slack.client_context import admit_event
+
+    adapter, _ = native_owner
+    if path == "dm-disabled":
+        adapter.config.extra["disable_dms"] = True
+        payload = {"channel": "Downer", "channel_type": "im", "user": "owner-user"}
+    else:
+        # A granted route still has to clear the adapter's own channel allowlist.
+        adapter.config.extra["allowed_channels"] = ["channel-b"]
+        payload = {"channel": "channel-a", "channel_type": "channel", "user": "owner-user"}
+    caplog.set_level(logging.INFO)
+    mode, source = await admit_event(adapter, payload, {"team_id": "workspace-synthetic"})
+    assert mode == "deny" and source is not None and source.chat_id == chat
+    records = [r for r in caplog.records if r.name.endswith("client_context")]
+    assert len(records) == 1 and records[0].levelno == logging.INFO
+    message = records[0].getMessage()
+    assert chat in message and marker in message
+    assert "secret" not in message and "TOKEN_SYNTHETIC" not in message and "Traceback" not in message
+    assert records[0].exc_info is None
