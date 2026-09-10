@@ -575,6 +575,38 @@ class TestIdempotency:
             assert calls["n"] == 1
 
     @pytest.mark.asyncio
+    async def test_filtered_event_does_not_pin_delivery_id_for_other_route(self):
+        """A reject on route A must not consume the delivery id for route B
+        (adapter-wide cache; Codex EZ-1029 review)."""
+        routes = {
+            "pulls": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "events": ["pull_request"],
+            },
+            "pushes": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "events": ["push"],
+            },
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {
+                "X-GitHub-Delivery": "delivery-shared",
+                "X-GitHub-Event": "push",
+            }
+            ignored = await cli.post("/webhooks/pulls", json={"a": 1}, headers=headers)
+            assert ignored.status == 200
+            assert (await ignored.json())["status"] == "ignored"
+            accepted = await cli.post("/webhooks/pushes", json={"a": 1}, headers=headers)
+            assert accepted.status == 202
+            assert adapter.handle_message.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_script_failure_releases_delivery_id_for_retry(self):
         """A timed-out or failing script must not pin the delivery id for the
         idempotency TTL, or GitHub cannot recover (EZ-1029 review)."""

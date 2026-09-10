@@ -525,15 +525,6 @@ class WebhookAdapter(BasePlatformAdapter):
         if payload is _UNPARSEABLE:
             return _json_error("Cannot parse body", 400)
         headers = request.headers
-        # Record before any await that can yield (route scripts can take tens of
-        # seconds). Overlapping GitHub/Svix retries of the same delivery id both
-        # pass the cache if we wait until after the script.
-        delivery_id = headers.get("X-GitHub-Delivery", headers.get(
-            "svix-id", headers.get("X-Request-ID", str(int(time.time() * 1000)))))
-        now = time.time()
-        if not self._record_delivery_id(delivery_id, now):
-            logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
-            return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
         event_type = (headers.get("X-GitHub-Event", "") or headers.get("X-GitLab-Event", "")
                       or payload.get("event_type", "") or payload.get("type", "") or "unknown")
         allowed_events = route_config.get("events", [])
@@ -544,6 +535,18 @@ class WebhookAdapter(BasePlatformAdapter):
         if not self._route_processor.route_filters_match(route_config, payload, event_type, request.headers):
             logger.info("[webhook] filtered event=%s route=%s", event_type, route_name)
             return web.json_response({"status": "ignored", "reason": "filter", "route": route_name})
+        # After the synchronous filters, before any await that can yield (route
+        # scripts can take tens of seconds). Overlapping GitHub/Svix retries of
+        # the same delivery id both pass the cache if we wait until after the
+        # script. Do not reserve on ignored/filtered events — the cache is
+        # adapter-wide, so a reject on one route would drop the same delivery
+        # on another route for the TTL.
+        delivery_id = headers.get("X-GitHub-Delivery", headers.get(
+            "svix-id", headers.get("X-Request-ID", str(int(time.time() * 1000)))))
+        now = time.time()
+        if not self._record_delivery_id(delivery_id, now):
+            logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
+            return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
         # Script, prompt render and skill lookup read the profile's home (skills/, config); the runner
         # only enters the routed profile's scope later around handle_message, so enter it here.
         # See #67277.
