@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -257,11 +257,16 @@ def execute(grants, arguments, check):
             rows = _report(raw, grant, start, end)
             _property(_request(client, "GET", url, token, guarded), grant)
         guarded()
+        # A day GA4 omitted must read as absent, never as a full period.
+        covered = {row["date"] for row in rows}
+        expected = ((start + timedelta(days=i)).isoformat() for i in range((end - start).days + 1))
+        missing = [day for day in expected if day not in covered]
         return json.dumps({"operation": TOOL, "grant_id": grant.id, **grant.binding,
             "start_date": start.isoformat(), "end_date": end.isoformat(), "time_zone": grant.time_zone,
             "retrieved_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "status": "observation", "approval": "not_a_decision_approval",
             "freshness": "queried_at_retrieved_at; historical_dates; not_realtime",
+            "complete": not missing, "missing_dates": missing,
             "rows": rows}, sort_keys=True)
     except Exception:
         # Neither upstream error bodies nor credential-bearing request exceptions
