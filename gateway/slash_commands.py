@@ -39,6 +39,17 @@ _ROLLBACK_SKIP_LINES = (("skipped_user_edits", "gateway.rollback.kept_user_edits
                         ("skipped_oversize", "gateway.rollback.kept_oversize"),
                         ("failed_deletes", "gateway.rollback.failed_deletes"))
 
+# Upstream product name -> the Slack app's name. Only the bare word is rewritten, and only its
+# first occurrence: hyphenated compounds (`Hermes-4-405B`), lowercase commands and paths
+# (`hermes resume`, `~/.hermes`) and `HERMES_HOME` are data, not branding.
+_SLACK_BRAND_RE = re.compile(r"\bHermes(?: Agent)?(?![\w-])")
+
+
+def _slack_brand(text: str) -> str:
+    """Rebrand the fixed product name in *text* for Slack surfaces."""
+    return _SLACK_BRAND_RE.sub("Jarvis", text, count=1)
+
+
 # /busy input modes -> (status-card behavior, set-confirmation behavior).
 _BUSY_MODE_BEHAVIOR = {
     "queue": ("queues for next turn", "Messages will be queued for the next turn while Hermes is busy."),
@@ -561,9 +572,7 @@ class GatewaySlashCommandsMixin(
     async def _handle_version_command(self, event: MessageEvent) -> str:
         """Handle /version — show the running Hermes Agent version."""
         label = _execute("version").text
-        if event.source.platform == Platform.SLACK and label.startswith("Hermes Agent v"):
-            return "Jarvis" + label.removeprefix("Hermes Agent")
-        return label
+        return _slack_brand(label) if event.source.platform == Platform.SLACK else label
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""
@@ -971,7 +980,7 @@ class GatewaySlashCommandsMixin(
         description = _BUSY_MODE_BEHAVIOR[arg][1]
         if event.source.platform == Platform.SLACK:
             # Only the fixed mode description is branded, never message content.
-            description = description.replace("Hermes", "Jarvis")
+            description = _slack_brand(description)
         return EphemeralReply(
             f"Busy input mode set to **`{arg}`** (saved).\n_{description}_")
 
@@ -1263,7 +1272,7 @@ class GatewaySlashCommandsMixin(
             return t("gateway.update.start_failed", error=e)
         self._schedule_update_notification_watch()
         notice = t("gateway.update.starting")
-        return notice.replace("Hermes", "Jarvis") if src.platform == Platform.SLACK else notice
+        return _slack_brand(notice) if src.platform == Platform.SLACK else notice
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
