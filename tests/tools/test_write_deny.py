@@ -87,9 +87,11 @@ class TestWriteAllowed:
         assert _is_write_denied("/tmp/safe_file.txt") is False
 
 
-    def test_hermes_control_files_requested_writable(self):
+    def test_hermes_credential_files_are_write_denied(self):
         from hermes_constants import get_hermes_home
 
         home = get_hermes_home()
-        for name in ["auth.json", "config.yaml", "webhook_subscriptions.json"]:
-            assert _is_write_denied(str(home / name)) is False, f"{name} should be writable"
+        # config.yaml is gated by _check_sensitive_path, not this denylist.
+        assert _is_write_denied(str(home / "config.yaml")) is False
+        for name in ["auth.json", "auth.lock", "webhook_subscriptions.json"]:
+            assert _is_write_denied(str(home / name)) is True, f"{name} should be denied"
