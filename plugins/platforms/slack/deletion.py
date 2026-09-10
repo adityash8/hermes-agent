@@ -2,8 +2,11 @@
 
 Only observed deletions are actionable; Slack does not replay every event missed
 while offline. State survives reconnects/session resets in the profile home. The
-adapter's single-writer token lock also owns this atomic file. Tombstones are not
-expired: only a newer, authorized direct mention reopens a surface.
+adapter's single-writer token lock also owns this atomic file. Tombstones never
+time out: only a newer, authorized direct mention reopens a surface. Thread records
+are capacity-bounded so the file cannot grow without bound; eviction drops the single
+least-recently-active record and logs it, so a live or freshly muted surface is never
+the victim and no burst silently reverses a fence.
 """
 from __future__ import annotations
 
@@ -185,7 +188,17 @@ class SlackDeletionMixin(BasePlatformAdapter):
         record = {**record, "muted": True, "generation": record.get("generation", 0) + 1,
                   "cutoff": max(str(event_ts), record.get("cutoff", "")),
                   "deleted": [*record.get("deleted", []), deleted_ts]}
-        state["threads"][json.dumps(key)] = record
+        threads = state["threads"]
+        # Re-insert so eviction orders by last activity, not by first deletion.
+        threads.pop(json.dumps(key), None)
+        threads[json.dumps(key)] = record
+        # Evict one at a time like the sibling cleanup receipts: dropping a tombstone
+        # unmutes that surface, so spend the whole cap and never reverse a fence in bulk.
+        while len(threads) > self._BOT_TS_MAX:
+            evicted = next(iter(threads))
+            del threads[evicted]
+            logger.info("[Slack] Dropped oldest deleted bot surface at cap=%d; no longer muted "
+                        "workspace=%s channel=%s thread=%s", self._BOT_TS_MAX, *json.loads(evicted))
         self._save_deletions()
         logger.info("[Slack] Silenced deleted bot surface workspace=%s channel=%s thread=%s", *key)
         cancellations = self._lazy_attr("_slack_deletion_cancellations", dict)
@@ -255,6 +268,8 @@ class SlackDeletionMixin(BasePlatformAdapter):
         if authorized is not True:
             return False
         record.update(muted=False, generation=record["generation"] + 1)
+        threads = self._deletion_state()["threads"]
+        threads[json.dumps(key)] = threads.pop(json.dumps(key), record)
         self._save_deletions()
         return True
 
