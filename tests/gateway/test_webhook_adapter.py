@@ -16,6 +16,7 @@ Covers:
 
 import asyncio
 import base64
+import threading
 import hashlib
 import hmac
 import json
@@ -537,6 +538,41 @@ class TestIdempotency:
             assert resp2.status == 200
             data = await resp2.json()
             assert data["status"] == "duplicate"
+
+    @pytest.mark.asyncio
+    async def test_overlapping_same_delivery_id_during_script_is_duplicate(self):
+        """A retry that arrives while the first request is still in the route
+        script must not spawn a second agent run (EZ-1029)."""
+        started = threading.Event()
+        release = threading.Event()
+        calls = {"n": 0}
+
+        def _blocking_script(_script, payload):
+            calls["n"] += 1
+            started.set()
+            release.wait(timeout=5)
+            return True, payload
+
+        routes = {"slow": {"secret": _INSECURE_NO_AUTH, "prompt": "test", "script": "true"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._route_processor.run_route_script = _blocking_script
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"X-GitHub-Delivery": "delivery-overlap"}
+            first = asyncio.create_task(cli.post("/webhooks/slow", json={"a": 1}, headers=headers))
+            await asyncio.to_thread(started.wait, 2)
+            assert started.is_set()
+            second = await cli.post("/webhooks/slow", json={"a": 1}, headers=headers)
+            release.set()
+            resp1 = await first
+            assert resp1.status == 202
+            assert second.status == 200
+            data = await second.json()
+            assert data["status"] == "duplicate"
+            assert adapter.handle_message.await_count == 1
+            assert calls["n"] == 1
 
 
 # ===================================================================
