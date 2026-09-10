@@ -1060,7 +1060,9 @@ async def test_unknown_route_directly_after_admission_never_uses_legacy(runner, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("path", ["admission", "turn-denied", "turn-failed", "malformed-slack-event"])
+@pytest.mark.parametrize(
+    "path", ["admission", "ingress-denied", "turn-denied", "turn-failed", "malformed-slack-event"]
+)
 async def test_each_deny_path_logs_exactly_one_static_record(runner, wire, native_owner, caplog, path):
     from plugins.platforms.slack.client_context import admit_event
 
@@ -1068,21 +1070,27 @@ async def test_each_deny_path_logs_exactly_one_static_record(runner, wire, nativ
     if path == "admission":
         runner._is_user_authorized_for_source.return_value = False
         assert await cc.admission(runner, event().source) == "deny"
-        chat = "channel-a"
-    elif path == "turn-denied":
+        chat, marker = "channel-a", "denied at admission"
+    elif path == "ingress-denied":
         assert await runner._handle_message(event(chat_id="foreign-channel")) == cc.DENIED
-        chat = "foreign-channel"
+        chat, marker = "foreign-channel", "denied at ingress"
+    elif path == "turn-denied":
+        # An authorized route reaches handle_turn; the interactive payload is what it rejects.
+        trigger = event()
+        trigger.prompt_response = {"prompt_id": "private-approval", "option_id": "approve"}
+        assert await runner._handle_message(trigger) == cc.DENIED
+        chat, marker = "channel-a", "turn denied"
     elif path == "turn-failed":
         wire.state.error = True
         assert await runner._handle_message(event()) == cc.FAILED
-        chat = "channel-a"
+        chat, marker = "channel-a", "turn failed"
     else:
         adapter, _ = native_owner
         assert await admit_event(adapter, {"channel": "Downer"}, {"team_id": "workspace-synthetic"}) == ("deny", None)
-        chat = "Downer"
+        chat, marker = "Downer", "failed admission checks"
     records = [r for r in caplog.records if r.name.endswith("client_context")]
     assert len(records) == 1 and records[0].levelno == logging.WARNING
     message = records[0].getMessage()
-    assert chat in message and ("denied" in message or "failed" in message)
+    assert chat in message and marker in message
     assert "secret" not in message and "TOKEN_SYNTHETIC" not in message and "Traceback" not in message
     assert records[0].exc_info is None
