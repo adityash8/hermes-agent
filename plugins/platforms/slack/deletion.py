@@ -186,25 +186,45 @@ class SlackDeletionMixin(BasePlatformAdapter):
                   "cutoff": max(str(event_ts), record.get("cutoff", "")),
                   "deleted": [*record.get("deleted", []), deleted_ts]}
         state["threads"][json.dumps(key)] = record
+        # A top-level bot post is its own surface root, but a run that answers at channel level
+        # (``reply_in_thread: false``, reaction handoffs, flat DMs) is keyed without a thread, so
+        # the mute above cannot reach it. Bump that surface's epoch, but only while such a run is
+        # actually live: it stops writing and its late post is cleaned up. With no run to stop the
+        # bump has nothing to gain and would fail — and then chat_delete — any unrelated
+        # channel-level write in flight. No tombstone either: the thread-less surface is the whole
+        # channel, and under the default ``reply_in_thread: true`` a summon resolves a per-message
+        # key, so that mute would never lift and would silence every later post in the channel.
+        flat = (key[0], key[1], "") if key[2] == deleted_ts else None
+        if flat is not None and not self._surface_sessions(flat):
+            flat = None
+        if flat is not None:
+            flat_record = self._deletion_record(flat)
+            state["threads"][json.dumps(flat)] = {
+                **flat_record, "generation": flat_record.get("generation", 0) + 1}
         self._save_deletions()
         logger.info("[Slack] Silenced deleted bot surface workspace=%s channel=%s thread=%s", *key)
         cancellations = self._lazy_attr("_slack_deletion_cancellations", dict)
-        task = cancellations.get(key)
-        if task is None or task.done():
-            task = asyncio.create_task(self._cancel_deleted_surface(key))
-            cancellations[key] = task
-        if wait:
-            await asyncio.shield(task)
+        for surface in ([key, flat] if flat is not None else [key]):
+            task = cancellations.get(surface)
+            if task is None or task.done():
+                task = asyncio.create_task(self._cancel_deleted_surface(surface))
+                cancellations[surface] = task
+            if wait:
+                await asyncio.shield(task)
+
+    def _surface_sessions(self, key):
+        """Live sessions keyed to this exact surface (snapshot: callers await between items)."""
+        return [(session_key, source)
+                for session_key, source in self._lazy_attr("_slack_surface_sessions", dict).items()
+                if (source.scope_id or "", source.chat_id, source.thread_id or "") == key]
 
     async def _cancel_deleted_surface(self, key):
         # Do not clear wake caches: the tombstone dominates them until a fresh summon.
-        sources = self._lazy_attr("_slack_surface_sessions", dict)
-        for session_key, source in list(sources.items()):
-            if (source.scope_id or "", source.chat_id, source.thread_id or "") == key:
-                try:
-                    await self.request_session_cancellation(session_key, source)
-                except Exception:
-                    logger.exception("[Slack] Could not cancel deleted surface session")
+        for session_key, source in self._surface_sessions(key):
+            try:
+                await self.request_session_cancellation(session_key, source)
+            except Exception:
+                logger.exception("[Slack] Could not cancel deleted surface session")
 
     async def _handle_message_deleted(self, event, payload):
         previous = event.get("previous_message") or {}
