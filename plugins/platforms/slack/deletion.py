@@ -257,7 +257,7 @@ class SlackDeletionMixin(BasePlatformAdapter):
             # that drops set_authorization_check would leave the surface muted forever.
             if getattr(self, "_authorization_check", None) is None:
                 if not getattr(self, "_slack_deletion_auth_unset_warned", False):
-                    self._slack_deletion_auth_unset_warned = True  # Warn once per process.
+                    self._slack_deletion_auth_unset_warned = True  # Warn once per adapter.
                     logger.warning(
                         "[Slack] No authorization check registered; deletion fence denies every "
                         "summon workspace=%s channel=%s thread=%s", *key)
