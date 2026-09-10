@@ -154,7 +154,15 @@ async def test_tool_derivation_never_uses_defaults(runner, extended, wire, monke
 
 @pytest.mark.asyncio
 async def test_non_json_config_values_keep_read_tools(runner, extended, wire):
+    # Every non-JSON value safe_load can produce: a timestamp, an unordered !!set, and !!binary.
     extended["agent"]["policy_updated"] = datetime.date(2026, 9, 9)
+    extended["agent"]["audited_by"] = {"reviewer-b", "reviewer-a", "reviewer-c"}
+    extended["agent"]["signature"] = b"\x00policy"
+    source = event().source
+    opts = cc.configured(runner.config)
+    # The turn re-derives this fingerprint mid-flight and aborts on any drift, so an unstable
+    # rendering would kill live turns rather than merely miss a cache.
+    assert turn.tool_policy(runner, source, opts) == turn.tool_policy(runner, source, opts)
     read_then_answer(wire)
     assert await runner._handle_message(event()) == "dated evidence only. [brief-a]"
     assert {t["function"]["name"] for t in wire.captured[0]["tools"]} == {"scoped_source_read"}
