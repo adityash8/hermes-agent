@@ -3243,6 +3243,12 @@ class BasePlatformAdapter(ABC):
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
+                if result.error_kind == "not_found":
+                    # The target went away during the backoff. Same reasoning as the pre-retry
+                    # check above: neither another retry nor the plain-text fallback can reach it.
+                    logger.debug("[%s] Send target gone on retry %d, not retrying: %s",
+                                 self.name, attempt, result.error)
+                    return result
                 error_str = result.error or ""
                 server_retry_after = result.retry_after  # None unless the server asked again
                 if not (result.retryable or self._is_retryable_error(error_str)):
