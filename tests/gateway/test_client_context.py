@@ -901,7 +901,10 @@ async def test_owner_relay_retains_prompt_and_media_path(native_owner, runner, p
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("denial", ["unknown", "missing-workspace", "revoked", "unauthorized", "unbound"])
+@pytest.mark.parametrize(
+    "denial",
+    ["unknown", "missing-workspace", "revoked", "unauthorized", "unbound", "unrecognized-mode"],
+)
 async def test_denied_relay_cannot_poison_reply_or_replay_state(runner, corpus, denial):
     from gateway.relay.adapter import RelayAdapter
 
@@ -926,6 +929,9 @@ async def test_denied_relay_cannot_poison_reply_or_replay_state(runner, corpus, 
         corpus.save()
     elif denial == "unauthorized":
         runner._is_user_authorized_for_source.return_value = False
+    elif denial == "unrecognized-mode":
+        # A misspelled or future admission mode must not fall through to legacy.
+        adapter._client_context_admission = AsyncMock(return_value="stict")
     else:
         adapter._client_context_admission = None
     await adapter._on_inbound(trigger)
