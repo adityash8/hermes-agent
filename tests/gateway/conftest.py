@@ -32,6 +32,7 @@ incident.
 """
 
 import ast
+import importlib
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -326,9 +327,38 @@ def _ensure_discord_mock() -> None:
     sys.modules["discord.ext.commands"] = commands_mod
 
 
+def _ensure_slack_sdks() -> None:
+    """Bind the *installed* Slack SDKs before any test file's stub can win.
+
+    Roughly twenty gateway test files install a ``MagicMock`` stub for
+    ``slack_bolt``/``slack_sdk`` at module-import time so that
+    ``plugins.platforms.slack.adapter`` still imports without the optional
+    ``slack`` extra. Those stubs are process-global: in a single-process run
+    the first such file collected claims ``sys.modules`` for every file after
+    it. That makes ``test_slack_bolt_deletion_ingress.py`` — which needs the
+    real Bolt authorization/middleware stack — order-dependent; collected
+    after a stubbing file it dies with ``No module named 'slack_bolt.request';
+    'slack_bolt' is not a package``. The per-file subprocess isolation of
+    ``scripts/run_tests.sh`` hides this, but any single-process run that names
+    a stubbing file first hits it.
+
+    conftest is imported before every test module in this directory, so
+    importing the real packages here makes each file's own
+    ``already in sys.modules`` guard short-circuit and collection order stops
+    deciding which implementation a test sees. When the extra is not installed
+    there is nothing to bind and the per-file stubs take over as before.
+    """
+    for name in ("slack_sdk", "slack_bolt"):
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            pass  # optional ``slack`` extra absent — per-file mocks handle it
+
+
 # Run at collection time — before any test file's module-level imports.
 _ensure_telegram_mock()
 _ensure_discord_mock()
+_ensure_slack_sdks()
 
 
 # ---------------------------------------------------------------------------
