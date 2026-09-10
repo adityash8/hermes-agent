@@ -568,9 +568,9 @@ class TestIdempotency:
             release.set()
             resp1 = await first
             assert resp1.status == 202
-            assert second.status == 200
+            assert second.status == 503
             data = await second.json()
-            assert data["status"] == "duplicate"
+            assert data["status"] == "in_flight"
             assert adapter.handle_message.await_count == 1
             assert calls["n"] == 1
 
@@ -638,6 +638,24 @@ class TestIdempotency:
             assert (await ignored.json())["status"] == "ignored"
             accepted = await cli.post("/webhooks/pushes", json={"a": 1}, headers=headers)
             assert accepted.status == 202
+            assert adapter.handle_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_prompt_render_exception_releases_delivery_id(self):
+        """A preprocessing crash must not pin the delivery id (Codex EZ-1029)."""
+        routes = {"boom": {"secret": _INSECURE_NO_AUTH, "prompt": "count {n}"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._render_prompt = lambda *a, **k: (_ for _ in ()).throw(TypeError("bad template"))
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"X-GitHub-Delivery": "delivery-boom"}
+            first = await cli.post("/webhooks/boom", json={"n": 1}, headers=headers)
+            assert first.status == 500
+            adapter._render_prompt = WebhookAdapter._render_prompt.__get__(adapter, WebhookAdapter)
+            second = await cli.post("/webhooks/boom", json={"n": 1}, headers=headers)
+            assert second.status == 202
             assert adapter.handle_message.await_count == 1
 
     @pytest.mark.asyncio
