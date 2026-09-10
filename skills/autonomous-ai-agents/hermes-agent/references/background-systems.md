@@ -38,7 +38,7 @@ the `cronjob` tool, the `hermes cron` CLI (`list`, `add`, `edit`,
   multi-platform delivery.
 - **Invariants:** 3-minute hard interrupt per run, `.tick.lock` file
   prevents duplicate ticks across processes, cron sessions pass
-  `skip_memory=True` by default, and cron deliveries are framed with a
+  `skip_memory=False` by default, and cron deliveries are framed with a
   header/footer instead of being mirrored into the target gateway
   session (keeps role alternation intact).
 
