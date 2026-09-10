@@ -233,6 +233,7 @@ class GatewayInboundMixin:
         if is_internal:
             return None
         try:
+            from agent.estop import get_state as _estop_get_state
             from agent.estop import paused_reply as _estop_paused_reply
         except ImportError:
             return None
@@ -248,7 +249,6 @@ class GatewayInboundMixin:
             # Rebuilt from the estop state rather than rewritten out of upstream's sentence: the
             # Slack copy must not silently lose its branding when that wording changes, and Slack
             # operators have no host shell for `hermes resume`. The reason stays verbatim.
-            from agent.estop import get_state as _estop_get_state
             _reason = (_estop_get_state() or {}).get("reason")
             return (f"⏸️ Jarvis is paused{f' ({_reason})' if _reason else ''}"
                     ". Ask an admin to resume Jarvis on the host.")

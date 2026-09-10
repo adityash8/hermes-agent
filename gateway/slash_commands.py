@@ -39,10 +39,12 @@ _ROLLBACK_SKIP_LINES = (("skipped_user_edits", "gateway.rollback.kept_user_edits
                         ("skipped_oversize", "gateway.rollback.kept_oversize"),
                         ("failed_deletes", "gateway.rollback.failed_deletes"))
 
-# Upstream product name -> the Slack app's name. Only the bare word is rewritten, and only its
-# first occurrence: hyphenated compounds (`Hermes-4-405B`), lowercase commands and paths
-# (`hermes resume`, `~/.hermes`) and `HERMES_HOME` are data, not branding.
-_SLACK_BRAND_RE = re.compile(r"\bHermes(?: Agent)?(?![\w-])")
+# Upstream product name -> the Slack app's name, first occurrence only. Lowercase commands, paths
+# and model ids (`hermes resume`, `~/.hermes`, `nousresearch/hermes-4-405b`) plus `HERMES_HOME` are
+# data, and the case-sensitive match already leaves them alone; `-<digit>` holds back capitalised
+# model names (`Hermes-4-405B`). A plain hyphen must still brand: localised catalogs compound the
+# name into one word (de `Hermes-Update`, af `Hermes-opdatering`).
+_SLACK_BRAND_RE = re.compile(r"\bHermes(?: Agent)?\b(?!-\d)")
 
 
 def _slack_brand(text: str) -> str:

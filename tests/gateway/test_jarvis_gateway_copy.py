@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from agent.i18n import t
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
@@ -154,3 +155,22 @@ async def test_slack_branding_survives_upstream_rewording(monkeypatch):
 
     # /update's own notice (its spawn path writes to the real Hermes home, so brand it directly).
     assert _slack_brand(UPDATE_NOTICE) == "⚕ Starting Jarvis update… I'll stream progress here."
+
+    # Localised catalogs compound the name into one word, so a plain hyphen must not veto branding.
+    assert _slack_brand(t("gateway.update.starting", lang="de")).startswith("⚕ Jarvis-Update")
+    assert _slack_brand(t("gateway.update.starting", lang="af")).startswith("⚕ Begin Jarvis-opdatering")
+    # Only version-numbered model names are held back, wherever they sit in the string.
+    assert _slack_brand("Hermes-4-405B is loaded") == "Hermes-4-405B is loaded"
+
+
+@pytest.mark.asyncio
+async def test_estop_gate_falls_back_when_state_reader_is_absent(monkeypatch):
+    """A trimmed-down estop module must leave the gate silent, not raise into the Slack turn."""
+    import agent.estop
+
+    monkeypatch.setattr("agent.estop.paused_reply", lambda: DRIFTED_PAUSE)
+    monkeypatch.delattr(agent.estop, "get_state")
+    runner = cast(Any, SimpleNamespace())
+    runner._hm_estop_turn_allowed = lambda *args: False
+    evt = event("/version", Platform.SLACK)
+    assert GatewayInboundMixin._hm_estop_gate(runner, evt, evt.source, False) is None
