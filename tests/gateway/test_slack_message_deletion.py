@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import TextDebounceState
 from plugins.platforms.slack.adapter import SlackAdapter
 
 
@@ -210,3 +211,35 @@ async def test_missing_or_inflight_writes_cannot_resurrect_a_deleted_surface(tra
     assert client.chat_postMessage.await_count == (2 if transport.startswith("late") else 1)
     if transport != "late_post_after_summon":
         assert not (await adapter.send("C1", "final fallback", metadata=META)).success
+
+
+@pytest.mark.asyncio
+async def test_deleted_surface_at_task_start_finalizes_session():
+    """A task whose surface was deleted before it did any work must leave no queued message,
+    session guard, owner entry, or live debounce timer behind for that session key."""
+    adapter, client = make_adapter()
+    assert (await adapter.send_or_update_status("C1", "progress", "working", metadata=META)).success
+    await adapter._handle_slack_message(mention("<@UBOT> begin", ts="105.000001"))
+    event = adapter.handle_message.call_args.args[0]
+    key = (event.source.scope_id or "", event.source.chat_id, event.source.thread_id or "")
+    event.metadata["_slack_deletion_generation"] = adapter._deletion_generation(key)
+    session_key = adapter._event_session_key(event)
+    await adapter._handle_slack_message(deletion())
+    client.reset_mock()
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._pending_messages[session_key] = MagicMock()
+    # A debounce timer left running would flush its buffered text straight back into
+    # _pending_messages, re-queueing work for a surface that no longer exists.
+    timer = asyncio.create_task(asyncio.sleep(3600))
+    adapter._text_debounce_store()[session_key] = TextDebounceState(
+        event=MagicMock(), task=timer, first_ts=0.0, last_ts=0.0)
+    task = asyncio.create_task(adapter._process_message_background(event, session_key))
+    assert adapter._track_session_task(session_key, task)
+    await task
+    await asyncio.sleep(0)
+    assert session_key not in adapter._pending_messages
+    assert session_key not in adapter._active_sessions
+    assert session_key not in adapter._session_tasks
+    assert session_key not in adapter._text_debounce_store()
+    assert timer.cancelled()
+    assert not client.mock_calls
