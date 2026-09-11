@@ -3070,8 +3070,8 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Deliver an oversized final edit: edit ``message_id`` with chunk 1, send chunks 2..N as
         replies to the previous. Returns ``message_id=<last-id>`` + ``continuation_message_ids``.
-        A continuation failure still reports success plus ``partial_overflow`` so the consumer
-        delivers the tail; only a first-chunk edit failure returns ``success=False``."""
+        A continuation failure reports ``success=False`` plus ``partial_overflow`` so the stream
+        consumer can send the missing tail; only a first-chunk edit failure omits that metadata."""
         formatted = self.format_message(content)
         chunks = self._cap_split_chunks(self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH))
         if len(chunks) <= 1:
@@ -3086,6 +3086,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return SendResult(success=False, error=str(e))
         continuation_ids: list[str] = []
+        delivered_chunks = [chunks[0]]
         delivered = 1
         prev_msg = msg
         for chunk in chunks[1:]:
@@ -3114,18 +3115,25 @@ class DiscordAdapter(BasePlatformAdapter):
                         self.name, delivered, len(chunks), retry_err,
                     )
                     last_id = continuation_ids[-1] if continuation_ids else message_id
+                    delivered_prefix = "".join(
+                        re.sub(r" \(\d+/\d+\)$", "", piece) for piece in delivered_chunks
+                    )
                     return SendResult(
-                        success=True,
+                        success=False,
                         message_id=last_id,
+                        error="overflow_continuation_failed",
+                        retryable=True,
                         continuation_message_ids=tuple(continuation_ids),
                         raw_response={
                             "partial_overflow": True, "delivered_chunks": delivered,
                             "total_chunks": len(chunks), "last_message_id": last_id,
+                            "delivered_prefix": delivered_prefix,
                             "continuation_message_ids": tuple(continuation_ids),
                         },
                     )
             new_id = str(sent.id)
             continuation_ids.append(new_id)
+            delivered_chunks.append(chunk)
             delivered += 1
             prev_msg = sent
         last_id = continuation_ids[-1] if continuation_ids else message_id
