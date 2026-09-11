@@ -210,3 +210,15 @@ async def test_missing_or_inflight_writes_cannot_resurrect_a_deleted_surface(tra
     assert client.chat_postMessage.await_count == (2 if transport.startswith("late") else 1)
     if transport != "late_post_after_summon":
         assert not (await adapter.send("C1", "final fallback", metadata=META)).success
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("author, muted", [("UBOT", True), ("UHUMAN", False)])
+async def test_unmapped_workspace_falls_back_to_default_bot_identity(author, muted):
+    """A team absent from the per-workspace map (single-workspace install, or a map not yet
+    populated at startup) must still resolve our own identity, or the fence never engages."""
+    adapter, client = make_adapter()
+    assert "T9" not in adapter._team_bot_user_ids
+    await adapter._handle_slack_message(deletion(user=author, team="T9"))
+    result = await adapter.send("C1", "after delete", metadata={**META, "team_id": "T9"})
+    assert result.success == (not muted)

@@ -215,7 +215,7 @@ class SlackDeletionMixin(BasePlatformAdapter):
         deleted_ts = str(event.get("deleted_ts") or previous.get("ts") or "")
         message_key = (team, channel, deleted_ts)
         known = self._deletion_messages().get(message_key)
-        bot_uid = self._team_bot_user_ids.get(team) if team else self._bot_user_id
+        bot_uid = self._team_bot_user_ids.get(team, self._bot_user_id)
         if not deleted_ts:
             return
         if not (known or (bot_uid and previous.get("user") == bot_uid)):
