@@ -1,5 +1,7 @@
 """Deletion is an exact-surface stop, not an invitation to recreate a reply."""
 import asyncio
+import json
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -210,3 +212,51 @@ async def test_missing_or_inflight_writes_cannot_resurrect_a_deleted_surface(tra
     assert client.chat_postMessage.await_count == (2 if transport.startswith("late") else 1)
     if transport != "late_post_after_summon":
         assert not (await adapter.send("C1", "final fallback", metadata=META)).success
+
+
+async def silence(adapter, thread, deleted_ts):
+    await adapter._silence_deleted_surface(("T1", "C1", thread), deleted_ts, "410.000001")
+
+
+@pytest.mark.asyncio
+async def test_tombstones_stay_bounded_so_the_state_file_cannot_grow_forever(caplog):
+    caplog.set_level(logging.INFO, logger="plugins.platforms.slack.deletion")
+    adapter, _client = make_adapter()
+    adapter._BOT_TS_MAX = 4
+    for index in range(9):
+        await silence(adapter, f"{300 + index}.000001", f"{400 + index}.000001")
+    threads = adapter._deletion_state()["threads"]
+    # Eviction is a trickle, not a cliff: each new tombstone drops exactly the one
+    # least-recently-active record, so the cap is spent in full and a burst never
+    # unmutes half the tracked surfaces at once.
+    assert list(threads) == [json.dumps(("T1", "C1", f"{ts}.000001")) for ts in range(305, 309)]
+    # Every reversed fence is greppable next to the mute it undoes.
+    dropped = [r.getMessage() for r in caplog.records if "Dropped oldest deleted" in r.getMessage()]
+    assert len(dropped) == 5 and "thread=300.000001" in dropped[0]
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_deletion_is_not_the_next_entry_evicted():
+    adapter, _client = make_adapter()
+    adapter._BOT_TS_MAX = 4
+    for index in range(4):
+        await silence(adapter, f"{300 + index}.000001", f"{400 + index}.000001")
+    await silence(adapter, "300.000001", "500.000001")  # same surface, new delete
+    await silence(adapter, "304.000001", "404.000001")  # forces eviction
+    assert json.dumps(("T1", "C1", "300.000001")) in adapter._deletion_state()["threads"]
+
+
+@pytest.mark.asyncio
+async def test_summoned_surface_survives_a_burst_of_unrelated_deletions():
+    adapter, _client = make_adapter()
+    adapter._BOT_TS_MAX = 4
+    assert (await adapter.send_or_update_status("C1", "progress", "working", metadata=META)).success
+    await adapter._handle_slack_message(deletion())
+    assert not (await adapter.send("C1", "muted", metadata=META)).success
+    for index in range(3):
+        await silence(adapter, f"{300 + index}.000001", f"{400 + index}.000001")
+    await adapter._handle_slack_message(mention("<@UBOT> resume", ts="123.000001"))
+    adapter.handle_message.assert_awaited_once()
+    await silence(adapter, "303.000001", "403.000001")  # forces eviction
+    await adapter._handle_slack_message(deletion())  # reconnect replay cannot revoke the summon
+    assert (await adapter.send("C1", "still summoned", metadata=META)).success
