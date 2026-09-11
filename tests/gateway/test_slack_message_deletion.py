@@ -210,3 +210,26 @@ async def test_missing_or_inflight_writes_cannot_resurrect_a_deleted_surface(tra
     assert client.chat_postMessage.await_count == (2 if transport.startswith("late") else 1)
     if transport != "late_post_after_summon":
         assert not (await adapter.send("C1", "final fallback", metadata=META)).success
+
+
+@pytest.mark.asyncio
+async def test_failed_delete_call_drops_cleanup_receipt():
+    """A chat.delete that raised confirmed nothing. If its cleanup receipt survived, a later
+    external deletion of that message would be read as our own cleanup and the surface would
+    stay writable.
+
+    "connection reset" is deliberately the ambiguous case: Slack may or may not have applied
+    the delete. Dropping the receipt costs a spurious mute when it did apply and the response
+    was merely lost, recoverable with one mention. Keeping it costs a silently ignored human
+    delete. This pins the first."""
+    adapter, client = make_adapter()
+    assert (await adapter.send_or_update_status("C1", "progress", "working", metadata=META)).success
+    client.chat_delete.side_effect = RuntimeError("connection reset")
+    assert not await adapter.delete_message("C1", "101.000001")
+    key = adapter._sent_surface(adapter._deletion_key("C1"), "101.000001")
+    assert not adapter._is_cleanup(key, "101.000001")
+    client.chat_delete.side_effect = None
+    client.reset_mock()
+    await adapter._handle_slack_message(deletion())
+    assert not (await adapter.send("C1", "fallback", metadata=META)).success
+    assert not client.mock_calls
