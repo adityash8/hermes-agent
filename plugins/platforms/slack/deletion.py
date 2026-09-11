@@ -253,6 +253,16 @@ class SlackDeletionMixin(BasePlatformAdapter):
         authorized = self._is_sender_authorized(
             user_id, "dm" if is_dm else "group", key[1], thread_id=key[2])
         if authorized is not True:
+            # Deny-by-default, but say so: an unset check denies every summon, so a refactor
+            # that drops set_authorization_check would leave the surface muted forever.
+            if getattr(self, "_authorization_check", None) is None:
+                if not getattr(self, "_slack_deletion_auth_unset_warned", False):
+                    self._slack_deletion_auth_unset_warned = True  # Warn once per adapter.
+                    logger.warning(
+                        "[Slack] No authorization check registered; deletion fence denies every "
+                        "summon workspace=%s channel=%s thread=%s", *key)
+            logger.debug("[Slack] Deletion fence denied summon authorized=%s workspace=%s "
+                         "channel=%s thread=%s", authorized, *key)
             return False
         record.update(muted=False, generation=record["generation"] + 1)
         self._save_deletions()
