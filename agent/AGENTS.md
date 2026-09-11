@@ -94,8 +94,8 @@ cache break — keep it the only one. Full detail:
 `agent/memory_provider.py` (ABC) + `agent/memory_manager.py` (orchestrator) drive memory-provider
 plugins; `agent/context_engine.py` drives context-engine plugins; `agent/image_gen_provider.py`
 image-gen plugins (all in `plugins/AGENTS.md`). `agent/curator.py` + `curator_backup.py` implement
-the skill curator (`skills/AGENTS.md`). Cron sessions pass `skip_memory=True` by default — memory
-providers intentionally do not run during cron.
+the skill curator (`skills/AGENTS.md`). Cron sessions pass `skip_memory=False` by default — memory
+providers run like any other agent session.
 
 ## Tests
 
