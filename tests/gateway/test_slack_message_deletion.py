@@ -210,3 +210,64 @@ async def test_missing_or_inflight_writes_cannot_resurrect_a_deleted_surface(tra
     assert client.chat_postMessage.await_count == (2 if transport.startswith("late") else 1)
     if transport != "late_post_after_summon":
         assert not (await adapter.send("C1", "final fallback", metadata=META)).success
+
+
+@pytest.mark.asyncio
+async def test_deleted_top_level_reply_stops_the_thread_less_session():
+    """``reply_in_thread: false`` answers at channel level, so its session has no thread id."""
+    adapter, client = make_adapter()
+    adapter.config.extra["reply_in_thread"] = False
+    del adapter.handle_message  # use real dispatch and background processing
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def generate(message):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    adapter.set_message_handler(generate)
+    adapter._run_processing_hook = AsyncMock()
+    adapter._start_typing_refresh = MagicMock(return_value=None)
+    adapter.set_session_cancellation_handler(AsyncMock())
+    summon = mention("<@UBOT> begin", ts="105.000001")
+    summon.pop("thread_ts")
+    await adapter._handle_slack_message(summon)
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    assert len(adapter._session_tasks) == 1
+    session_key, owner = next(iter(adapter._session_tasks.items()))
+    assert (await adapter.send("C1", "channel reply", metadata={"team_id": "T1"})).success
+    await adapter._handle_slack_message(deletion(thread=None))
+    assert cancelled.is_set() and owner.cancelled()
+    callback = adapter._session_cancellation_handler
+    callback.assert_awaited_once()
+    called_key, source = callback.await_args.args
+    assert called_key == session_key
+    assert (source.scope_id, source.chat_id, source.thread_id) == ("T1", "C1", None)
+    # The channel is not tombstoned: a deleted top-level post is one message, not the surface.
+    # Accepted consequence — the stopped turn does not stay stopped the way a muted thread does,
+    # because the whole channel is one session here and the next message starts a new turn.
+    assert (await adapter.send("C1", "later", metadata={"team_id": "T1"})).success
+
+
+@pytest.mark.asyncio
+async def test_deleted_top_level_post_spares_unrelated_channel_writes():
+    """No channel-level run is live under the default, so bumping that epoch only hits innocents."""
+    adapter, client = make_adapter()
+    assert (await adapter.send("C1", "proactive post", metadata={"team_id": "T1"})).success
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def late_post(**kwargs):
+        entered.set()
+        await release.wait()
+        return {"ok": True, "ts": "201.000001"}
+
+    client.chat_postMessage.side_effect = late_post
+    pending = asyncio.create_task(adapter.send("C1", "unrelated cron post", metadata={"team_id": "T1"}))
+    await entered.wait()
+    await adapter._handle_slack_message(deletion(thread=None))
+    release.set()
+    assert (await pending).success
+    client.chat_delete.assert_not_awaited()
+    assert (await adapter.send("C1", "still writable", metadata={"team_id": "T1"})).success
