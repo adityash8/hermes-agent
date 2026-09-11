@@ -7,10 +7,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from agent.i18n import t
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
-from gateway.slash_commands import GatewaySlashCommandsMixin
+from gateway.slash_commands import (_BUSY_MODE_BEHAVIOR, GatewaySlashCommandsMixin,
+                                    _slack_brand)
 from gateway.slash_commands_status import GatewayStatusCommandsMixin
 from gateway.run_busy import GatewayBusySessionMixin
 from gateway.run_inbound import GatewayInboundMixin
@@ -84,6 +86,7 @@ async def test_system_labels_preserve_dynamic_payloads(monkeypatch, platform, br
     elif surface == "paused_notice":
         monkeypatch.setattr("agent.estop.paused_reply", lambda:
                             f"⏸️ Hermes is paused ({PAYLOAD}). New work is on hold; run `hermes resume` to pick things back up.")
+        monkeypatch.setattr("agent.estop.get_state", lambda: {"reason": PAYLOAD})
         runner._hm_estop_turn_allowed = lambda *args: False
         text = GatewayInboundMixin._hm_estop_gate(runner, evt, evt.source, False)
         assert text is not None
@@ -111,3 +114,63 @@ async def test_system_labels_preserve_dynamic_payloads(monkeypatch, platform, br
             assert "hermes" not in text.lower()
         else:
             assert "`hermes`" in text and "`hermes update`" in text
+
+
+# Upstream prose the Slack copy must not depend on, reworded as a future upstream merge might.
+DRIFTED_PAUSE = f"⏸️ Hermes is on hold ({PAYLOAD}) — run `hermes resume` when you are back."
+DRIFTED_VERSION = "Hermes Agent 0.22 (2026-09-07) · local Hermes-build"
+BUSY_WITH_MODEL = "Messages will be queued while Hermes is busy on Hermes-4-405B."
+UPDATE_NOTICE = "⚕ Starting Hermes update… I'll stream progress here."
+
+
+@pytest.mark.asyncio
+async def test_slack_branding_survives_upstream_rewording(monkeypatch):
+    """Slack branding must not hinge on upstream's exact wording, and must leave data tokens alone."""
+    monkeypatch.setenv("HERMES_LANGUAGE", "en")
+    runner = cast(Any, SimpleNamespace())
+    evt = event("/version", Platform.SLACK)
+
+    # Paused notice: rebuilt from the estop state, so a reworded upstream notice still reads Jarvis
+    # and still never tells a Slack operator to run a host command. The reason stays verbatim.
+    monkeypatch.setattr("agent.estop.paused_reply", lambda: DRIFTED_PAUSE)
+    monkeypatch.setattr("agent.estop.get_state", lambda: {"reason": PAYLOAD})
+    runner._hm_estop_turn_allowed = lambda *args: False
+    assert GatewayInboundMixin._hm_estop_gate(runner, evt, evt.source, False) == (
+        f"⏸️ Jarvis is paused ({PAYLOAD}). Ask an admin to resume Jarvis on the host.")
+
+    # Version label: branded even when upstream drops the "v"; the build tag is data.
+    monkeypatch.setattr("hermes_cli.banner.format_banner_version_label", lambda: DRIFTED_VERSION)
+    assert await GatewaySlashCommandsMixin._handle_version_command(runner, evt) == (
+        "Jarvis 0.22 (2026-09-07) · local Hermes-build")
+
+    # Busy confirmation: the brand word only — a model name that starts with Hermes is data.
+    monkeypatch.setitem(_BUSY_MODE_BEHAVIOR, "queue", ("queues for next turn", BUSY_WITH_MODEL))
+    monkeypatch.setattr("cli.save_config_value", lambda *args: True)
+    runner._busy_profile_name_for_source = lambda source: None
+    runner._load_busy_text_mode = lambda: "queue"
+    runner._adapter_for_source = lambda source: None
+    busy = str(await GatewaySlashCommandsMixin._handle_busy_command(
+        runner, event("/busy queue", Platform.SLACK)))
+    assert "while Jarvis is busy on Hermes-4-405B." in busy
+
+    # /update's own notice (its spawn path writes to the real Hermes home, so brand it directly).
+    assert _slack_brand(UPDATE_NOTICE) == "⚕ Starting Jarvis update… I'll stream progress here."
+
+    # Localised catalogs compound the name into one word, so a plain hyphen must not veto branding.
+    assert _slack_brand(t("gateway.update.starting", lang="de")).startswith("⚕ Jarvis-Update")
+    assert _slack_brand(t("gateway.update.starting", lang="af")).startswith("⚕ Begin Jarvis-opdatering")
+    # Only version-numbered model names are held back, wherever they sit in the string.
+    assert _slack_brand("Hermes-4-405B is loaded") == "Hermes-4-405B is loaded"
+
+
+@pytest.mark.asyncio
+async def test_estop_gate_falls_back_when_state_reader_is_absent(monkeypatch):
+    """A trimmed-down estop module must leave the gate silent, not raise into the Slack turn."""
+    import agent.estop
+
+    monkeypatch.setattr("agent.estop.paused_reply", lambda: DRIFTED_PAUSE)
+    monkeypatch.delattr(agent.estop, "get_state")
+    runner = cast(Any, SimpleNamespace())
+    runner._hm_estop_turn_allowed = lambda *args: False
+    evt = event("/version", Platform.SLACK)
+    assert GatewayInboundMixin._hm_estop_gate(runner, evt, evt.source, False) is None
