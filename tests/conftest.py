@@ -1353,6 +1353,18 @@ def _live_system_guard(request, monkeypatch):
             for parent in walker.parents():
                 if parent.pid == test_pid:
                     return True
+        except _psutil.NoSuchProcess:
+            # The PID vanished between the lookup above and this walk. psutil
+            # swallows a disappearing *ancestor* inside parents(), so the only
+            # way NoSuchProcess escapes is the target itself being gone — the
+            # same stale-PID no-op the lookup above already allows. Without
+            # this, the blanket handler below reported it as a foreign PID and
+            # spuriously failed any test that terminates a real subprocess:
+            # Popen.send_signal() polls, sees the child alive, and calls
+            # os.kill() a moment later, by which time a short-lived child can
+            # already have exited and been reaped. Flaked under parallel load
+            # in tests/agent/lsp/test_client_e2e.py and test_stale_diagnostics.py.
+            return True
         except Exception:
             return False
         return False
