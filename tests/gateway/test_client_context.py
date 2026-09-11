@@ -5,6 +5,7 @@ import copy
 import hashlib
 import importlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -901,8 +902,11 @@ async def test_owner_relay_retains_prompt_and_media_path(native_owner, runner, p
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("denial", ["unknown", "missing-workspace", "revoked", "unauthorized", "unbound"])
-async def test_denied_relay_cannot_poison_reply_or_replay_state(runner, corpus, denial):
+@pytest.mark.parametrize(
+    "denial",
+    ["unknown", "missing-workspace", "revoked", "unauthorized", "unbound", "unrecognized-mode"],
+)
+async def test_denied_relay_cannot_poison_reply_or_replay_state(runner, corpus, denial, caplog):
     from gateway.relay.adapter import RelayAdapter
 
     adapter = object.__new__(RelayAdapter)
@@ -926,13 +930,23 @@ async def test_denied_relay_cannot_poison_reply_or_replay_state(runner, corpus, 
         corpus.save()
     elif denial == "unauthorized":
         runner._is_user_authorized_for_source.return_value = False
+    elif denial == "unrecognized-mode":
+        # A misspelled or future admission mode must not fall through to legacy.
+        adapter._client_context_admission = AsyncMock(return_value="stict")
     else:
         adapter._client_context_admission = None
-    await adapter._on_inbound(trigger)
+    with caplog.at_level(logging.ERROR, logger="gateway.relay.adapter"):
+        await adapter._on_inbound(trigger)
     assert {name: getattr(adapter, name) for name in caches} == before
     assert adapter._seen_inbound == {}
     adapter._stamp_slack_session_thread.assert_not_called()
     adapter.handle_message.assert_not_awaited()
+    if denial == "unrecognized-mode":
+        # Dropping instead of raising is only safe while the drop stays visible.
+        assert any(
+            r.levelno == logging.ERROR and "unrecognized admission mode 'stict'" in r.getMessage()
+            for r in caplog.records
+        )
 
 
 @pytest.mark.asyncio
