@@ -174,6 +174,7 @@ class WebhookAdapter(BasePlatformAdapter):
         self.gateway_runner = None  # set externally; needed for cross-platform delivery
         # Idempotency: TTL cache of recently processed delivery IDs.
         self._seen_deliveries: Dict[str, float] = {}
+        self._in_flight_deliveries: set[str] = set()
         self._idempotency_ttl: int = 3600  # 1 hour
         self._seen_deliveries_next_prune_at: float = 0.0
         self._rate_counts: Dict[str, Deque[float]] = {}  # per-route hit timestamps in a fixed window
@@ -296,16 +297,37 @@ class WebhookAdapter(BasePlatformAdapter):
         window.append(now)
         return True
 
-    def _record_delivery_id(self, delivery_id: str, now: float) -> bool:
-        """Return True when this delivery should be processed."""
-        if (seen_at := self._seen_deliveries.get(delivery_id)) is not None and now - seen_at < self._idempotency_ttl:
-            return False
+    @staticmethod
+    def _delivery_cache_key(route_name: str, delivery_id: str) -> str:
+        """Idempotency is per route. GitHub retries reuse an id on one URL;
+        the same header on a second route must not be treated as a duplicate."""
+        return f"{route_name}\n{delivery_id}"
+
+    def _record_delivery_id(self, delivery_id: str, now: float, *, route_name: str) -> str:
+        """Reserve a delivery. Returns ``accepted``, ``duplicate``, or ``in_flight``."""
+        key = self._delivery_cache_key(route_name, delivery_id)
+        if key in self._in_flight_deliveries:
+            return "in_flight"
+        if (seen_at := self._seen_deliveries.get(key)) is not None and now - seen_at < self._idempotency_ttl:
+            return "duplicate"
         if seen_at is not None:
-            self._seen_deliveries.pop(delivery_id, None)
-        self._seen_deliveries[delivery_id] = now
+            self._seen_deliveries.pop(key, None)
+        self._in_flight_deliveries.add(key)
         if len(self._seen_deliveries) > max(self._rate_limit * 2, 128):
             self._prune_seen_deliveries(now)
-        return True
+        return "accepted"
+
+    def _commit_delivery_id(self, delivery_id: str, now: float, *, route_name: str) -> None:
+        """Mark a reserved delivery as completed so later retries are duplicates."""
+        key = self._delivery_cache_key(route_name, delivery_id)
+        self._in_flight_deliveries.discard(key)
+        self._seen_deliveries[key] = now
+
+    def _forget_delivery_id(self, delivery_id: str, *, route_name: str) -> None:
+        """Drop a reservation that never reached dispatch so a later retry can run."""
+        key = self._delivery_cache_key(route_name, delivery_id)
+        self._in_flight_deliveries.discard(key)
+        self._seen_deliveries.pop(key, None)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
@@ -531,33 +553,61 @@ class WebhookAdapter(BasePlatformAdapter):
         if not self._route_processor.route_filters_match(route_config, payload, event_type, request.headers):
             logger.info("[webhook] filtered event=%s route=%s", event_type, route_name)
             return web.json_response({"status": "ignored", "reason": "filter", "route": route_name})
-        # Script, prompt render and skill lookup read the profile's home (skills/, config); the runner
-        # only enters the routed profile's scope later around handle_message, so enter it here.
-        # See #67277.
-        with self._profile_scope(profile):
-            script = route_config.get("script")
-            if script:
-                # Shells out (up to its timeout) — worker thread so the loop isn't blocked; to_thread
-                # copies contextvars so the profile scope follows.
-                keep, transformed_payload = await asyncio.to_thread(
-                    self._route_processor.run_route_script, script, payload)
-                if not keep:
-                    logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
-                    return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
-                payload = transformed_payload or payload
-            prompt = self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name)
-            if skills := route_config.get("skills", []):
-                prompt = self._apply_skills(prompt, skills)
+        # After the synchronous filters, before any await that can yield (route
+        # scripts can take tens of seconds). Overlapping GitHub/Svix retries of
+        # the same delivery id both pass the cache if we wait until after the
+        # script. Do not reserve on ignored/filtered events — the cache is
+        # adapter-wide, so a reject on one route would drop the same delivery
+        # on another route for the TTL.
         delivery_id = headers.get("X-GitHub-Delivery", headers.get(
             "svix-id", headers.get("X-Request-ID", str(int(time.time() * 1000)))))
-        now = time.time()  # idempotency: skip duplicate deliveries (webhook retries)
-        if not self._record_delivery_id(delivery_id, now):
+        now = time.time()
+        reservation = self._record_delivery_id(delivery_id, now, route_name=route_name)
+        if reservation == "duplicate":
             logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
             return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
-        if route_config.get("deliver_only"):
-            return await self._handle_deliver_only(prompt, payload, route_config, route_name, event_type, delivery_id)
-        return self._dispatch_agent_run(request, route_config, route_name, profile, payload, prompt, event_type,
-                                        delivery_id, now)
+        if reservation == "in_flight":
+            # Do not 200-ack a retry while the first attempt can still fail;
+            # GitHub/Svix stop retrying on 2xx.
+            logger.info("[webhook] Delivery %s still in flight on route %s", delivery_id, route_name)
+            return web.json_response(
+                {"status": "in_flight", "delivery_id": delivery_id, "route": route_name},
+                status=503,
+            )
+        committed = False
+        try:
+            # Script, prompt render and skill lookup read the profile's home (skills/, config); the runner
+            # only enters the routed profile's scope later around handle_message, so enter it here.
+            # See #67277.
+            with self._profile_scope(profile):
+                script = route_config.get("script")
+                if script:
+                    # Shells out (up to its timeout) — worker thread so the loop isn't blocked; to_thread
+                    # copies contextvars so the profile scope follows.
+                    keep, transformed_payload = await asyncio.to_thread(
+                        self._route_processor.run_route_script, script, payload)
+                    if not keep:
+                        logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
+                        return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
+                    payload = transformed_payload or payload
+                prompt = self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name)
+                if skills := route_config.get("skills", []):
+                    prompt = self._apply_skills(prompt, skills)
+            if route_config.get("deliver_only"):
+                response = await self._handle_deliver_only(
+                    prompt, payload, route_config, route_name, event_type, delivery_id)
+                committed = True
+                return response
+            response = self._dispatch_agent_run(
+                request, route_config, route_name, profile, payload, prompt, event_type,
+                delivery_id, now)
+            committed = True
+            return response
+        finally:
+            if committed:
+                self._commit_delivery_id(delivery_id, time.time(), route_name=route_name)
+            else:
+                self._forget_delivery_id(delivery_id, route_name=route_name)
 
     def _dispatch_agent_run(self, request, route_config: dict, route_name: str, profile, payload: Any, prompt: str,
                             event_type: str, delivery_id: str, now: float) -> "web.Response":
