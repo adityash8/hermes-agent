@@ -25,7 +25,9 @@ import logging
 import os
 import re
 import sys
+from importlib.machinery import PathFinder
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -66,6 +68,36 @@ from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
 from gateway.config import PlatformConfig  # noqa: E402
 
 ADAPTER_LOGGER = "plugins.platforms.slack.adapter"
+
+
+def test_module_stub_does_not_shadow_installed_slack_bolt():
+    """``_ensure_slack_mock`` above must never displace a real installation.
+
+    The stub is process-global, so in a single-process run whichever slack
+    test file is collected first decides what every later file imports.
+    ``test_slack_bolt_deletion_ingress.py`` needs the genuine Bolt package —
+    with this module's MagicMock in ``sys.modules`` it dies at collection with
+    ``'slack_bolt' is not a package``. ``tests/gateway/conftest.py`` binds the
+    installed SDKs before any test module is imported, which makes the guard
+    above short-circuit. This pins that binding, and fails in a per-file run —
+    the shape ``scripts/run_tests.sh`` actually uses — if it regresses.
+
+    A conftest outside this directory can stub ``sys.modules`` before the
+    gateway conftest is even imported (``tests/e2e/conftest.py`` does), and no
+    binding here can undo that; in that collection order this skips instead of
+    reporting a regression it did not cause.
+    """
+    from tests.gateway.conftest import SLACK_STUBBED_BEFORE_GATEWAY_CONFTEST
+
+    if SLACK_STUBBED_BEFORE_GATEWAY_CONFTEST:
+        pytest.skip("Slack was stubbed before tests/gateway/conftest.py was imported")
+
+    for name in ("slack_bolt", "slack_sdk"):
+        if PathFinder.find_spec(name) is None:
+            pytest.skip(f"{name} is not installed in this environment")
+        assert isinstance(sys.modules.get(name), ModuleType), (
+            f"{name} is installed but sys.modules holds a test stub instead"
+        )
 
 
 def _fake_create_task(coro, **kwargs):
