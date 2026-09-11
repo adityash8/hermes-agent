@@ -106,6 +106,25 @@ async def test_real_sdk_rounds_isolate_two_clients_and_preserve_scoped_prefix(ru
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("whole_range", [False, True])
+async def test_partial_ga4_range_is_reported_as_incomplete(runner, analytics, wire, whole_range):
+    _, state = analytics
+    if whole_range:
+        def fill(request, response):
+            if request.method == "POST":
+                response["rows"].append({"dimensionValues": [{"value": "20200102"}],
+                                         "metricValues": [{"value": "1"} for _ in ga.METRICS]})
+                response["rowCount"] = len(response["rows"])
+        state["change"] = fill
+    report_round(wire)
+    assert await runner._handle_message(event())
+    result = json.loads(wire.captured[1]["messages"][-1]["content"])
+    assert result["complete"] is whole_range
+    assert result["missing_dates"] == ([] if whole_range else ["2020-01-02"])
+    assert len(result["rows"]) == (2 if whole_range else 1)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("change", [
     {"account_id": "202"}, {"property_id": "2002"}, {"client": "client-b"}, {"audience": "shared"},
     {"grant_id": "ga-b"}, {"url": "https://evil.invalid"}, {"sql": "select *"}, {"method": "DELETE"},
