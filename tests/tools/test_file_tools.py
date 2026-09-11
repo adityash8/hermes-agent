@@ -492,6 +492,31 @@ class TestSensitivePathCheck:
         result = json.loads(write_file_tool("/tmp/other.txt", "hello"))
         assert result["status"] == "ok"
 
+    def test_home_override_bypasses_cached_config_path(self, tmp_path, monkeypatch):
+        """A multiplexed profile must not reuse the first profile's cached
+        config.yaml deny path (EZ-1028)."""
+        import tools.file_tools_write_guards as guards
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        cached = tmp_path / "cached" / "config.yaml"
+        live = tmp_path / "live" / "config.yaml"
+        cached.parent.mkdir()
+        live.parent.mkdir()
+        cached.write_text("a\n")
+        live.write_text("b\n")
+        monkeypatch.setattr(guards, "_hermes_config_resolved", str(cached))
+        monkeypatch.setattr(guards, "_hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(guards, "_config_path_resolved", lambda: str(live))
+        assert guards._get_hermes_config_resolved() == str(cached)
+        token = set_hermes_home_override(str(live.parent))
+        try:
+            assert guards._get_hermes_config_resolved() == str(live)
+            denied = guards._check_sensitive_path(str(live))
+            assert denied is not None
+            assert "Hermes config" in denied
+        finally:
+            reset_hermes_home_override(token)
+
 
 class TestPatchSchemaShape:
     """The BASE schema is replace-only (V4A layers on for OpenAI-family
