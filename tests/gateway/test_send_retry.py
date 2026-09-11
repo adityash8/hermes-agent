@@ -168,6 +168,38 @@ class TestSendWithRetryFallback:
         assert "plain text" in adapter._send_calls[1][1].lower()
 
 
+    @pytest.mark.asyncio
+    async def test_not_found_target_is_not_retried_or_downgraded(self):
+        """A gone chat/thread/message (error_kind="not_found") cannot be reached by a retry
+        or by a plain-text fallback, so exactly one send is attempted."""
+        adapter = _StubAdapter()
+        gone = SendResult(success=False, error="chat not found", error_kind="not_found")
+        adapter._send_results = [gone]
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry("chat1", "**bold**", max_retries=2, base_delay=0)
+        mock_sleep.assert_not_called()
+        assert result is gone
+        assert adapter._send_calls == [("chat1", "**bold**")]
+
+    @pytest.mark.asyncio
+    async def test_not_found_discovered_during_retry_is_not_downgraded(self):
+        """The target can vanish while a transient failure is backing off. The retry result is
+        then "not_found", and the plain-text fallback below cannot reach it any more than the
+        retry could — so the send stops there instead of making a third, guaranteed-dead call."""
+        adapter = _StubAdapter()
+        gone = SendResult(success=False, error="chat not found", error_kind="not_found")
+        adapter._send_results = [
+            SendResult(success=False, error="Connection reset by peer", retryable=True),
+            gone,
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry("chat1", "**bold**", max_retries=2, base_delay=0)
+        mock_sleep.assert_awaited_once()
+        assert result is gone
+        # Two sends: the original and the single retry. No plain-text fallback.
+        assert adapter._send_calls == [("chat1", "**bold**"), ("chat1", "**bold**")]
+
+
 # ---------------------------------------------------------------------------
 # _send_with_retry — retry_after honor
 # ---------------------------------------------------------------------------
