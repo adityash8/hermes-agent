@@ -5,6 +5,7 @@ import copy
 import hashlib
 import importlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -1056,3 +1057,85 @@ async def test_unknown_route_directly_after_admission_never_uses_legacy(runner, 
     runner._handle_message_with_agent = replace_grant
     assert await runner._handle_message(event()) == cc.DENIED
     assert not wire.captured
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path",
+    ["admission", "adapter-no-callback", "ingress-denied", "turn-denied", "turn-failed",
+     "revalidation-failed", "malformed-slack-event"],
+)
+async def test_each_deny_path_logs_exactly_one_static_record(runner, corpus, wire, native_owner, caplog, path):
+    from plugins.platforms.slack.client_context import admit_event
+
+    caplog.set_level(logging.INFO)
+    if path == "admission":
+        runner._is_user_authorized_for_source.return_value = False
+        assert await cc.admission(runner, event().source) == "deny"
+        chat, marker = "channel-a", "denied at admission"
+    elif path == "adapter-no-callback":
+        # A Slack adapter that turns client context on without wiring its admission callback
+        # must fail closed instead of silently handing the event to the legacy path.
+        assert await cc.adapter_admission(SimpleNamespace(client_context_enabled=True), event().source) == "deny"
+        chat, marker = "channel-a", "no admission callback"
+    elif path == "ingress-denied":
+        assert await runner._handle_message(event(chat_id="foreign-channel")) == cc.DENIED
+        chat, marker = "foreign-channel", "denied at ingress"
+    elif path == "turn-denied":
+        # An authorized route reaches handle_turn; the interactive payload is what it rejects.
+        trigger = event()
+        trigger.prompt_response = {"prompt_id": "private-approval", "option_id": "approve"}
+        assert await runner._handle_message(trigger) == cc.DENIED
+        chat, marker = "channel-a", "turn denied"
+    elif path == "turn-failed":
+        wire.state.error = True
+        assert await runner._handle_message(event()) == cc.FAILED
+        chat, marker = "channel-a", "turn failed"
+    elif path == "revalidation-failed":
+        # Ingress admits the route; a granted source file changes while the provider call is in
+        # flight, so the post-completion digest recheck rejects the answer instead of sending it.
+        wire.state.callback = lambda body: (corpus.root / "a.txt").write_text("edited midflight", encoding="utf-8")
+        assert await runner._handle_message(event()) is None
+        chat, marker = "channel-a", "revalidation failed"
+    else:
+        adapter, _ = native_owner
+        assert await admit_event(adapter, {"channel": "Downer"}, {"team_id": "workspace-synthetic"}) == ("deny", None)
+        chat, marker = "Downer", "failed admission checks"
+    records = [r for r in caplog.records if r.name.endswith("client_context")]
+    assert len(records) == 1 and records[0].levelno == logging.WARNING
+    message = records[0].getMessage()
+    assert chat in message and marker in message
+    assert "secret" not in message and "TOKEN_SYNTHETIC" not in message and "Traceback" not in message
+    assert records[0].exc_info is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "chat", "marker"),
+    [("dm-disabled", "Downer", "denied by adapter restrictions"),
+     ("channel-not-allowed", "channel-a", "not an allowed channel")],
+)
+async def test_adapter_restriction_denies_log_exactly_one_static_info_record(
+        runner, native_owner, caplog, path, chat, marker):
+    """The two adapter-restriction denies are configured policy, not failures, so they log at INFO
+    while every other deny stays a WARNING. They still owe exactly one static record per deny,
+    naming the channel and nothing else."""
+    from plugins.platforms.slack.client_context import admit_event
+
+    adapter, _ = native_owner
+    if path == "dm-disabled":
+        adapter.config.extra["disable_dms"] = True
+        payload = {"channel": "Downer", "channel_type": "im", "user": "owner-user"}
+    else:
+        # A granted route still has to clear the adapter's own channel allowlist.
+        adapter.config.extra["allowed_channels"] = ["channel-b"]
+        payload = {"channel": "channel-a", "channel_type": "channel", "user": "owner-user"}
+    caplog.set_level(logging.INFO)
+    mode, source = await admit_event(adapter, payload, {"team_id": "workspace-synthetic"})
+    assert mode == "deny" and source is not None and source.chat_id == chat
+    records = [r for r in caplog.records if r.name.endswith("client_context")]
+    assert len(records) == 1 and records[0].levelno == logging.INFO
+    message = records[0].getMessage()
+    assert chat in message and marker in message
+    assert "secret" not in message and "TOKEN_SYNTHETIC" not in message and "Traceback" not in message
+    assert records[0].exc_info is None

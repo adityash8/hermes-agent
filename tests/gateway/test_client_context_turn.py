@@ -4,6 +4,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
 import threading
 from unittest.mock import AsyncMock
 
@@ -274,6 +275,24 @@ async def test_delayed_resolver_cannot_send_after_revocation_or_cancellation(
     assert await asyncio.to_thread(finished.wait, 5)
     assert not wire.captured
     assert not runner.__dict__.get("_client_context_history")
+
+
+@pytest.mark.asyncio
+async def test_authorization_change_midturn_logs_exactly_one_static_record(runner, extended, wire, caplog):
+    """The only deny path that needs a tool-generation turn: the rest live in test_client_context."""
+    caplog.set_level(logging.INFO)
+
+    def revoke(body):
+        runner._is_user_authorized_for_source.return_value = False
+
+    wire.state.callback = revoke
+    assert await runner._handle_message(event()) is None
+    records = [r for r in caplog.records if r.name.endswith("client_context")]
+    assert len(records) == 1 and records[0].levelno == logging.WARNING
+    message = records[0].getMessage()
+    assert "channel-a" in message and "authorization changed" in message
+    assert "secret" not in message and "TOKEN_SYNTHETIC" not in message and "Traceback" not in message
+    assert records[0].exc_info is None
 
 
 @pytest.mark.asyncio
