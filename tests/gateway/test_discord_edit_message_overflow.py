@@ -223,6 +223,37 @@ class TestFinalOverflowSplits:
             assert not c.endswith("...")
 
     @pytest.mark.asyncio
+    async def test_continuation_failure_is_not_reported_as_success(self):
+        """A failed later chunk must not look like full delivery to the
+        stream consumer (which only inspects partial_overflow on the
+        failure path)."""
+        adapter = _make_adapter()
+        edits = []
+        msg = SimpleNamespace(
+            id=42,
+            to_reference=MagicMock(return_value=object()),
+            edit=AsyncMock(side_effect=lambda *, content: edits.append(content)),
+        )
+
+        def send_side_effect(_n, _content, _reference):
+            raise RuntimeError("error code: 10008: Unknown Message")
+
+        channel, sends = _wire_channel(
+            adapter, original_msg=msg, send_side_effect=send_side_effect
+        )
+        big = "q" * 6000
+        result = await adapter.edit_message("555", "42", big, finalize=True)
+
+        assert result.success is False
+        assert result.retryable is True
+        assert result.raw_response["partial_overflow"] is True
+        assert result.raw_response["delivered_chunks"] == 1
+        assert "delivered_prefix" in result.raw_response
+        assert result.continuation_message_ids == ()
+        assert edits  # chunk 1 still landed in place
+        assert sends  # continuations were attempted
+
+    @pytest.mark.asyncio
     async def test_byte_coverage_preserved(self):
         adapter = _make_adapter()
         edits = []
