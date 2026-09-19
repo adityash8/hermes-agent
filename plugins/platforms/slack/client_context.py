@@ -1,15 +1,20 @@
 """Admission from authenticated Bolt fields, before Slack enrichment or state changes."""
 
+import logging
+
 from gateway.client_context import adapter_admission
 from gateway.client_context_policy import identifier, require
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.session import SessionSource
 
+logger = logging.getLogger(__name__)
+
 
 async def admit_event(adapter, event, body=None):
     if not adapter.client_context_enabled:
         return "legacy", None
+    channel = None
     try:
         # The outer workspace wins. Never recover missing identity from assistant
         # caches, forwarded blocks, authorizations, user names or channel labels.
@@ -36,7 +41,7 @@ async def admit_event(adapter, event, body=None):
         )
         mode = await adapter_admission(adapter, source)
         if mode == "deny":
-            return mode, source
+            return mode, source  # adapter_admission already logged the reason
         if event.get("subtype") == "message_changed":
             # Normalization must not replace the admitted actor or destination.
             updated = event.get("message")
@@ -48,12 +53,16 @@ async def admit_event(adapter, event, body=None):
         if (adapter._is_ignored_channel(channel)
                 or (channel_type in {"im", "mpim"} or is_dm) and adapter._slack_disable_dms()
                 or adapter._early_reject_unauthorized(user, channel, is_dm)):
+            logger.info("[Slack] client context denied by adapter restrictions in channel %s", channel)
             return "deny", source
         allowed = adapter._slack_allowed_channels()
         if not is_dm and allowed and channel not in allowed:
+            logger.info("[Slack] client context denied: channel %s is not an allowed channel", channel)
             return "deny", source
         return mode, source
     except Exception:
+        # channel is only set once it passed identifier(); never log raw event fields.
+        logger.warning("[Slack] client context denied: event failed admission checks in channel %s", channel or "unknown")
         return "deny", None
 
 
