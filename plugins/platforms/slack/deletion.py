@@ -59,7 +59,7 @@ def deletion_guard(method):
         except DeletedSurfaceError as exc:
             if signature.return_annotation in (None, "None"):
                 return None
-            return SendResult(success=False, error=str(exc))
+            return SendResult(success=False, error=str(exc), error_kind="not_found")
         finally:
             _delivery_scope.reset(token)
     return guarded
