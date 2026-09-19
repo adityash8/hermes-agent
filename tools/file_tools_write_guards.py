@@ -57,13 +57,40 @@ def _hermes_home_real() -> str:
 
 
 def _get_hermes_config_resolved() -> str | None:
-    """Return the resolved absolute path of the Hermes config file (cached)."""
+    """Return the resolved absolute path of the Hermes config file (cached).
+
+    Profile-scoped turns (``get_hermes_home_override()`` set) skip the
+    process-global cache — a multiplex gateway serves several profiles in one
+    process, and the first profile's config.yaml must not become the deny
+    target for later ones.
+    """
+    from hermes_constants import get_hermes_home_override
+    if get_hermes_home_override() is not None:
+        try:
+            return _config_path_resolved()
+        except Exception:
+            try:
+                return str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
+            except Exception:
+                return None
     return _cached_lookup("_hermes_config_resolved", "_hermes_config_resolved_loaded", _config_path_resolved,
                           lambda: str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve()))
 
 
 def _get_real_hermes_home() -> str | None:
-    """Return the realpath of the authoritative Hermes home (cached)."""
+    """Return the realpath of the authoritative Hermes home (cached).
+
+    Same multiplex bypass as ``_get_hermes_config_resolved``.
+    """
+    from hermes_constants import get_hermes_home_override
+    if get_hermes_home_override() is not None:
+        try:
+            return _hermes_home_real()
+        except Exception:
+            try:
+                return os.path.realpath(_expand_tilde("~/.hermes"))
+            except Exception:
+                return None
     return _cached_lookup("_real_hermes_home_cached", "_real_hermes_home_loaded", _hermes_home_real,
                           lambda: os.path.realpath(_expand_tilde("~/.hermes")))
 
