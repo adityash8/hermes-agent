@@ -233,6 +233,7 @@ class GatewayInboundMixin:
         if is_internal:
             return None
         try:
+            from agent.estop import get_state as _estop_get_state
             from agent.estop import paused_reply as _estop_paused_reply
         except ImportError:
             return None
@@ -244,12 +245,13 @@ class GatewayInboundMixin:
             getattr(getattr(source, "platform", None), "value", "unknown"),
             getattr(source, "chat_id", None) or "unknown",
         )
-        if source.platform == Platform.SLACK and _paused_notice.startswith("⏸️ Hermes is paused"):
-            detail = _paused_notice.removeprefix("⏸️ Hermes is paused")
-            suffix = ". New work is on hold; run `hermes resume` to pick things back up."
-            if detail.endswith(suffix):
-                detail = detail.removesuffix(suffix) + ". Ask an admin to resume Jarvis on the host."
-            return "⏸️ Jarvis is paused" + detail
+        if source.platform == Platform.SLACK:
+            # Rebuilt from the estop state rather than rewritten out of upstream's sentence: the
+            # Slack copy must not silently lose its branding when that wording changes, and Slack
+            # operators have no host shell for `hermes resume`. The reason stays verbatim.
+            _reason = (_estop_get_state() or {}).get("reason")
+            return (f"⏸️ Jarvis is paused{f' ({_reason})' if _reason else ''}"
+                    ". Ask an admin to resume Jarvis on the host.")
         return _paused_notice
 
     @staticmethod
