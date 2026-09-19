@@ -265,5 +265,7 @@ def execute(grants, arguments, check):
             "rows": rows}, sort_keys=True)
     except Exception:
         # Neither upstream error bodies nor credential-bearing request exceptions
-        # may enter model history, gateway logs, or peer-facing errors.
+        # may enter model history, gateway logs, or peer-facing errors. ContextChanged
+        # subclasses ContextDenied and is caught here on purpose: a peer must not be able
+        # to tell a mid-turn revocation apart from any other failure.
         raise ContextDenied("client context analytics unavailable") from None

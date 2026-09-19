@@ -260,6 +260,9 @@ def execute(grants, name, arguments, check):
         guarded()
         return output
     except Exception:
+        # ContextChanged subclasses ContextDenied and is caught here on purpose: a peer
+        # must not be able to tell a mid-turn revocation apart from any other failure,
+        # so everything but a validated observation leaves as the same opaque denial.
         raise ContextDenied("client context analytics unavailable") from None
 
 
