@@ -276,8 +276,15 @@ class SlackDeletionMixin(BasePlatformAdapter):
             self._check_deletion_scope()
             await super()._process_message_background(event, session_key)
         except DeletedSurfaceError:
+            # Nothing ran and the surface is gone, so a follow-up queued for that same surface has
+            # nowhere to land: drop it and finalize instead of leaving a half-torn-down session.
             if self._session_tasks.get(session_key) is asyncio.current_task():
+                self._pending_messages.pop(session_key, None)
+                # A live debounce timer would merge its buffered text straight back into
+                # _pending_messages after the pop, for a session with no owner task and no guard.
+                self._discard_text_debounce(session_key)
                 self._release_session_guard(session_key)
+                self._session_tasks.pop(session_key, None)
         finally:
             _delivery_scope.reset(token)
             if session_key not in self._active_sessions:
