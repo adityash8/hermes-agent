@@ -16,6 +16,7 @@ Covers:
 
 import asyncio
 import base64
+import threading
 import hashlib
 import hmac
 import json
@@ -537,6 +538,145 @@ class TestIdempotency:
             assert resp2.status == 200
             data = await resp2.json()
             assert data["status"] == "duplicate"
+
+    @pytest.mark.asyncio
+    async def test_overlapping_same_delivery_id_during_script_is_duplicate(self):
+        """A retry that arrives while the first request is still in the route
+        script must not spawn a second agent run (EZ-1029)."""
+        started = threading.Event()
+        release = threading.Event()
+        calls = {"n": 0}
+
+        def _blocking_script(_script, payload):
+            calls["n"] += 1
+            started.set()
+            release.wait(timeout=5)
+            return True, payload
+
+        routes = {"slow": {"secret": _INSECURE_NO_AUTH, "prompt": "test", "script": "true"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._route_processor.run_route_script = _blocking_script
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"X-GitHub-Delivery": "delivery-overlap"}
+            first = asyncio.create_task(cli.post("/webhooks/slow", json={"a": 1}, headers=headers))
+            await asyncio.to_thread(started.wait, 2)
+            assert started.is_set()
+            second = await cli.post("/webhooks/slow", json={"a": 1}, headers=headers)
+            release.set()
+            resp1 = await first
+            assert resp1.status == 202
+            assert second.status == 503
+            data = await second.json()
+            assert data["status"] == "in_flight"
+            assert adapter.handle_message.await_count == 1
+            assert calls["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_in_flight_script_does_not_block_other_route(self):
+        """A reservation on route A must not 200-duplicate the same delivery
+        on route B (Codex EZ-1029 review)."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def _blocking_script(_script, payload):
+            started.set()
+            release.wait(timeout=5)
+            return False, None
+
+        routes = {
+            "slow": {"secret": _INSECURE_NO_AUTH, "prompt": "test", "script": "true"},
+            "other": {"secret": _INSECURE_NO_AUTH, "prompt": "test"},
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._route_processor.run_route_script = _blocking_script
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"X-GitHub-Delivery": "delivery-shared"}
+            first = asyncio.create_task(cli.post("/webhooks/slow", json={"a": 1}, headers=headers))
+            await asyncio.to_thread(started.wait, 2)
+            assert started.is_set()
+            other = await cli.post("/webhooks/other", json={"a": 1}, headers=headers)
+            release.set()
+            ignored = await first
+            assert ignored.status == 200
+            assert (await ignored.json())["reason"] == "script"
+            assert other.status == 202
+            assert adapter.handle_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_filtered_event_does_not_pin_delivery_id_for_other_route(self):
+        """A reject on route A must not consume the delivery id for route B
+        (adapter-wide cache; Codex EZ-1029 review)."""
+        routes = {
+            "pulls": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "events": ["pull_request"],
+            },
+            "pushes": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "events": ["push"],
+            },
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {
+                "X-GitHub-Delivery": "delivery-shared",
+                "X-GitHub-Event": "push",
+            }
+            ignored = await cli.post("/webhooks/pulls", json={"a": 1}, headers=headers)
+            assert ignored.status == 200
+            assert (await ignored.json())["status"] == "ignored"
+            accepted = await cli.post("/webhooks/pushes", json={"a": 1}, headers=headers)
+            assert accepted.status == 202
+            assert adapter.handle_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_prompt_render_exception_releases_delivery_id(self):
+        """A preprocessing crash must not pin the delivery id (Codex EZ-1029)."""
+        routes = {"boom": {"secret": _INSECURE_NO_AUTH, "prompt": "count {n}"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._render_prompt = lambda *a, **k: (_ for _ in ()).throw(TypeError("bad template"))
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"X-GitHub-Delivery": "delivery-boom"}
+            first = await cli.post("/webhooks/boom", json={"n": 1}, headers=headers)
+            assert first.status == 500
+            adapter._render_prompt = WebhookAdapter._render_prompt.__get__(adapter, WebhookAdapter)
+            second = await cli.post("/webhooks/boom", json={"n": 1}, headers=headers)
+            assert second.status == 202
+            assert adapter.handle_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_script_failure_releases_delivery_id_for_retry(self):
+        """A timed-out or failing script must not pin the delivery id for the
+        idempotency TTL, or GitHub cannot recover (EZ-1029 review)."""
+        routes = {"fail": {"secret": _INSECURE_NO_AUTH, "prompt": "test", "script": "true"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._route_processor.run_route_script = lambda *_a, **_k: (False, None)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"X-GitHub-Delivery": "delivery-retry"}
+            first = await cli.post("/webhooks/fail", json={"a": 1}, headers=headers)
+            assert first.status == 200
+            assert (await first.json())["reason"] == "script"
+            adapter._route_processor.run_route_script = lambda *_a, **_k: (True, {"a": 1})
+            second = await cli.post("/webhooks/fail", json={"a": 1}, headers=headers)
+            assert second.status == 202
+            assert adapter.handle_message.await_count == 1
 
 
 # ===================================================================
