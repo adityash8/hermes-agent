@@ -308,7 +308,7 @@ class TestSendVoiceReply:
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
         with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result) as mock_tts, \
-             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("tools.tts_text_normalize._strip_markdown_for_tts", side_effect=lambda t: t), \
              patch("os.path.isfile", return_value=True), \
              patch("os.unlink"), \
              patch("os.makedirs"):
@@ -336,7 +336,7 @@ class TestSendVoiceReply:
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
         with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
-             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("tools.tts_text_normalize._strip_markdown_for_tts", side_effect=lambda t: t), \
              patch("os.path.isfile", return_value=True), \
              patch("os.unlink"), \
              patch("os.makedirs"):
@@ -768,6 +768,49 @@ class TestDiscordVoiceChannelMethods:
 
 
     @pytest.mark.asyncio
+    async def test_disconnect_leaves_voice_before_cancelling_bot_task(self):
+        """Voice must be torn down while the gateway websocket is still alive.
+
+        VoiceClient.disconnect() sends a voice state update over the main gateway
+        connection and waits for the voice socket to close.  The bot task is the
+        loop running that connection, so cancelling it first strands the
+        handshake and the disconnect blocks until the caller's shutdown timeout.
+        """
+        adapter = self._make_adapter()
+        events = []
+
+        async def cancel_liveness_task():
+            events.append("cancel_liveness_task")
+
+        async def cancel_bot_task():
+            events.append("cancel_bot_task")
+
+        async def leave_voice_channel(guild_id):
+            events.append(f"leave_voice_channel:{guild_id}")
+
+        async def close():
+            events.append("close_client")
+
+        adapter._cancel_liveness_task = cancel_liveness_task
+        adapter._cancel_bot_task = cancel_bot_task
+        adapter.leave_voice_channel = leave_voice_channel
+        adapter._client.close = close
+        adapter._voice_clients[111] = MagicMock()
+        adapter._ready_event = MagicMock()
+        adapter._post_connect_task = None
+        adapter._missed_message_backfill_task = None
+
+        await adapter.disconnect()
+
+        assert events == [
+            "cancel_liveness_task",
+            "leave_voice_channel:111",
+            "cancel_bot_task",
+            "close_client",
+        ]
+
+
+    @pytest.mark.asyncio
     async def test_get_user_voice_channel_success(self):
         adapter = self._make_adapter()
         mock_vc = MagicMock()
@@ -1011,7 +1054,7 @@ class TestStreamTtsToSpeaker:
 
     def test_none_sentinel_flushes_buffer(self):
         """None sentinel causes remaining buffer to be spoken."""
-        from tools.tts_tool import stream_tts_to_speaker
+        from tools.tts_tool_speaker import stream_tts_to_speaker
         text_q = queue.Queue()
         stop_evt = threading.Event()
         done_evt = threading.Event()
@@ -1029,7 +1072,7 @@ class TestStreamTtsToSpeaker:
 
     def test_stop_event_aborts_early(self):
         """Setting stop_event causes early exit."""
-        from tools.tts_tool import stream_tts_to_speaker
+        from tools.tts_tool_speaker import stream_tts_to_speaker
         text_q = queue.Queue()
         stop_evt = threading.Event()
         done_evt = threading.Event()
@@ -1045,7 +1088,7 @@ class TestStreamTtsToSpeaker:
 
     def test_done_event_set_on_exception(self):
         """tts_done_event is set even when an exception occurs."""
-        from tools.tts_tool import stream_tts_to_speaker
+        from tools.tts_tool_speaker import stream_tts_to_speaker
         text_q = queue.Queue()
         stop_evt = threading.Event()
         done_evt = threading.Event()
@@ -1875,7 +1918,7 @@ class TestStreamTtsTempfileFallback:
         import wave
         import tools.tts_tool as tts_mod
         import tools.voice_mode as vm
-        from tools.tts_tool import stream_tts_to_speaker
+        from tools.tts_tool_speaker import stream_tts_to_speaker
 
         # Fake registry streamer so resolve_streaming_provider yields chunked
         # PCM regardless of which real providers are configured in the env.

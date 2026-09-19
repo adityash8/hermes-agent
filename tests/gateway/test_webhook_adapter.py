@@ -16,6 +16,7 @@ Covers:
 
 import asyncio
 import base64
+import threading
 import hashlib
 import hmac
 import json
@@ -149,10 +150,32 @@ class TestValidateSignature:
             "X-Hub-Signature-256",
             "X-Gitlab-Token",
             "X-Webhook-Signature",
+            "linear-signature",
         ):
             req = _mock_request(headers={header: hostile})
             # Must return False, never raise.
             assert adapter._validate_signature(req, body, secret) is False
+
+    def test_linear_signature_valid_accepts(self):
+        """Linear signs the raw body (hex HMAC-SHA256) in linear-signature."""
+        adapter = _make_adapter()
+        body = b'{"type": "Issue", "data": {"id": "abc"}}'
+        secret = "linear-webhook-key"
+        sig = _generic_signature(body, secret)  # same math as linear-signature
+
+        req = _mock_request(headers={"linear-signature": sig})
+
+        assert adapter._validate_signature(req, body, secret) is True
+
+    def test_linear_signature_mismatch_rejects(self):
+        """A well-formed linear-signature computed with the wrong key fails closed."""
+        adapter = _make_adapter()
+        body = b'{"type": "Issue"}'
+        sig = _generic_signature(body, "attacker-controlled-key")
+
+        req = _mock_request(headers={"linear-signature": sig})
+
+        assert adapter._validate_signature(req, body, "real-secret") is False
 
 
     def test_non_ascii_svix_signature_rejected(self):
@@ -515,6 +538,145 @@ class TestIdempotency:
             assert resp2.status == 200
             data = await resp2.json()
             assert data["status"] == "duplicate"
+
+    @pytest.mark.asyncio
+    async def test_overlapping_same_delivery_id_during_script_is_duplicate(self):
+        """A retry that arrives while the first request is still in the route
+        script must not spawn a second agent run (EZ-1029)."""
+        started = threading.Event()
+        release = threading.Event()
+        calls = {"n": 0}
+
+        def _blocking_script(_script, payload):
+            calls["n"] += 1
+            started.set()
+            release.wait(timeout=5)
+            return True, payload
+
+        routes = {"slow": {"secret": _INSECURE_NO_AUTH, "prompt": "test", "script": "true"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._route_processor.run_route_script = _blocking_script
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"X-GitHub-Delivery": "delivery-overlap"}
+            first = asyncio.create_task(cli.post("/webhooks/slow", json={"a": 1}, headers=headers))
+            await asyncio.to_thread(started.wait, 2)
+            assert started.is_set()
+            second = await cli.post("/webhooks/slow", json={"a": 1}, headers=headers)
+            release.set()
+            resp1 = await first
+            assert resp1.status == 202
+            assert second.status == 503
+            data = await second.json()
+            assert data["status"] == "in_flight"
+            assert adapter.handle_message.await_count == 1
+            assert calls["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_in_flight_script_does_not_block_other_route(self):
+        """A reservation on route A must not 200-duplicate the same delivery
+        on route B (Codex EZ-1029 review)."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def _blocking_script(_script, payload):
+            started.set()
+            release.wait(timeout=5)
+            return False, None
+
+        routes = {
+            "slow": {"secret": _INSECURE_NO_AUTH, "prompt": "test", "script": "true"},
+            "other": {"secret": _INSECURE_NO_AUTH, "prompt": "test"},
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._route_processor.run_route_script = _blocking_script
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"X-GitHub-Delivery": "delivery-shared"}
+            first = asyncio.create_task(cli.post("/webhooks/slow", json={"a": 1}, headers=headers))
+            await asyncio.to_thread(started.wait, 2)
+            assert started.is_set()
+            other = await cli.post("/webhooks/other", json={"a": 1}, headers=headers)
+            release.set()
+            ignored = await first
+            assert ignored.status == 200
+            assert (await ignored.json())["reason"] == "script"
+            assert other.status == 202
+            assert adapter.handle_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_filtered_event_does_not_pin_delivery_id_for_other_route(self):
+        """A reject on route A must not consume the delivery id for route B
+        (adapter-wide cache; Codex EZ-1029 review)."""
+        routes = {
+            "pulls": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "events": ["pull_request"],
+            },
+            "pushes": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "test",
+                "events": ["push"],
+            },
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {
+                "X-GitHub-Delivery": "delivery-shared",
+                "X-GitHub-Event": "push",
+            }
+            ignored = await cli.post("/webhooks/pulls", json={"a": 1}, headers=headers)
+            assert ignored.status == 200
+            assert (await ignored.json())["status"] == "ignored"
+            accepted = await cli.post("/webhooks/pushes", json={"a": 1}, headers=headers)
+            assert accepted.status == 202
+            assert adapter.handle_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_prompt_render_exception_releases_delivery_id(self):
+        """A preprocessing crash must not pin the delivery id (Codex EZ-1029)."""
+        routes = {"boom": {"secret": _INSECURE_NO_AUTH, "prompt": "count {n}"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._render_prompt = lambda *a, **k: (_ for _ in ()).throw(TypeError("bad template"))
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"X-GitHub-Delivery": "delivery-boom"}
+            first = await cli.post("/webhooks/boom", json={"n": 1}, headers=headers)
+            assert first.status == 500
+            adapter._render_prompt = WebhookAdapter._render_prompt.__get__(adapter, WebhookAdapter)
+            second = await cli.post("/webhooks/boom", json={"n": 1}, headers=headers)
+            assert second.status == 202
+            assert adapter.handle_message.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_script_failure_releases_delivery_id_for_retry(self):
+        """A timed-out or failing script must not pin the delivery id for the
+        idempotency TTL, or GitHub cannot recover (EZ-1029 review)."""
+        routes = {"fail": {"secret": _INSECURE_NO_AUTH, "prompt": "test", "script": "true"}}
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+        adapter._route_processor.run_route_script = lambda *_a, **_k: (False, None)
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            headers = {"X-GitHub-Delivery": "delivery-retry"}
+            first = await cli.post("/webhooks/fail", json={"a": 1}, headers=headers)
+            assert first.status == 200
+            assert (await first.json())["reason"] == "script"
+            adapter._route_processor.run_route_script = lambda *_a, **_k: (True, {"a": 1})
+            second = await cli.post("/webhooks/fail", json={"a": 1}, headers=headers)
+            assert second.status == 202
+            assert adapter.handle_message.await_count == 1
 
 
 # ===================================================================
@@ -920,7 +1082,7 @@ class TestMultiplexProfileWebhookAuthentication:
         adapter.gateway_runner = runner
         monkeypatch.setattr(
             "hermes_cli.profiles.profiles_to_serve",
-            lambda multiplex: [
+            lambda multiplex, profile_allowlist=None: [
                 ("default", tmp_path),
                 ("worker", tmp_path / "profiles" / "worker"),
                 ("other", tmp_path / "profiles" / "other"),
@@ -988,6 +1150,63 @@ class TestMultiplexProfileWebhookAuthentication:
                 headers=headers,
             )
             assert default_profile.status == 404
+
+    @pytest.mark.asyncio
+    async def test_routed_profile_skills_resolve_under_that_profile(
+        self, tmp_path, monkeypatch
+    ):
+        """A /p/<profile>/ route's ``skills:`` must load from that profile's
+        skills/ dir (#67277). Before the fix the lookup ran with no profile
+        scope, so it scanned the launch profile and logged "Skill not found".
+        """
+        import agent.skill_commands as sc_mod
+
+        worker = tmp_path / "profiles" / "worker"
+        skill_dir = worker / "skills" / "worker-only"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: worker-only\ndescription: w\n---\n\nBody of worker-only.\n"
+        )
+        (worker / "config.yaml").write_text("{}\n")
+        (worker / ".env").write_text("")
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir", lambda name: tmp_path / "profiles" / name
+        )
+        route_secret = "worker-route-secret-abc123"
+        adapter = _make_adapter(
+            routes={
+                "gh": {
+                    "profile": "worker",
+                    "secret": route_secret,
+                    "prompt": "PR: {action}",
+                    "skills": ["worker-only"],
+                }
+            },
+            host="127.0.0.1",
+        )
+        self._configure_profiles(adapter, tmp_path, monkeypatch)
+        seen = []
+
+        async def _capture(event):
+            seen.append(event)
+
+        adapter.handle_message = _capture
+        body = b'{"action":"opened"}'
+        headers = {
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": _github_signature(body, route_secret),
+        }
+        with (
+            patch.object(sc_mod, "_skill_commands", {}),
+            patch.object(sc_mod, "_skill_commands_home", None),
+        ):
+            async with TestClient(TestServer(self._app(adapter))) as cli:
+                resp = await cli.post("/p/worker/webhooks/gh", data=body, headers=headers)
+                assert resp.status == 202
+                await asyncio.sleep(0.05)
+        assert len(seen) == 1
+        assert seen[0].source.profile == "worker"
+        assert "Body of worker-only." in seen[0].text
 
 
 def test_route_profile_validation_fails_closed():

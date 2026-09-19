@@ -77,7 +77,6 @@ async def test_restart_command_uses_atomic_json_writes_for_marker_files(tmp_path
     # run.py); it uses that module's top-level atomic_json_write import.
     import gateway.slash_commands as gateway_slash
     monkeypatch.setattr(gateway_slash, "atomic_json_write", _fake_atomic_json_write)
-    monkeypatch.setattr(gateway_run, "atomic_json_write", _fake_atomic_json_write)
 
     runner, _adapter = make_restart_runner()
     runner.request_restart = MagicMock(return_value=True)
@@ -237,7 +236,7 @@ async def test_relay_fronted_logical_home_gets_startup_notification(tmp_path, mo
     assert relay.send_for_platform.await_args.args[:3] == (
         Platform.SLACK,
         "D123",
-        "♻️ Gateway online — Hermes is back and ready.",
+        "♻️ Gateway online — Jarvis is back and ready.",
     )
     assert relay.send_for_platform.await_args.kwargs["metadata"]["user_id"] == "U123"
     assert relay.send_for_platform.await_args.kwargs["metadata"]["scope_id"] == "T123"

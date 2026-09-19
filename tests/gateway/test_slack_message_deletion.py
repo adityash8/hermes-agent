@@ -1,0 +1,425 @@
+"""Deletion is an exact-surface stop, not an invitation to recreate a reply."""
+import asyncio
+import json
+import logging
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import PlatformConfig
+from gateway.platforms.base import TextDebounceState
+from plugins.platforms.slack.adapter import SlackAdapter
+
+
+META = {"team_id": "T1", "thread_id": "100.000001"}
+
+
+def make_adapter():
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="fake", extra={"require_mention": False}))
+    adapter._app = MagicMock()
+    adapter._bot_user_id = "UBOT"
+    adapter._team_bot_user_ids = {"T1": "UBOT", "T2": "UOTHERBOT"}
+    client = AsyncMock()
+    client.chat_postMessage.return_value = {"ok": True, "ts": "101.000001"}
+    client.chat_update.return_value = {"ok": True}
+    client.chat_delete.return_value = {"ok": True}
+    client.chat_startStream.return_value = {"ok": True, "ts": "102.000001"}
+    client.api_call.return_value = {"ok": True, "ts": "103.000001"}
+    setattr(adapter, "_get_client", MagicMock(return_value=client))
+    setattr(adapter, "stop_typing", AsyncMock())
+    setattr(adapter, "_resolve_user_is_bot", AsyncMock(return_value=False))
+    setattr(adapter, "_resolve_user_name", AsyncMock(return_value="Human"))
+    setattr(adapter, "_resolve_channel_name", AsyncMock(return_value="Channel"))
+    setattr(adapter, "_hydrate_thread_context", AsyncMock(return_value=(None, [], [])))
+    adapter._authorization_check = lambda *args, **kwargs: True
+    adapter.handle_message = AsyncMock()
+    return adapter, client
+
+
+def deletion(*, user="UBOT", channel="C1", team="T1", ts="101.000001", thread="100.000001"):
+    return {"type": "message", "subtype": "message_deleted", "channel": channel,
+            "team": team, "deleted_ts": ts, "event_ts": "110.000001",
+            "previous_message": {"user": user, "ts": ts, "thread_ts": thread}}
+
+
+def mention(text, ts="120.000001", **extra):
+    return {"type": "message", "channel": "C1", "team": "T1", "user": "UHUMAN",
+            "client_msg_id": ts, "ts": ts, "thread_ts": META["thread_id"],
+            "text": text, **extra}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind, muted", [
+    ("external", True), ("restart", True), ("restart_before_delete", True), ("active_turn", True), ("tracked_without_author", True),
+    ("human_root", False), ("other_bot", False), ("other_workspace", False),
+    ("cleanup_race", False), ("failed_cleanup", True),
+])
+async def test_deleted_reply_blocks_all_recreation_until_fresh_authorized_mention(kind, muted):
+    adapter, client = make_adapter()
+    assert (await adapter.send_or_update_status("C1", "progress", "working", metadata=META)).success
+    event = deletion()
+    if kind == "restart_before_delete":
+        adapter, client = make_adapter()
+        event.pop("previous_message")
+    if kind == "active_turn":
+        del adapter.handle_message  # use real dispatch and background processing
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+        async def generate(message):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        adapter.set_message_handler(generate)
+        adapter._run_processing_hook = AsyncMock()
+        adapter._start_typing_refresh = MagicMock(return_value=None)
+        adapter.set_session_cancellation_handler(AsyncMock())
+        await adapter._handle_slack_message(mention("<@UBOT> begin", ts="105.000001"))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        assert len(adapter._session_tasks) == 1
+        session_key, owner = next(iter(adapter._session_tasks.items()))
+        # Queue clearing must precede the owner's finalizer and its pending-message drain.
+        adapter._pending_messages[session_key] = MagicMock()
+    if kind == "human_root":
+        event = deletion(user="UHUMAN", ts=META["thread_id"])
+    elif kind == "other_bot":
+        event = deletion(user="UOTHERBOT", ts="104.000001")
+    elif kind == "other_workspace":
+        event = deletion(team="T2")
+    elif kind == "tracked_without_author":
+        event.pop("previous_message")
+    elif kind == "cleanup_race":
+        async def cleanup(**kwargs):
+            await adapter._handle_slack_message(event)
+            return {"ok": True}
+        client.chat_delete.side_effect = cleanup
+        assert await adapter.delete_message("C1", "101.000001")
+    elif kind == "failed_cleanup":
+        client.chat_delete.return_value = {"ok": False, "error": "cant_delete_message"}
+        assert not await adapter.delete_message("C1", "101.000001")
+    await adapter._handle_slack_message(event)
+    if kind == "active_turn":
+        assert cancelled.is_set() and owner.cancelled()
+        assert not adapter._pending_messages and not adapter._active_sessions
+        callback = adapter._session_cancellation_handler
+        callback.assert_awaited_once()
+        called_key, source = callback.await_args.args
+        assert called_key == session_key
+        assert (source.scope_id, source.chat_id, source.thread_id) == ("T1", "C1", META["thread_id"])
+        adapter.handle_message = AsyncMock()
+    if kind == "restart":
+        adapter, client = make_adapter()
+    client.reset_mock()
+    if not muted:
+        assert (await adapter.send("C1", "unaffected", metadata=META)).success
+        return
+    results = [
+        await adapter.send_or_update_status("C1", "progress", "still working", metadata=META),
+        await adapter.edit_message("C1", "101.000001", "final", finalize=True, metadata=META),
+        await adapter.send("C1", "fallback", metadata=META),
+        await adapter.send_draft("C1", 1, "stream", metadata=META),
+        await adapter.send_native_task_card_progress("C1", [{"id": "a"}], metadata=META),
+        await adapter.send_exec_approval("C1", "echo hi", "session", metadata=META),
+    ]
+    assert all(not result.success for result in results)
+    assert not client.mock_calls
+    # Matching timestamps in another channel/workspace/thread must remain writable.
+    for channel, metadata in [("C2", META), ("C1", {**META, "team_id": "T2"}),
+                              ("C1", {**META, "thread_id": "200.000001"})]:
+        assert (await adapter.send(channel, "unaffected", metadata=metadata)).success
+    for event in [mention("ambient"), mention("<@UBOT> stale", ts="105.000001"),
+                  mention("ambient", ts="121.000001", _hermes_force_process=True),
+                  mention("> <@UBOT> quoted", ts="121.000002"),
+                  mention("`<@UBOT>` code", ts="121.000003")]:
+        await adapter._handle_slack_message(event)
+    adapter._authorization_check = lambda *args, **kwargs: False
+    await adapter._handle_slack_message(mention("<@UBOT> unauthorized", ts="122.000001"))
+    adapter.handle_message.assert_not_awaited()
+    assert not (await adapter.send("C1", "still muted", metadata=META)).success
+    adapter._authorization_check = None
+    await adapter._handle_slack_message(mention("<@UBOT> unknown auth", ts="122.000002"))
+    adapter.handle_message.assert_not_awaited()
+    adapter._authorization_check = lambda *args, **kwargs: True
+    await adapter._handle_slack_message(mention("<@UBOT> resume", ts="123.000001"))
+    adapter.handle_message.assert_awaited_once()
+    assert (await adapter.send("C1", "fresh reply", metadata=META)).success
+    await adapter._handle_slack_message(deletion())  # reconnect replay cannot revoke the summon
+    assert (await adapter.send("C1", "still summoned", metadata=META)).success
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["status_return", "status_raise", "native_append", "native_seal",
+                                       "late_post", "late_post_after_summon", "late_post_cancelled", "late_first_reply_deleted", "late_chunk"])
+async def test_missing_or_inflight_writes_cannot_resurrect_a_deleted_surface(transport):
+    adapter, client = make_adapter()
+    await adapter.send_or_update_status("C1", "progress", "working", metadata=META)
+    if transport.startswith("status"):
+        if transport == "status_return":
+            client.chat_update.return_value = {"ok": False, "error": "message_not_found"}
+        else:
+            error = RuntimeError("Slack update failed")
+            setattr(error, "response", {"ok": False, "error": "message_not_found"})
+            client.chat_update.side_effect = error
+        result = await adapter.send_or_update_status("C1", "progress", "resurrect", metadata=META)
+    elif transport.startswith("native"):
+        await adapter.send_draft("C1", 1, "hello", metadata=META)
+        if transport == "native_append":
+            client.chat_appendStream.return_value = {"ok": False, "error": "message_not_found"}
+            result = await adapter.send_draft("C1", 1, "hello again", metadata=META)
+        else:
+            client.chat_stopStream.return_value = {"ok": False, "error": "message_not_found"}
+            result = await adapter.send("C1", "hello final", metadata=META)
+    else:
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def late_post(**kwargs):
+            entered.set()
+            await release.wait()
+            return {"ok": True, "ts": "201.000001"}
+        client.chat_postMessage.side_effect = late_post
+        content = "hello" if transport != "late_chunk" else "x" * (adapter.MAX_MESSAGE_LENGTH + 20)
+        pending = asyncio.create_task(adapter.send("C1", content, metadata=META))
+        await entered.wait()
+        if transport == "late_post_cancelled":
+            source = adapter.build_source(
+                chat_id="C1", chat_type="group", user_id="UHUMAN",
+                thread_id=META["thread_id"], scope_id="T1")
+            adapter._slack_surface_sessions = {"cancelled-send": source}
+            adapter._track_session_task("cancelled-send", pending)
+            cleaned = asyncio.Event()
+            async def cleanup(**kwargs):
+                cleaned.set()
+                return {"ok": True}
+            client.chat_delete.side_effect = cleanup
+        # Ambient channel cache must not steal the in-flight call's workspace.
+        adapter._channel_team["C1"] = "T2"
+        event = deletion()
+        if transport == "late_first_reply_deleted":
+            event = deletion(ts="201.000001")
+            event.pop("previous_message")
+        await adapter._handle_slack_message(event)
+        if transport == "late_post_after_summon":
+            await adapter._handle_slack_message(mention("<@UBOT> new work"))
+        release.set()
+        if transport == "late_post_cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            await asyncio.wait_for(cleaned.wait(), timeout=2)
+            result = None
+        else:
+            result = await pending
+        client.chat_delete.assert_awaited_once_with(channel="C1", ts="201.000001")
+    assert result is None or not result.success
+    assert client.chat_postMessage.await_count == (2 if transport.startswith("late") else 1)
+    if transport != "late_post_after_summon":
+        assert not (await adapter.send("C1", "final fallback", metadata=META)).success
+
+
+@pytest.mark.asyncio
+async def test_deleted_surface_send_is_not_retried_or_downgraded(caplog):
+    """The retry wrapper must not treat a deleted surface as a formatting failure: one guarded
+    send, no plain-text fallback, no Slack call, and no WARNING/ERROR noise per attempt."""
+    adapter, client = make_adapter()
+    assert (await adapter.send_or_update_status("C1", "progress", "working", metadata=META)).success
+    await adapter._handle_slack_message(deletion())
+    client.reset_mock()
+    guarded_send, attempts = adapter.send, []
+
+    async def counting_send(*args, **kwargs):
+        attempts.append(kwargs.get("content"))
+        return await guarded_send(*args, **kwargs)
+
+    adapter.send = counting_send
+    with caplog.at_level(logging.DEBUG):
+        result = await adapter._send_with_retry("C1", "final", metadata=META)
+    assert not result.success and result.error_kind == "not_found"
+    assert attempts == ["final"]
+    assert not client.mock_calls
+    assert not [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+@pytest.mark.asyncio
+async def test_deleted_surface_at_task_start_finalizes_session():
+    """A task whose surface was deleted before it did any work must leave no queued message,
+    session guard, owner entry, or live debounce timer behind for that session key."""
+    adapter, client = make_adapter()
+    assert (await adapter.send_or_update_status("C1", "progress", "working", metadata=META)).success
+    await adapter._handle_slack_message(mention("<@UBOT> begin", ts="105.000001"))
+    event = adapter.handle_message.call_args.args[0]
+    key = (event.source.scope_id or "", event.source.chat_id, event.source.thread_id or "")
+    event.metadata["_slack_deletion_generation"] = adapter._deletion_generation(key)
+    session_key = adapter._event_session_key(event)
+    await adapter._handle_slack_message(deletion())
+    client.reset_mock()
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._pending_messages[session_key] = MagicMock()
+    # A debounce timer left running would flush its buffered text straight back into
+    # _pending_messages, re-queueing work for a surface that no longer exists.
+    timer = asyncio.create_task(asyncio.sleep(3600))
+    adapter._text_debounce_store()[session_key] = TextDebounceState(
+        event=MagicMock(), task=timer, first_ts=0.0, last_ts=0.0)
+    task = asyncio.create_task(adapter._process_message_background(event, session_key))
+    assert adapter._track_session_task(session_key, task)
+    await task
+    await asyncio.sleep(0)
+    assert session_key not in adapter._pending_messages
+    assert session_key not in adapter._active_sessions
+    assert session_key not in adapter._session_tasks
+    assert session_key not in adapter._text_debounce_store()
+    assert timer.cancelled()
+
+@pytest.mark.asyncio
+async def test_failed_delete_call_drops_cleanup_receipt():
+    """A chat.delete that raised confirmed nothing. If its cleanup receipt survived, a later
+    external deletion of that message would be read as our own cleanup and the surface would
+    stay writable.
+
+    "connection reset" is deliberately the ambiguous case: Slack may or may not have applied
+    the delete. Dropping the receipt costs a spurious mute when it did apply and the response
+    was merely lost, recoverable with one mention. Keeping it costs a silently ignored human
+    delete. This pins the first."""
+    adapter, client = make_adapter()
+    assert (await adapter.send_or_update_status("C1", "progress", "working", metadata=META)).success
+    client.chat_delete.side_effect = RuntimeError("connection reset")
+    assert not await adapter.delete_message("C1", "101.000001")
+    key = adapter._sent_surface(adapter._deletion_key("C1"), "101.000001")
+    assert not adapter._is_cleanup(key, "101.000001")
+    client.chat_delete.side_effect = None
+    client.reset_mock()
+    await adapter._handle_slack_message(deletion())
+    assert not (await adapter.send("C1", "fallback", metadata=META)).success
+    assert not client.mock_calls
+
+@pytest.mark.asyncio
+async def test_unset_authorization_check_makes_the_deny_visible(caplog):
+    """Deny-by-default stays, but an unset check must not be silent: it denies every
+    summon forever, so it is warned once (surface ids only, never user or text)."""
+    adapter, _client = make_adapter()
+    assert (await adapter.send_or_update_status("C1", "progress", "working", metadata=META)).success
+    await adapter._handle_slack_message(deletion())
+    adapter._authorization_check = None
+    with caplog.at_level(logging.DEBUG, logger="plugins.platforms.slack.deletion"):
+        await adapter._handle_slack_message(mention("<@UBOT> unknown auth", ts="122.000001"))
+        await adapter._handle_slack_message(mention("<@UBOT> unknown auth", ts="122.000002"))
+    adapter.handle_message.assert_not_awaited()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                and "No authorization check registered" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "channel=C1" in warnings[0]
+    denials = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG
+               and "Deletion fence denied summon" in r.getMessage()]
+    assert len(denials) == 2 and all("channel=C1" in message for message in denials)
+    assert "UHUMAN" not in caplog.text and "unknown auth" not in caplog.text
+async def silence(adapter, thread, deleted_ts):
+    await adapter._silence_deleted_surface(("T1", "C1", thread), deleted_ts, "410.000001")
+
+
+@pytest.mark.asyncio
+async def test_tombstones_stay_bounded_so_the_state_file_cannot_grow_forever(caplog):
+    caplog.set_level(logging.INFO, logger="plugins.platforms.slack.deletion")
+    adapter, _client = make_adapter()
+    adapter._BOT_TS_MAX = 4
+    for index in range(9):
+        await silence(adapter, f"{300 + index}.000001", f"{400 + index}.000001")
+    threads = adapter._deletion_state()["threads"]
+    # Eviction is a trickle, not a cliff: each new tombstone drops exactly the one
+    # least-recently-active record, so the cap is spent in full and a burst never
+    # unmutes half the tracked surfaces at once.
+    assert list(threads) == [json.dumps(("T1", "C1", f"{ts}.000001")) for ts in range(305, 309)]
+    # Every reversed fence is greppable next to the mute it undoes.
+    dropped = [r.getMessage() for r in caplog.records if "Dropped oldest deleted" in r.getMessage()]
+    assert len(dropped) == 5 and "thread=300.000001" in dropped[0]
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_deletion_is_not_the_next_entry_evicted():
+    adapter, _client = make_adapter()
+    adapter._BOT_TS_MAX = 4
+    for index in range(4):
+        await silence(adapter, f"{300 + index}.000001", f"{400 + index}.000001")
+    await silence(adapter, "300.000001", "500.000001")  # same surface, new delete
+    await silence(adapter, "304.000001", "404.000001")  # forces eviction
+    assert json.dumps(("T1", "C1", "300.000001")) in adapter._deletion_state()["threads"]
+
+
+@pytest.mark.asyncio
+async def test_summoned_surface_survives_a_burst_of_unrelated_deletions():
+    adapter, _client = make_adapter()
+    adapter._BOT_TS_MAX = 4
+    assert (await adapter.send_or_update_status("C1", "progress", "working", metadata=META)).success
+    await adapter._handle_slack_message(deletion())
+    assert not (await adapter.send("C1", "muted", metadata=META)).success
+    for index in range(3):
+        await silence(adapter, f"{300 + index}.000001", f"{400 + index}.000001")
+    await adapter._handle_slack_message(mention("<@UBOT> resume", ts="123.000001"))
+    adapter.handle_message.assert_awaited_once()
+    await silence(adapter, "303.000001", "403.000001")  # forces eviction
+    await adapter._handle_slack_message(deletion())  # reconnect replay cannot revoke the summon
+    assert (await adapter.send("C1", "still summoned", metadata=META)).success
+async def test_deleted_top_level_reply_stops_the_thread_less_session():
+    """``reply_in_thread: false`` answers at channel level, so its session has no thread id."""
+    adapter, client = make_adapter()
+    adapter.config.extra["reply_in_thread"] = False
+    del adapter.handle_message  # use real dispatch and background processing
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def generate(message):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    adapter.set_message_handler(generate)
+    adapter._run_processing_hook = AsyncMock()
+    adapter._start_typing_refresh = MagicMock(return_value=None)
+    adapter.set_session_cancellation_handler(AsyncMock())
+    summon = mention("<@UBOT> begin", ts="105.000001")
+    summon.pop("thread_ts")
+    await adapter._handle_slack_message(summon)
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    assert len(adapter._session_tasks) == 1
+    session_key, owner = next(iter(adapter._session_tasks.items()))
+    assert (await adapter.send("C1", "channel reply", metadata={"team_id": "T1"})).success
+    await adapter._handle_slack_message(deletion(thread=None))
+    assert cancelled.is_set() and owner.cancelled()
+    callback = adapter._session_cancellation_handler
+    callback.assert_awaited_once()
+    called_key, source = callback.await_args.args
+    assert called_key == session_key
+    assert (source.scope_id, source.chat_id, source.thread_id) == ("T1", "C1", None)
+    # The channel is not tombstoned: a deleted top-level post is one message, not the surface.
+    # Accepted consequence — the stopped turn does not stay stopped the way a muted thread does,
+    # because the whole channel is one session here and the next message starts a new turn.
+    assert (await adapter.send("C1", "later", metadata={"team_id": "T1"})).success
+
+
+@pytest.mark.asyncio
+async def test_deleted_top_level_post_spares_unrelated_channel_writes():
+    """No channel-level run is live under the default, so bumping that epoch only hits innocents."""
+    adapter, client = make_adapter()
+    assert (await adapter.send("C1", "proactive post", metadata={"team_id": "T1"})).success
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def late_post(**kwargs):
+        entered.set()
+        await release.wait()
+        return {"ok": True, "ts": "201.000001"}
+
+    client.chat_postMessage.side_effect = late_post
+    pending = asyncio.create_task(adapter.send("C1", "unrelated cron post", metadata={"team_id": "T1"}))
+    await entered.wait()
+    await adapter._handle_slack_message(deletion(thread=None))
+    release.set()
+    assert (await pending).success
+    client.chat_delete.assert_not_awaited()
+    assert (await adapter.send("C1", "still writable", metadata={"team_id": "T1"})).success
+@pytest.mark.asyncio
+@pytest.mark.parametrize("author, muted", [("UBOT", True), ("UHUMAN", False)])
+async def test_unmapped_workspace_falls_back_to_default_bot_identity(author, muted):
+    """A team absent from the per-workspace map (single-workspace install, or a map not yet
+    populated at startup) must still resolve our own identity, or the fence never engages."""
+    adapter, client = make_adapter()
+    assert "T9" not in adapter._team_bot_user_ids
+    await adapter._handle_slack_message(deletion(user=author, team="T9"))
+    result = await adapter.send("C1", "after delete", metadata={**META, "team_id": "T9"})
+    assert result.success == (not muted)
