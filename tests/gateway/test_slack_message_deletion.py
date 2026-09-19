@@ -287,3 +287,24 @@ async def test_failed_delete_call_drops_cleanup_receipt():
     await adapter._handle_slack_message(deletion())
     assert not (await adapter.send("C1", "fallback", metadata=META)).success
     assert not client.mock_calls
+
+@pytest.mark.asyncio
+async def test_unset_authorization_check_makes_the_deny_visible(caplog):
+    """Deny-by-default stays, but an unset check must not be silent: it denies every
+    summon forever, so it is warned once (surface ids only, never user or text)."""
+    adapter, _client = make_adapter()
+    assert (await adapter.send_or_update_status("C1", "progress", "working", metadata=META)).success
+    await adapter._handle_slack_message(deletion())
+    adapter._authorization_check = None
+    with caplog.at_level(logging.DEBUG, logger="plugins.platforms.slack.deletion"):
+        await adapter._handle_slack_message(mention("<@UBOT> unknown auth", ts="122.000001"))
+        await adapter._handle_slack_message(mention("<@UBOT> unknown auth", ts="122.000002"))
+    adapter.handle_message.assert_not_awaited()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+                and "No authorization check registered" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "channel=C1" in warnings[0]
+    denials = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG
+               and "Deletion fence denied summon" in r.getMessage()]
+    assert len(denials) == 2 and all("channel=C1" in message for message in denials)
+    assert "UHUMAN" not in caplog.text and "unknown auth" not in caplog.text
