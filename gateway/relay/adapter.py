@@ -718,8 +718,13 @@ class RelayAdapter(BasePlatformAdapter):
         """Bridge a connector-delivered MessageEvent into the normal adapter path."""
         from gateway.client_context import adapter_admission
         mode = await adapter_admission(self, event.source)
-        if mode == "deny":
-            return  # Never let denied/revoked input mutate reply-routing or replay state.
+        if mode not in ("legacy", "scoped"):
+            # Never let denied/revoked input mutate reply-routing or replay state. An
+            # unrecognized mode is denied rather than falling through to the legacy
+            # (most permissive) path, matching the native Slack leg's ``!= "legacy"`` gate.
+            if mode != "deny":
+                logger.error("relay inbound denied: unrecognized admission mode %r", mode)
+            return
         # Inbound replay dedupe: the relay leg is at-least-once — on WS re-handshake
         # the connector replays its durable buffer, and a long turn straddling a
         # quiet socket drop got re-run (final answer 2-5x). Platform message identity
