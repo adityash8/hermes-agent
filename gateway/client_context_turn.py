@@ -78,7 +78,7 @@ def tool_policy(runner, source, opts) -> tuple:
                 narrowed = {**config, "platform_toolsets": {**platforms, platform: override}}
                 effective &= _get_platform_tools(narrowed, platform)
         names = tuple(sorted(n for n in opts.read_tools if CAPABILITIES.get(n) in effective))
-        fingerprint = json.dumps([config, override, enabled, resolved_disabled], sort_keys=True)
+        fingerprint = json.dumps([config, override, enabled, resolved_disabled], sort_keys=True, default=str)
         return names, hashlib.sha256(fingerprint.encode()).hexdigest()
     except Exception:
         return (), "unavailable"
