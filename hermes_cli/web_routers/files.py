@@ -104,12 +104,13 @@ def _is_sensitive_path(path: Path) -> bool:
     return any(part.lower() in _SENSITIVE_MANAGED_DIR_NAMES for part in path.parts)
 
 
-# Hermes-managed names that are ordinary in projects (a repo's config.yaml, a
-# pairing/ package). /api/fs resolves ANY absolute path, so these — and the
+# Names that are ordinary in projects: a repo's config.yaml, and the .env
+# templates agent.file_safety names as the readable documented-shape substitute.
+# /api/fs resolves ANY absolute path, so these — and the
 # _SENSITIVE_MANAGED_DIR_NAMES trees — block only inside a Hermes dir; every
 # other sensitive basename (.env, credentials, auth.json, the secret caches) is
 # a secret wherever it sits and blocks everywhere.
-_HERMES_ONLY_SENSITIVE_BASENAMES = frozenset({"config.yaml"})
+_HERMES_ONLY_SENSITIVE_BASENAMES = frozenset({"config.yaml", ".env.example", ".env.sample", ".env.template"})
 
 
 def _fs_read_blocked(path: Path) -> bool:

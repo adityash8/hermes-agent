@@ -125,7 +125,7 @@ def test_fs_reads_reject_hermes_managed_names_in_hermes_home(client, endpoint, r
     assert "SECRET" not in response.text
 
 
-@pytest.mark.parametrize("rel", ["config.yaml", "mcp-tokens/index.ts", "pairing/README.md"])
+@pytest.mark.parametrize("rel", ["config.yaml", ".env.example", "mcp-tokens/index.ts", "pairing/README.md"])
 def test_fs_reads_allow_hermes_managed_names_in_projects(client, tmp_path, rel):
     """/api/fs serves arbitrary project paths; a repo's config.yaml is not a Hermes secret."""
     target = tmp_path / "project" / rel
@@ -143,6 +143,7 @@ def test_fs_list_hides_sensitive_entries(client, tmp_path):
     root.mkdir()
     (root / "main.py").write_text("print()")
     (root / "config.yaml").write_text("name: app")
+    (root / ".env.example").write_text("API_KEY=")
     (root / "pairing").mkdir()
     (root / ".env").write_text("SECRET=1")
     (root / "Auth.JSON").write_text("{}")
@@ -150,7 +151,21 @@ def test_fs_list_hides_sensitive_entries(client, tmp_path):
     response = client.get("/api/fs/list", params={"path": str(root)})
 
     assert response.status_code == 200
-    assert [entry["name"] for entry in response.json()["entries"]] == ["pairing", "config.yaml", "main.py"]
+    assert [entry["name"] for entry in response.json()["entries"]] == [
+        "pairing", ".env.example", "config.yaml", "main.py",
+    ]
+
+
+def test_fs_list_survives_symlink_loop_on_guarded_name(client, tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "main.py").write_text("print()")
+    (root / "config.yaml").symlink_to(root / "config.yaml")
+
+    response = client.get("/api/fs/list", params={"path": str(root)})
+
+    assert response.status_code == 200
+    assert "main.py" in [entry["name"] for entry in response.json()["entries"]]
 
 
 def test_fs_list_hides_hermes_managed_entries_in_hermes_home(client):

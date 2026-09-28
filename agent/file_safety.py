@@ -51,8 +51,12 @@ def _hermes_dirs() -> list[Path]:
 
 
 def is_hermes_path(path: str | Path) -> bool:
-    """True when ``path`` resolves inside the active HERMES_HOME, the root or any profile."""
-    resolved = _fold(Path(path).expanduser().resolve())
+    """True when ``path`` resolves inside the active HERMES_HOME, the root or any profile.
+    Fails closed (True) when ``path`` cannot be resolved, e.g. a symlink loop."""
+    try:
+        resolved = _fold(Path(path).expanduser().resolve())
+    except (OSError, RuntimeError):
+        return True
     return any(_is_under(resolved, _fold(hd)) for hd in _hermes_dirs())
 
 
