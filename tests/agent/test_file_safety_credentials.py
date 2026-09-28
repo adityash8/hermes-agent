@@ -203,6 +203,16 @@ def test_onepassword_token_and_cache_write_denied(fake_home, rel):
     assert is_write_denied(str(_create(fake_home, rel))) is True
 
 
+@pytest.mark.parametrize("rel", ["cache/bws_cache.json", "cache/bws_cache.enc.json"])
+def test_bitwarden_caches_read_blocked_and_write_denied(fake_home, rel):
+    """Both Bitwarden Secrets Manager cache variants, plaintext and encrypted."""
+    from agent.file_safety import get_read_block_error, is_write_denied
+
+    cache = str(_create(fake_home, rel))
+    assert "credential store" in (get_read_block_error(cache) or "")
+    assert is_write_denied(cache) is True
+
+
 
 
 
@@ -370,7 +380,7 @@ def sibling_profile(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     "rel",
     ["auth.json", ".env", ".op.env", ".anthropic_oauth.json", "webhook_subscriptions.json",
-     "auth/google_oauth.json", "cache/bws_cache.json", "cache/op_cache.json"],
+     "auth/google_oauth.json", "cache/bws_cache.json", "cache/bws_cache.enc.json", "cache/op_cache.json"],
 )
 def test_sibling_profile_credential_store_read_blocked(sibling_profile, rel):
     from agent.file_safety import get_read_block_error
@@ -388,7 +398,8 @@ def test_sibling_profile_mcp_tokens_read_blocked(sibling_profile):
 
 @pytest.mark.parametrize(
     "rel",
-    [".env", ".op.env", ".anthropic_oauth.json", "cache/op_cache.json", "cache/bws_cache.enc.json",
+    [".env", ".op.env", ".anthropic_oauth.json", "cache/op_cache.json", "cache/bws_cache.json",
+     "cache/bws_cache.enc.json",
      "state.db", "sessions/s.json", "mcp-tokens/gh.json", "pairing/device"],
 )
 def test_sibling_profile_credential_store_write_denied(sibling_profile, rel):
