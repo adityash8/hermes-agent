@@ -1466,10 +1466,10 @@ class TestQuickSnapshot:
 
 
 
-    def test_oversized_db_suppresses_pruning(self, hermes_home, capsys):
-        """#68805: an oversized state.db skipped for size must suppress
-        pruning so the older complete snapshot (containing the only
-        recoverable database) is preserved.
+    def test_oversized_db_spares_recovery_snapshot(self, hermes_home, capsys):
+        """#68805: an oversized state.db skipped for size must not let
+        pruning delete the older complete snapshot (containing the only
+        recoverable database).
 
         Reproduces the reviewer's scenario: keep=1 + a state.db exceeding
         the size cap → the new snapshot omits state.db, failed_dbs stays
@@ -1513,7 +1513,28 @@ class TestQuickSnapshot:
         assert second_id in snap_ids
 
         out = capsys.readouterr().out
-        assert "skipping state.db" in out.lower() or "skipping snapshot prune" in out.lower()
+        assert "skipped for size: state.db" in out.lower()
+
+    def test_oversized_db_still_prunes_beyond_keep(self, hermes_home):
+        """A state.db that stays over the size cap must not freeze retention:
+        every pre-update run skipped pruning, so keep=1 grew to 11 snapshots.
+        Pruning still bounds the set, sparing only the NEWEST snapshot that
+        holds a recoverable state.db (an older complete one is redundant)."""
+        from hermes_cli.backup import create_quick_snapshot, list_quick_snapshots
+
+        old_complete = create_quick_snapshot(label="old-complete", hermes_home=hermes_home)
+        _advance_backup_clock()
+        newest_complete = create_quick_snapshot(label="complete", hermes_home=hermes_home)
+        oversized = []
+        for i in range(3):
+            _advance_backup_clock()
+            oversized.append(create_quick_snapshot(
+                label=f"oversized{i}", hermes_home=hermes_home, max_file_size=1024, keep=1))
+
+        snap_ids = {s["id"] for s in list_quick_snapshots(limit=100, hermes_home=hermes_home)}
+        assert snap_ids == {oversized[-1], newest_complete}
+        assert (hermes_home / "state-snapshots" / newest_complete / "state.db").exists()
+        assert old_complete not in snap_ids
 
 
 class TestQuickSnapshotProjectsKanban:
