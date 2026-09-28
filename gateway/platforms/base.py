@@ -791,10 +791,20 @@ def _profile_cache_roots() -> List[Path]:
     return [p / "cache" / subdir for p in _profile_dirs() for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS]
 
 
+def _guard_root() -> Path:
+    """``_HERMES_ROOT``, or the real ``<root>`` when HERMES_HOME is a symlink alias of
+    ``<root>/profiles/<name>`` (get_default_hermes_root() keeps the alias for profile identity)."""
+    with contextlib.suppress(OSError, RuntimeError):
+        real_home = _HERMES_HOME.resolve()
+        if real_home.parent.name == "profiles":
+            return real_home.parent.parent
+    return _HERMES_ROOT
+
+
 def _profile_dirs() -> List[Path]:
     """Every ``<root>/profiles/<name>`` dir, enumerated at check time (active and siblings)."""
     try:
-        return [p for p in (_HERMES_ROOT / "profiles").iterdir() if p.is_dir()]
+        return [p for p in (_guard_root() / "profiles").iterdir() if p.is_dir()]
     except OSError:
         return []
 
@@ -842,7 +852,8 @@ def _media_delivery_denied_paths() -> List[Path]:
     return [*map(Path, _MEDIA_DELIVERY_DENIED_PREFIXES),
             *(home / sub for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS),
             # Sibling profiles too: HERMES_HOME=<root>/profiles/A must not deliver B's secrets.
-            *(r / rel for r in (_HERMES_HOME, _HERMES_ROOT, *_profile_dirs()) for rel in _ROOT_CREDENTIAL_PATHS)]
+            *(r / rel for r in (_HERMES_HOME, _HERMES_ROOT, _guard_root(), *_profile_dirs())
+              for rel in _ROOT_CREDENTIAL_PATHS)]
 
 
 def _resolve_path(path: Path, *, strict: bool = False, expand: bool = False) -> Optional[Path]:

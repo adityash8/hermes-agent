@@ -34,10 +34,21 @@ def _hermes_root_path() -> Path:
     return _constants_path("get_default_hermes_root")
 
 
+def _guard_root_path() -> Path:
+    """Root whose profiles the credential guard covers. When HERMES_HOME is a symlink alias of
+    ``<root>/profiles/<name>``, get_default_hermes_root() keeps the alias (profile identity follows
+    the spelled path) but ``<root>`` and the sibling profiles still hold credentials."""
+    with suppress(OSError, RuntimeError):
+        real_home = _hermes_home_path().resolve()
+        if real_home.parent.name == "profiles":
+            return real_home.parent.parent
+    return _hermes_root_path()
+
+
 def _profile_dirs() -> list[Path]:
     """Every ``<root>/profiles/<name>`` dir (active and siblings), enumerated at check time."""
     with suppress(OSError):
-        return [p for p in (_hermes_root_path() / "profiles").iterdir() if p.is_dir()]
+        return [p for p in (_guard_root_path() / "profiles").iterdir() if p.is_dir()]
     return []
 
 
@@ -47,7 +58,8 @@ def _hermes_dirs() -> list[Path]:
     All are checked so credential stores at <root>/... and in sibling profiles
     stay guarded when running under a profile (HERMES_HOME = <root>/profiles/<name>).
     """
-    return list(dict.fromkeys(_resolve_each((_hermes_home_path(), _hermes_root_path(), *_profile_dirs()))))
+    return list(dict.fromkeys(_resolve_each(
+        (_hermes_home_path(), _hermes_root_path(), _guard_root_path(), *_profile_dirs()))))
 
 
 def is_hermes_path(path: str | Path) -> bool:

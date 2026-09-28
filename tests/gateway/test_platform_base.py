@@ -80,6 +80,32 @@ def test_media_delivery_denies_sibling_profile_credentials(tmp_path, monkeypatch
     assert base.validate_media_delivery_path(str(notes)) == str(notes.resolve())
 
 
+@pytest.mark.require_symlinks
+def test_media_delivery_denies_root_and_sibling_credentials_under_symlinked_home(tmp_path, monkeypatch):
+    """HERMES_HOME=<alias> -> <root>/profiles/coder: get_default_hermes_root() returns the alias,
+    yet <root> and the sibling profile's secrets must stay undeliverable."""
+    import gateway.platforms.base as base
+
+    monkeypatch.delenv(base.MEDIA_DELIVERY_STRICT_ENV, raising=False)
+    root = tmp_path / "data"
+    (root / "profiles" / "coder").mkdir(parents=True)
+    alias = tmp_path / "link_coder"
+    alias.symlink_to(root / "profiles" / "coder")
+    monkeypatch.setattr(base, "_HERMES_HOME", alias)
+    monkeypatch.setattr(base, "_HERMES_ROOT", alias)
+    secrets = [root / ".env", root / "profiles" / "writer" / ".op.env",
+               root / "profiles" / "writer" / "mcp-tokens" / "gh.json"]
+    for path in secrets:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("secret")
+    notes = root / "profiles" / "writer" / "notes.txt"
+    notes.write_text("public")
+
+    for path in secrets:
+        assert base.validate_media_delivery_path(str(path)) is None, path
+    assert base.validate_media_delivery_path(str(notes)) == str(notes.resolve())
+
+
 @pytest.mark.macos_only
 @pytest.mark.parametrize("rel", [".OP.ENV", "CACHE/OP_CACHE.JSON", "Auth.Json", ".ENV", "MCP-Tokens/gh.json"])
 def test_media_delivery_denies_case_variant_credentials(tmp_path, monkeypatch, rel):
