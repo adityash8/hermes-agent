@@ -1202,18 +1202,22 @@ def _create_quick_snapshot_locked(
         json.dump(meta, f, indent=2)
     os.replace(staging_dir, root / snap_id)
     # Auto-prune (pre-update callers pass a smaller keep so state.db copies don't accumulate).
-    # Skip when a DB failed to capture OR was skipped for size (#68805): the snapshot is
-    # incomplete and the older one may hold the only recoverable database.
-    if not (failed_dbs or oversized_skipped):
-        _prune_oldest(_snapshot_dirs(root), _QUICK_DEFAULT_KEEP if keep is None else keep, shutil.rmtree, "snapshot")
+    # Skip when a DB failed to capture: the snapshot is incomplete and older ones are the
+    # recovery source. A DB skipped for size (#68805) still prunes — a DB that stays over the
+    # cap would otherwise freeze retention forever — but spares the newest older snapshot that
+    # holds it, so the only recoverable copy survives.
+    if failed_dbs:
+        logger.warning(
+            "Skipping snapshot prune because %d DB(s) failed to capture "
+            "— preserving older snapshots as recovery source", len(failed_dbs))
     else:
         if oversized_skipped:
-            print("  ⚠ Skipping snapshot prune: DB file(s) skipped for size: " + ", ".join(oversized_skipped))
+            print("  ⚠ Snapshot: DB file(s) skipped for size: " + ", ".join(oversized_skipped)
+                  + " — pruning, keeping the newest older copy of each")
             logger.warning("Quick snapshot skipped oversized DB file(s): %s", ", ".join(oversized_skipped))
-        logger.warning(
-            "Skipping snapshot prune because %d DB(s) failed to capture and/or %d were oversized "
-            "— preserving older snapshots as recovery source",
-            len(failed_dbs), len(oversized_skipped))
+        keep_n = _QUICK_DEFAULT_KEEP if keep is None else keep
+        _prune_oldest(_quick_snapshot_prune_victims(root, keep_n, oversized_skipped), 0,
+                      shutil.rmtree, "snapshot")
     logger.info("quick snapshot phase=copy status=complete id=%s files=%d bytes=%d",
                 snap_id, len(manifest), sum(manifest.values()))
     return snap_id
@@ -1230,6 +1234,14 @@ def _snapshot_dirs(root: Path) -> List[Path]:
     """Published snapshot directories under *root*, newest first."""
     return _newest_first(root, lambda d: d.is_dir() and not d.name.startswith(".")
                          and not d.name.endswith(".partial"))
+
+
+def _quick_snapshot_prune_victims(root: Path, keep: int, spare_rels: List[str]) -> List[Path]:
+    """Snapshots past the newest *keep*, minus the newest one still holding each of *spare_rels*
+    (DBs the latest snapshot skipped for size), so a recovery copy of each always survives."""
+    dirs = _snapshot_dirs(root)
+    spared = {next((d for d in dirs if (d / rel).is_file()), None) for rel in spare_rels}
+    return [d for d in dirs[keep:] if d not in spared]
 
 
 def list_quick_snapshots(limit: int = 20, hermes_home: Optional[Path] = None) -> List[Dict[str, Any]]:
