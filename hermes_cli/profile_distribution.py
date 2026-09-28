@@ -34,7 +34,7 @@ DEFAULT_DIST_OWNED: Tuple[str, ...] = ("SOUL.md", "config.yaml", "mcp.json", "sk
 # ``profiles.py`` export exclusions plus the ``local/`` convention for user customizations.
 USER_OWNED_EXCLUDE: frozenset = frozenset({
     # Credentials & runtime secrets
-    "auth.json", ".env",
+    "auth.json", ".env", ".op.env",
     # Databases & runtime state
     "state.db", "state.db-shm", "state.db-wal",
     "hermes_state.db", "response_store.db",

@@ -609,6 +609,8 @@ class TestMasterCredentialStoresAreNeverMountable:
         (home / "webhook_subscriptions.json").write_text("{}")
         (home / "cache").mkdir()
         (home / "cache" / "bws_cache.json").write_text("{}")
+        (home / "cache" / "op_cache.json").write_text("{}")
+        (home / ".op.env").write_text("OP_SERVICE_ACCOUNT_TOKEN=ops_test\n")
         (home / "mcp-tokens").mkdir()
         (home / "mcp-tokens" / "srv.json").write_text('{"access_token":"t"}')
         (home / "google_token.json").write_text("{}")
@@ -622,6 +624,8 @@ class TestMasterCredentialStoresAreNeverMountable:
             ".anthropic_oauth.json",
             "webhook_subscriptions.json",
             "cache/bws_cache.json",
+            "cache/op_cache.json",
+            ".op.env",
             "mcp-tokens/srv.json",
         ],
     )

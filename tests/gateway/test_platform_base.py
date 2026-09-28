@@ -39,6 +39,23 @@ def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):
     assert base.validate_media_delivery_path(str(path)) is None
 
 
+@pytest.mark.parametrize("rel", [".op.env", "cache/op_cache.json"])
+def test_media_delivery_denies_onepassword_token_and_cache(tmp_path, monkeypatch, rel):
+    """The 1Password service-account token and plaintext cache are credential stores."""
+    import gateway.platforms.base as base
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setattr(base, "_HERMES_HOME", hermes_home)
+    monkeypatch.setattr(base, "_HERMES_ROOT", hermes_home)
+    path = hermes_home / rel
+    path.parent.mkdir(exist_ok=True)
+    path.write_text("secret")
+
+    assert path in base._media_delivery_denied_paths()
+    assert base.validate_media_delivery_path(str(path)) is None
+
+
 class TestInboundMediaSizeCap:
     """gateway.max_inbound_media_bytes caps inbound media buffered into RAM (#13145)."""
 

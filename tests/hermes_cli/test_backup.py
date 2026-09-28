@@ -194,6 +194,35 @@ class TestShouldExclude:
         # Other .bak files are user data and stay.
         assert not _should_exclude(Path("config.yaml.bak"))
 
+    @pytest.mark.parametrize("rel", [
+        ".op.env",
+        "cache/op_cache.json",
+        "cache/bws_cache.json",
+        "cache/bws_cache.enc.json",
+        "profiles/coder/.op.env",
+        "profiles/coder/cache/op_cache.json",
+    ])
+    def test_excludes_secret_manager_token_and_caches(self, rel):
+        """The 1Password service-account token and the decrypted op/bws
+        caches must not ship in a zip: together they are every secret in
+        plaintext plus the key to re-fetch them. Both are regenerable."""
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path(rel))
+
+    @pytest.mark.parametrize("rel", [
+        "cache/images/x.png",
+        "cache/model_catalog.json",
+        ".env",
+        "auth.json",
+        "skills/x/cache/op_cache.json",
+        "scratch/.op.env",
+    ])
+    def test_keeps_non_secret_cache_and_restore_marker_files(self, rel):
+        """Only exact profile-home relpaths are dropped: other cache/ entries
+        are user media, and .env / auth.json stay by design (restore marker)."""
+        from hermes_cli.backup import _should_exclude
+        assert not _should_exclude(Path(rel))
+
 
 # ---------------------------------------------------------------------------
 # _iter_backup_files tests
@@ -370,6 +399,31 @@ class TestBackup:
         assert not any(n.startswith(_QUICK_SNAPSHOTS_DIR + "/") for n in names), names
         # Exactly one state.db in the archive: the live one.
         assert [n for n in names if n == "state.db" or n.endswith("/state.db")] == ["state.db"]
+
+    def test_secret_manager_files_not_in_backup(self, tmp_path, monkeypatch):
+        """End to end: run_backup drops the op token and caches but keeps the
+        rest of cache/ and the .env restore marker."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        (hermes_home / ".op.env").write_text("OP_SERVICE_ACCOUNT_TOKEN=ops_test\n")
+        (hermes_home / "cache" / "images").mkdir(parents=True)
+        (hermes_home / "cache" / "op_cache.json").write_text("{}")
+        (hermes_home / "cache" / "images" / "a.png").write_bytes(b"png")
+
+        from hermes_cli.backup import run_backup
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        out_zip = tmp_path / "backup.zip"
+        run_backup(Namespace(output=str(out_zip)))
+
+        with zipfile.ZipFile(out_zip, "r") as zf:
+            names = set(zf.namelist())
+        assert ".op.env" not in names
+        assert "cache/op_cache.json" not in names
+        assert "cache/images/a.png" in names
+        assert ".env" in names
 
 
 # ---------------------------------------------------------------------------
