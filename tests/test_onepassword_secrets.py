@@ -1,7 +1,8 @@
 """Hermetic tests for the 1Password (`op` CLI) secret source.
 
-We never invoke the real ``op`` binary: ``subprocess.run`` is mocked so the
-suite stays fast and offline-safe.  A live resolve is exercised manually via
+We never invoke the real ``op`` binary: either ``subprocess.run`` is mocked or
+a fake ``op`` script (the ``fake_op_binary`` fixture) stands in, so the suite
+stays fast and offline-safe.  A live resolve is exercised manually via
 ``hermes secrets onepassword sync`` outside of pytest.
 """
 
@@ -54,6 +55,76 @@ def _err(code: int, stderr: str):
     return mock.Mock(returncode=code, stdout="", stderr=stderr)
 
 
+def _dispatching_run(values, calls):
+    """Mocked ``subprocess.run`` that understands ``op inject`` and ``op read``.
+
+    ``values`` maps reference → secret; ``calls`` collects each argv (thread-safe
+    ``list.append`` — fallback reads run in a pool)."""
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[1] == "inject":
+            out = kwargs["input"]
+            for ref, value in values.items():
+                out = out.replace("{{ %s }}" % ref, value)
+            if "{{ " in out:
+                return _err(1, "[ERROR] item does not have a field")
+            return _ok(out)
+        return _ok(values[cmd[cmd.index("--") + 1]] + "\n")
+    return fake_run
+
+
+# Stand-in `op` binary: values come from op_values.json beside the script; each
+# call's argv (and inject template, which holds references only) is appended to
+# op_calls.log. `inject` is all-or-nothing like the real CLI.
+_FAKE_OP_SOURCE = r'''
+import json, re, sys
+from pathlib import Path
+
+here = Path(__file__)
+values = json.loads(here.with_name("op_values.json").read_text())
+args = sys.argv[1:]
+stdin = sys.stdin.read() if args[:1] == ["inject"] else None
+with here.with_name("op_calls.log").open("a") as log:
+    log.write(json.dumps({"argv": args, "stdin": stdin}) + "\n")
+
+if args[:1] == ["inject"]:
+    def resolve(match):
+        ref = match.group(1)
+        if ref not in values:
+            sys.stderr.write("[ERROR] item does not have a field '%s'\n" % ref.rsplit("/", 1)[-1])
+            sys.exit(1)
+        return values[ref]
+    sys.stdout.write(re.sub(r"\{\{ (.+?) \}\}", resolve, stdin))
+elif args[:1] == ["read"] and "--" in args:
+    ref = args[args.index("--") + 1]
+    if ref not in values:
+        sys.stderr.write("[ERROR] could not read secret '%s': field not found\n" % ref)
+        sys.exit(1)
+    sys.stdout.write(values[ref] + "\n")
+else:
+    sys.exit(2)
+'''
+
+
+@pytest.fixture
+def fake_op_binary(tmp_path):
+    """``make(values) -> Path`` of an executable fake ``op`` serving ``values``."""
+    def make(values):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        script = bin_dir / "op"
+        script.write_text(f"#!{sys.executable}\n{_FAKE_OP_SOURCE}")
+        script.chmod(0o755)
+        (bin_dir / "op_values.json").write_text(json.dumps(values))
+        return script
+    return make
+
+
+def _op_calls(script: Path):
+    log = script.with_name("op_calls.log")
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+
 # ---------------------------------------------------------------------------
 # Reference validation
 # ---------------------------------------------------------------------------
@@ -80,35 +151,124 @@ def test_validate_references_filters_bad_names_and_refs():
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_happy_path(monkeypatch, tmp_path):
-    fake_op = tmp_path / "op"
-    fake_op.write_text("")
-    values = {
+def test_fetch_happy_path_is_one_inject_call(fake_op_binary):
+    fake_op = fake_op_binary({
         "op://Private/OpenAI/api key": "sk-abc\n",
         "op://Private/Anthropic/credential": "sk-ant-xyz",
-    }
-
-    def fake_run(cmd, **kwargs):
-        # argv list, never shell=True; reference passed after `--`.
-        assert "--" in cmd
-        ref = cmd[cmd.index("--") + 1]
-        return _ok(values[ref])
-
-    monkeypatch.setattr(op.subprocess, "run", fake_run)
+        "op://Private/Deploy/ssh key": "-----BEGIN KEY-----\nline2\n-----END KEY-----",
+    })
 
     secrets, warnings = op.fetch_onepassword_secrets(
         references={
             "OPENAI_API_KEY": "op://Private/OpenAI/api key",
             "ANTHROPIC_API_KEY": "op://Private/Anthropic/credential",
+            "DEPLOY_KEY": "op://Private/Deploy/ssh key",
         },
-        binary=fake_op,
-        use_cache=False,
+        account="acme", binary=fake_op, use_cache=False,
     )
-    assert secrets == {"OPENAI_API_KEY": "sk-abc", "ANTHROPIC_API_KEY": "sk-ant-xyz"}
+    assert secrets == {
+        "OPENAI_API_KEY": "sk-abc",  # op's trailing newline convention stripped
+        "ANTHROPIC_API_KEY": "sk-ant-xyz",
+        "DEPLOY_KEY": "-----BEGIN KEY-----\nline2\n-----END KEY-----",  # multiline intact
+    }
     assert warnings == []
+    calls = _op_calls(fake_op)
+    assert [c["argv"] for c in calls] == [["inject", "--account", "acme"]]
+    # References travel on stdin, never argv.
+    assert "op://Private/OpenAI/api key" in calls[0]["stdin"]
 
 
+def test_fetch_dedups_shared_reference(fake_op_binary):
+    fake_op = fake_op_binary({"op://V/Shared/key": "shared-val", "op://V/Other/key": "other-val"})
 
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={"A_KEY": "op://V/Shared/key", "B_KEY": "op://V/Shared/key",
+                    "C_KEY": "op://V/Other/key"},
+        binary=fake_op, use_cache=False,
+    )
+    assert secrets == {"A_KEY": "shared-val", "B_KEY": "shared-val", "C_KEY": "other-val"}
+    assert warnings == []
+    (call,) = _op_calls(fake_op)
+    assert call["stdin"].count("op://V/Shared/key") == 1
+
+
+def test_inject_failure_falls_back_to_per_reference_reads(fake_op_binary, tmp_path):
+    good = {f"op://V/I{i}/key": f"sk-live-SECRET-{i}" for i in range(10)}
+    fake_op = fake_op_binary(good)
+    references = {f"KEY_{i}": ref for i, ref in enumerate(good)}
+    references["BROKEN_A"] = references["BROKEN_B"] = "op://V/Gone/key"
+    op._reset_cache_for_tests(tmp_path)
+
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references=references, binary=fake_op, cache_ttl_seconds=300, home_path=tmp_path,
+    )
+    # Every good reference still resolves; the bad one is reported once, naming
+    # both affected env vars and the reference.
+    assert secrets == {f"KEY_{i}": f"sk-live-SECRET-{i}" for i in range(10)}
+    assert len(warnings) == 1
+    assert warnings[0].startswith("BROKEN_A, BROKEN_B: op read failed for 'op://V/Gone/key'")
+    assert not any(value in w for value in good.values() for w in warnings)
+
+    argvs = [c["argv"] for c in _op_calls(fake_op)]
+    assert argvs[0] == ["inject"]
+    assert sorted(a[-1] for a in argvs[1:]) == sorted({*good, "op://V/Gone/key"})
+    assert all(a[:2] == ["read", "--"] for a in argvs[1:])  # `--` before every ref
+
+    # A pull with any error is never cached: the next fetch goes back to op.
+    assert not (tmp_path / "cache" / "op_cache.json").exists()
+    op._CACHE.clear()
+    op.fetch_onepassword_secrets(
+        references=references, binary=fake_op, cache_ttl_seconds=300, home_path=tmp_path,
+    )
+    assert len(_op_calls(fake_op)) > len(argvs)
+
+
+def test_empty_value_is_rejected_and_not_cached(fake_op_binary, tmp_path):
+    fake_op = fake_op_binary({"op://V/I/full": "val", "op://V/I/blank": ""})
+    op._reset_cache_for_tests(tmp_path)
+
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={"FULL": "op://V/I/full", "BLANK": "op://V/I/blank"},
+        binary=fake_op, cache_ttl_seconds=300, home_path=tmp_path,
+    )
+    assert secrets == {"FULL": "val"}
+    assert warnings == ["BLANK: op read returned an empty value for 'op://V/I/blank'"]
+    assert not (tmp_path / "cache" / "op_cache.json").exists()
+
+
+def test_reference_with_variable_syntax_bypasses_inject(fake_op_binary):
+    # `op inject` would expand $FIELD from the environment; `op read` takes it literally.
+    fake_op = fake_op_binary({"op://V/I/$FIELD": "literal", "op://V/I/plain": "p"})
+
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={"DOLLAR": "op://V/I/$FIELD", "PLAIN": "op://V/I/plain"},
+        binary=fake_op, use_cache=False,
+    )
+    assert secrets == {"DOLLAR": "literal", "PLAIN": "p"}
+    assert warnings == []
+    calls = _op_calls(fake_op)
+    inject = [c for c in calls if c["argv"][0] == "inject"]
+    assert len(inject) == 1 and "$" not in inject[0]["stdin"]
+    assert ["read", "--", "op://V/I/$FIELD"] in [c["argv"] for c in calls]
+
+
+def test_inject_timeout_falls_back_to_reads(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    calls = []
+    reads = _dispatching_run({"op://V/I/F": "v"}, calls)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[1] == "inject":
+            raise subprocess.TimeoutExpired(cmd, 30)
+        return reads(cmd, **kwargs)
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={"K": "op://V/I/F"}, binary=fake_op, use_cache=False,
+    )
+    assert secrets == {"K": "v"}
+    assert warnings == []
 
 
 
@@ -146,20 +306,15 @@ def test_fetch_read_failure_becomes_warning(monkeypatch, tmp_path):
 def test_inprocess_cache_hit(monkeypatch, tmp_path):
     fake_op = tmp_path / "op"
     fake_op.write_text("")
-    calls = {"n": 0}
-
-    def fake_run(*a, **k):
-        calls["n"] += 1
-        return _ok("v")
-
-    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    calls = []
+    monkeypatch.setattr(op.subprocess, "run", _dispatching_run({"op://V/I/F": "v"}, calls))
     op._reset_cache_for_tests(tmp_path)
     for _ in range(2):
         op.fetch_onepassword_secrets(
             references={"K": "op://V/I/F"}, cache_ttl_seconds=60,
             binary=fake_op, home_path=tmp_path,
         )
-    assert calls["n"] == 1  # second call served from L1 cache
+    assert len(calls) == 1  # second call served from L1 cache
 
 
 
@@ -172,13 +327,8 @@ def test_connect_credential_change_invalidates_cache(monkeypatch, tmp_path):
     """A different 1Password Connect identity must not reuse a cached value."""
     fake_op = tmp_path / "op"
     fake_op.write_text("")
-    calls = {"n": 0}
-
-    def fake_run(*a, **k):
-        calls["n"] += 1
-        return _ok("v")
-
-    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    calls = []
+    monkeypatch.setattr(op.subprocess, "run", _dispatching_run({"op://V/I/F": "v"}, calls))
     op._reset_cache_for_tests(tmp_path)
 
     monkeypatch.setenv("OP_CONNECT_HOST", "https://connect.example.com")
@@ -194,7 +344,7 @@ def test_connect_credential_change_invalidates_cache(monkeypatch, tmp_path):
         references={"K": "op://V/I/F"}, cache_ttl_seconds=300,
         binary=fake_op, home_path=tmp_path,
     )
-    assert calls["n"] == 2  # cache key changed → refetch
+    assert len(calls) == 2  # cache key changed → refetch
 
 
 
