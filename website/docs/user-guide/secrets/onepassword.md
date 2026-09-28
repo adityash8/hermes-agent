@@ -159,7 +159,7 @@ Successful, complete pulls are cached in-process and on disk under `<hermes_home
 - Hermes refuses to let a resolved value overwrite the token env var itself, even with `override_existing: true`.
 - The `op` child process gets a minimal allowlisted environment (auth/session vars + `PATH`/`HOME`), not a copy of the full `os.environ`, so post-dotenv provider credentials aren't all inherited by the child.
 - References are validated to start with `op://`. The batched `op inject` receives them in a template on stdin, never on the command line; the per-reference `op read` passes each after a `--` option terminator so a crafted value can't be parsed as an `op` flag.
-- `op inject` expands `$VAR` / `${VAR}` inside a reference, so any reference containing `$`, `{`, or `}` skips the batch and is always resolved literally with `op read`.
+- `op inject` expands `$VAR` / `${VAR}` inside a reference, so any reference containing `$`, `{`, `}`, or a line break skips the batch and is always resolved literally with `op read`.
 
 ## When NOT to use this
 

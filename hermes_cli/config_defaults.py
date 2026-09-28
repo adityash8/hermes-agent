@@ -2159,8 +2159,8 @@ DEFAULT_CONFIG = {
         },
         "onepassword": {
             "enabled": False,  # When false, the op CLI is never invoked.
-            "env": {},  # env-var name → op://vault/item/field; each resolved with one `op read`.
-            # Account shorthand / sign-in address for `op read --account`; empty = default.
+            "env": {},  # env-var name → op://vault/item/field; resolved together in one `op inject` call.
+            # Account shorthand / sign-in address passed to `op` as `--account`; empty = default.
             "account": "",
             # Env var holding a service-account token for headless auth (exported to op as
             # OP_SERVICE_ACCOUNT_TOKEN). Unset = interactive/desktop op session.

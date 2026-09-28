@@ -14,6 +14,7 @@ material is fingerprinted, never stored).
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import shutil
@@ -244,8 +245,11 @@ def _resolve_references(op: Path, references: List[str], *, account: str = "",
     errors: Dict[str, str] = {}
     pending = [ref for ref in references if ref not in values]
     if pending:
+        # Pool threads don't inherit contextvars: run each read in a copy of this
+        # context so it sees the per-fetch source environment (profile hydration).
         with ThreadPoolExecutor(max_workers=min(_OP_READ_WORKERS, len(pending))) as pool:
-            futures = {ref: pool.submit(_run_op_read, op, ref, account=account, token_value=token_value)
+            futures = {ref: pool.submit(contextvars.copy_context().run, _run_op_read, op, ref,
+                                        account=account, token_value=token_value)
                        for ref in pending}
         for ref, future in futures.items():
             try:

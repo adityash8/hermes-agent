@@ -236,20 +236,78 @@ def test_empty_value_is_rejected_and_not_cached(fake_op_binary, tmp_path):
     assert not (tmp_path / "cache" / "op_cache.json").exists()
 
 
-def test_reference_with_variable_syntax_bypasses_inject(fake_op_binary):
-    # `op inject` would expand $FIELD from the environment; `op read` takes it literally.
-    fake_op = fake_op_binary({"op://V/I/$FIELD": "literal", "op://V/I/plain": "p"})
+@pytest.mark.parametrize("unsafe_ref", ["op://V/I/$FIELD", "op://V/I/${FIELD}", "op://V/I/a{b", "op://V/I/a}b"])
+def test_reference_with_variable_syntax_bypasses_inject(fake_op_binary, unsafe_ref):
+    # `op inject` would expand $FIELD from the environment (and braces would
+    # corrupt the template); `op read` takes the reference literally.
+    fake_op = fake_op_binary({unsafe_ref: "literal", "op://V/I/plain": "p"})
 
     secrets, warnings = op.fetch_onepassword_secrets(
-        references={"DOLLAR": "op://V/I/$FIELD", "PLAIN": "op://V/I/plain"},
+        references={"UNSAFE": unsafe_ref, "PLAIN": "op://V/I/plain"},
         binary=fake_op, use_cache=False,
     )
-    assert secrets == {"DOLLAR": "literal", "PLAIN": "p"}
+    assert secrets == {"UNSAFE": "literal", "PLAIN": "p"}
     assert warnings == []
     calls = _op_calls(fake_op)
     inject = [c for c in calls if c["argv"][0] == "inject"]
-    assert len(inject) == 1 and "$" not in inject[0]["stdin"]
-    assert ["read", "--", "op://V/I/$FIELD"] in [c["argv"] for c in calls]
+    assert len(inject) == 1 and unsafe_ref not in inject[0]["stdin"]
+    assert ["read", "--", unsafe_ref] in [c["argv"] for c in calls]
+
+
+def test_partial_inject_output_retries_only_missing_refs(monkeypatch, tmp_path):
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    calls = []
+    values = {"op://V/I/a": "va", "op://V/I/b": "vb", "op://V/I/c": "vc"}
+    dispatch = _dispatching_run(values, calls)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[1] == "inject":
+            # Drop b's marker line entirely, as if op had mangled it.
+            kwargs["input"] = "".join(line for line in kwargs["input"].splitlines(keepends=True)
+                                      if "op://V/I/b" not in line)
+        return dispatch(cmd, **kwargs)
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={"A": "op://V/I/a", "B": "op://V/I/b", "C": "op://V/I/c"},
+        account="acme", binary=fake_op, use_cache=False,
+    )
+    assert secrets == {"A": "va", "B": "vb", "C": "vc"}
+    assert warnings == []
+    # Only the missing reference is re-read, and the fallback keeps --account.
+    assert [c[1:] for c in calls] == [["inject", "--account", "acme"],
+                                      ["read", "--account", "acme", "--", "op://V/I/b"]]
+
+
+def test_fallback_reads_see_per_fetch_source_environment(monkeypatch, tmp_path):
+    # Profile hydration installs a per-fetch env view (a ContextVar); the pooled
+    # `op read` threads must build their child env from it, not os.environ.
+    from agent.secret_sources.base import reset_source_environment, set_source_environment
+
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    read_envs = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[1] == "inject":
+            return _err(1, "[ERROR] boom")
+        read_envs.append(kwargs["env"])
+        return _ok("v\n")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    token = set_source_environment({"OP_SESSION_profile": "sess", "OP_ACCOUNT": "profile-acct"})
+    try:
+        secrets, warnings = op.fetch_onepassword_secrets(
+            references={"K1": "op://V/I/one", "K2": "op://V/I/two"}, binary=fake_op, use_cache=False,
+        )
+    finally:
+        reset_source_environment(token)
+    assert secrets == {"K1": "v", "K2": "v"}
+    assert warnings == []
+    assert len(read_envs) == 2
+    assert all(env.get("OP_SESSION_profile") == "sess" and env.get("OP_ACCOUNT") == "profile-acct"
+               for env in read_envs)
 
 
 def test_inject_timeout_falls_back_to_reads(monkeypatch, tmp_path):
