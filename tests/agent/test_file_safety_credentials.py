@@ -185,6 +185,24 @@ def test_webhook_subscriptions_blocked(fake_home):
     assert "credential store" in err
 
 
+@pytest.mark.parametrize("rel", [".op.env", "cache/op_cache.json"])
+def test_onepassword_token_and_cache_blocked(fake_home, rel):
+    """.op.env holds the 1Password service-account token; op_cache.json holds
+    every fetched secret in plaintext — both blocked."""
+    from agent.file_safety import get_read_block_error
+
+    err = get_read_block_error(str(_create(fake_home, rel)))
+    assert err is not None
+    assert "credential store" in err
+
+
+@pytest.mark.parametrize("rel", [".op.env", "cache/op_cache.json"])
+def test_onepassword_token_and_cache_write_denied(fake_home, rel):
+    from agent.file_safety import is_write_denied
+
+    assert is_write_denied(str(_create(fake_home, rel))) is True
+
+
 
 
 

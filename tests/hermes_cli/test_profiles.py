@@ -795,6 +795,25 @@ class TestExportImport:
         assert "default/memories/MEMORY.md" in names
 
 
+    def test_export_named_excludes_onepassword_token_and_cache(self, profile_env, tmp_path):
+        profile_dir = create_profile("coder", no_alias=True)
+        (profile_dir / ".op.env").write_text("OP_SERVICE_ACCOUNT_TOKEN=dummy")
+        (profile_dir / "cache").mkdir(exist_ok=True)
+        (profile_dir / "cache" / "op_cache.json").write_text("{}")
+        (profile_dir / "SOUL.md").write_text("Be nice.")
+
+        output = tmp_path / "export" / "coder.tar.gz"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        export_profile("coder", str(output))
+
+        with tarfile.open(str(output), "r:gz") as tf:
+            names = tf.getnames()
+
+        assert "coder/SOUL.md" in names
+        assert "coder/.op.env" not in names
+        assert "coder/cache/op_cache.json" not in names
+
+
     def test_export_default_handles_broken_symlinks(self, profile_env, tmp_path):
         """Broken symlinks inside allowed artifacts are preserved, not crashed (#58394).
 

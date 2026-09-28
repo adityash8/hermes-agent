@@ -73,6 +73,26 @@ def _in_excluded_root_dir(rel_path: Path) -> bool:
         or (len(parts) >= 3 and parts[0] == "profiles" and parts[2] in _EXCLUDED_ROOT_DIRS))
 
 
+# Secret-manager bootstrap token and decrypted-secret caches: a zip must not carry the
+# 1Password service-account token next to the plaintext values it unlocks. Unlike ``.env`` /
+# ``auth.json`` these are regenerable (caches refill from the vault; ``.op.env`` is
+# re-provisioned). Exact relpaths at a profile-home root, so ``cache/`` user media still ships.
+_EXCLUDED_SECRET_RELPATHS = {
+    Path(".op.env"),
+    Path("cache") / "op_cache.json",
+    Path("cache") / "bws_cache.json",
+    Path("cache") / "bws_cache.enc.json",
+}
+
+
+def _is_excluded_secret_file(rel_path: Path) -> bool:
+    """True when *rel_path* is a secret-manager token/cache at the root or ``profiles/<name>/``."""
+    parts = rel_path.parts
+    if len(parts) >= 3 and parts[0] == "profiles":
+        rel_path = Path(*parts[2:])
+    return rel_path in _EXCLUDED_SECRET_RELPATHS
+
+
 # SQLite sidecars are excluded because ``*.db`` is snapshotted via ``sqlite3.backup()``:
 # shipping the live WAL/SHM/journal alongside would pair a fresh snapshot with stale sidecar
 # state and produce a torn restore on next open. They are regenerated on first connection.
@@ -223,7 +243,7 @@ def _iter_external_files(base: Path) -> List[Path]:
 def _should_exclude(rel_path: Path) -> bool:
     """Return True if *rel_path* (relative to hermes root) should be skipped."""
     parts = rel_path.parts
-    if _in_excluded_root_dir(rel_path):
+    if _in_excluded_root_dir(rel_path) or _is_excluded_secret_file(rel_path):
         return True
     # ``hermes-agent`` only matches at the root level; nested same-named dirs are preserved.
     if any(p in _EXCLUDED_DIRS and (p != "hermes-agent" or p == parts[0]) for p in parts):

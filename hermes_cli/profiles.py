@@ -1460,7 +1460,7 @@ def _default_export_ignore(root_dir: Path):
 
 
 # Credential files dropped from named-profile exports.
-_EXPORT_CREDENTIAL_FILES = frozenset({"auth.json", ".env"})
+_EXPORT_CREDENTIAL_FILES = frozenset({"auth.json", ".env", ".op.env", "op_cache.json"})
 
 # Text/config suffixes secret-scrubbed on export; binary DBs, images etc. are left alone.
 _EXPORT_REDACT_SUFFIXES = frozenset({
