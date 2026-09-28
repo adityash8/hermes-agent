@@ -300,3 +300,106 @@ def test_profile_mode_blocks_root_credentials(tmp_path, monkeypatch):
     root_tok.parent.mkdir(parents=True, exist_ok=True)
     root_tok.write_text("x")
     assert "MCP token" in (get_read_block_error(str(root_tok)) or "")
+
+
+# ---------------------------------------------------------------------------
+# Case variants (case-insensitive APFS) and sibling profiles
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize(
+    "rel",
+    ["AUTH.JSON", ".OP.ENV", ".Env", ".Anthropic_OAuth.json", "CACHE/OP_CACHE.JSON", "cache/BWS_CACHE.json"],
+)
+def test_case_variant_credential_store_read_blocked(fake_home, rel):
+    """APFS opens ``.OP.ENV`` as ``.op.env`` but ``resolve()`` keeps the caller's
+    spelling — the variant must still hit the credential-store deny."""
+    from agent.file_safety import get_read_block_error
+
+    _create(fake_home, rel.lower())
+    assert "credential store" in (get_read_block_error(str(fake_home / rel)) or "")
+
+
+@pytest.mark.macos_only
+def test_case_variant_mcp_token_read_blocked(fake_home):
+    from agent.file_safety import get_read_block_error
+
+    _create(fake_home, Path("mcp-tokens") / "gh.json")
+    assert "MCP token" in (get_read_block_error(str(fake_home / "MCP-Tokens" / "gh.json")) or "")
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize(
+    "rel",
+    [".OP.ENV", ".ENV", ".ANTHROPIC_OAUTH.JSON", "Cache/OP_CACHE.JSON", "cache/BWS_CACHE.ENC.JSON",
+     "STATE.DB", "Sessions/s.json", "MCP-TOKENS/gh.json"],
+)
+def test_case_variant_credential_store_write_denied(fake_home, rel):
+    from agent.file_safety import is_write_denied
+
+    assert is_write_denied(str(fake_home / rel)) is True
+
+
+@pytest.mark.macos_only
+def test_case_variant_ssh_config_stays_approval_gated():
+    """A case variant of ``~/.ssh/config`` must not slip between the hard deny
+    and the approval gate (neither firing would allow a silent write)."""
+    from agent.file_safety import is_write_approval_required, is_write_denied
+
+    variant = os.path.expanduser("~/.SSH/CONFIG")
+    assert is_write_approval_required(variant) is True
+    assert is_write_denied(variant) is False
+
+
+@pytest.fixture()
+def sibling_profile(tmp_path, monkeypatch):
+    """Active profile ``coder``; returns the sibling profile ``writer``'s dir."""
+    import agent.file_safety as fs
+
+    root = tmp_path / "hermes"
+    active = root / "profiles" / "coder"
+    active.mkdir(parents=True)
+    monkeypatch.setattr(fs, "_hermes_home_path", lambda: active)
+    monkeypatch.setattr(fs, "_hermes_root_path", lambda: root)
+    sibling = root / "profiles" / "writer"
+    sibling.mkdir()
+    return sibling
+
+
+@pytest.mark.parametrize(
+    "rel",
+    ["auth.json", ".env", ".op.env", ".anthropic_oauth.json", "webhook_subscriptions.json",
+     "auth/google_oauth.json", "cache/bws_cache.json", "cache/op_cache.json"],
+)
+def test_sibling_profile_credential_store_read_blocked(sibling_profile, rel):
+    from agent.file_safety import get_read_block_error
+
+    secret = _create(sibling_profile, rel)
+    assert "credential store" in (get_read_block_error(str(secret)) or "")
+
+
+def test_sibling_profile_mcp_tokens_read_blocked(sibling_profile):
+    from agent.file_safety import get_read_block_error
+
+    token = _create(sibling_profile, Path("mcp-tokens") / "gh.json")
+    assert "MCP token" in (get_read_block_error(str(token)) or "")
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [".env", ".op.env", ".anthropic_oauth.json", "cache/op_cache.json", "cache/bws_cache.enc.json",
+     "state.db", "sessions/s.json", "mcp-tokens/gh.json", "pairing/device"],
+)
+def test_sibling_profile_credential_store_write_denied(sibling_profile, rel):
+    from agent.file_safety import is_write_denied
+
+    assert is_write_denied(str(sibling_profile / rel)) is True
+
+
+def test_sibling_profile_ordinary_file_readable(sibling_profile):
+    from agent.file_safety import get_read_block_error, is_write_denied
+
+    notes = _create(sibling_profile, "notes.txt")
+    assert get_read_block_error(str(notes)) is None
+    assert is_write_denied(str(notes)) is False

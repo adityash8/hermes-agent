@@ -8,6 +8,7 @@ clear denial for models that respect tool errors plus a visible audit trail.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from contextlib import suppress
 from typing import Optional
@@ -33,13 +34,20 @@ def _hermes_root_path() -> Path:
     return _constants_path("get_default_hermes_root")
 
 
-def _hermes_dirs() -> list[Path]:
-    """Resolved active HERMES_HOME and global root, deduplicated.
+def _profile_dirs() -> list[Path]:
+    """Every ``<root>/profiles/<name>`` dir (active and siblings), enumerated at check time."""
+    with suppress(OSError):
+        return [p for p in (_hermes_root_path() / "profiles").iterdir() if p.is_dir()]
+    return []
 
-    Both are checked so credential stores at <root>/... stay guarded when
-    running under a profile (HERMES_HOME = <root>/profiles/<name>).
+
+def _hermes_dirs() -> list[Path]:
+    """Resolved active HERMES_HOME, global root and every profile, deduplicated.
+
+    All are checked so credential stores at <root>/... and in sibling profiles
+    stay guarded when running under a profile (HERMES_HOME = <root>/profiles/<name>).
     """
-    return list(dict.fromkeys(_resolve_each((_hermes_home_path(), _hermes_root_path()))))
+    return list(dict.fromkeys(_resolve_each((_hermes_home_path(), _hermes_root_path(), *_profile_dirs()))))
 
 
 def _resolve_each(paths) -> list[Path]:
@@ -49,6 +57,16 @@ def _resolve_each(paths) -> list[Path]:
         with suppress(Exception):
             out.append(p.resolve())
     return out
+
+
+def _fold(path: str | Path) -> str | Path:
+    """Casefolded on darwin: APFS is case-insensitive by default but ``resolve()`` /
+    ``realpath`` keep the caller's spelling, so ``~/.hermes/.OP.ENV`` must still match
+    ``.op.env`` (over-blocks only on a case-sensitive volume). Comparison-only: fold
+    AFTER resolving, and never open the returned path."""
+    if sys.platform != "darwin":
+        return path
+    return Path(str(path).casefold()) if isinstance(path, Path) else path.casefold()
 
 
 def _is_under(resolved: str | Path, base: str | Path) -> bool:
@@ -74,6 +92,11 @@ def _home_and_resolved(path: str) -> tuple[str, str]:
     return tuple(os.path.realpath(os.path.expanduser(p)) for p in ("~", str(path)))
 
 
+def _is_write_approval_path(home: str, resolved: str) -> bool:
+    """``resolved`` (already :func:`_fold`-ed) is an approval-gated path."""
+    return resolved in {_fold(p) for p in build_write_approval_paths(home)}
+
+
 def build_write_denied_paths(home: str) -> set[str]:
     """Return exact sensitive paths that must never be written."""
     # ``~/.ssh/config`` is deliberately NOT hard-denied: no key bytes, and editing
@@ -93,7 +116,7 @@ def build_write_denied_paths(home: str) -> set[str]:
                     os.path.join("cache", "op_cache.json"))
     paths = [
         *(os.path.join(home, *f) for f in home_files),
-        *(str(base / f) for f in hermes_files for base in (_hermes_home_path(), _hermes_root_path())),
+        *(str(base / f) for f in hermes_files for base in _hermes_dirs()),
         "/etc/sudoers", "/etc/passwd", "/etc/shadow",
     ]
     return {os.path.realpath(p) for p in paths}
@@ -139,25 +162,26 @@ _HERMES_PROTECTED_SUBPATHS = ("state.db", "sessions", "mcp-tokens", "pairing")
 def _classify_write_denial(path: str) -> Optional[str]:
     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
     home, resolved = _home_and_resolved(path)
+    resolved = _fold(resolved)
 
     # Approval-gated paths are allowed at this layer so interactive tools can
     # prompt; checked first so the ``.ssh/`` prefix deny doesn't swallow them.
-    if resolved in build_write_approval_paths(home):
+    if _is_write_approval_path(home, resolved):
         return None
 
-    if resolved in build_write_denied_paths(home) or any(
-        resolved.startswith(prefix) for prefix in build_write_denied_prefixes(home)
+    if resolved in {_fold(p) for p in build_write_denied_paths(home)} or any(
+        resolved.startswith(_fold(prefix)) for prefix in build_write_denied_prefixes(home)
     ):
         return "credential"
 
     for base in _hermes_dirs():
         for sub in _HERMES_PROTECTED_SUBPATHS:
             with suppress(Exception):
-                if _is_under(resolved, os.path.realpath(os.path.join(str(base), sub))):
+                if _is_under(resolved, _fold(os.path.realpath(os.path.join(str(base), sub)))):
                     return "credential"
 
     safe_roots = get_safe_write_roots()
-    if safe_roots and not any(_is_under(resolved, root) for root in safe_roots):
+    if safe_roots and not any(_is_under(resolved, _fold(root)) for root in safe_roots):
         return "safe_root"
 
     return None
@@ -184,7 +208,7 @@ def is_write_approval_required(path: str) -> bool:
     """True if ``path`` is approval-gated (``~/.ssh/config``): interactive callers
     prompt, callers without a channel treat it as a block (fail closed)."""
     home, resolved = _home_and_resolved(path)
-    return resolved in build_write_approval_paths(home)
+    return _is_write_approval_path(home, _fold(resolved))
 
 
 # Secret-bearing project-local env file basenames, blocked anywhere on disk.
@@ -231,22 +255,22 @@ def get_read_block_error(path: str) -> Optional[str]:
     ``TERMINAL_CWD``) MUST pass an absolute path: ``resolve()`` here anchors at
     the process cwd, so a relative ``"auth.json"`` would miss the denylist.
     """
-    resolved = Path(path).expanduser().resolve()
+    resolved = _fold(Path(path).expanduser().resolve())
     hermes_dirs = _hermes_dirs()
     reason = None
-    if any(_is_under(resolved, hd / "skills" / ".hub") for hd in hermes_dirs):
+    if any(_is_under(resolved, _fold(hd / "skills" / ".hub")) for hd in hermes_dirs):
         reason = (
             "is an internal Hermes cache file and cannot be read directly to prevent "
             "prompt injection. Use the skills_list or skill_view tools instead."
         )
-    elif any(resolved in _resolve_each(hd / name for hd in hermes_dirs) for name in _CREDENTIAL_FILE_NAMES):
+    elif any(resolved in map(_fold, _resolve_each(hd / name for hd in hermes_dirs)) for name in _CREDENTIAL_FILE_NAMES):
         reason = (
             "is a Hermes credential store and cannot be read directly. Provider tools "
             "consume these credentials through internal channels." + _DID_SUFFIX
         )
     else:
         for subdir, dir_msg, file_msg in _READ_DENIED_DIRS:
-            for blocked_dir in _resolve_each(hd / subdir for hd in hermes_dirs):
+            for blocked_dir in map(_fold, _resolve_each(hd / subdir for hd in hermes_dirs)):
                 if _is_under(resolved, blocked_dir):
                     reason = (dir_msg if resolved == blocked_dir else file_msg) + _DID_SUFFIX
                     break

@@ -788,11 +788,15 @@ def _profile_cache_roots() -> List[Path]:
     profile path is allowlisted *before* the ``/root`` system denylist is consulted (which otherwise wins
     when HERMES_HOME is symlinked under a denied prefix and $HOME is not that prefix). See issue #31733.
     """
+    return [p / "cache" / subdir for p in _profile_dirs() for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS]
+
+
+def _profile_dirs() -> List[Path]:
+    """Every ``<root>/profiles/<name>`` dir, enumerated at check time (active and siblings)."""
     try:
-        profile_dirs = [p for p in (_HERMES_ROOT / "profiles").iterdir() if p.is_dir()]
+        return [p for p in (_HERMES_ROOT / "profiles").iterdir() if p.is_dir()]
     except OSError:
         return []
-    return [p / "cache" / subdir for p in profile_dirs for subdir in _MEDIA_DELIVERY_CACHE_SUBDIRS]
 
 
 def _kanban_attachment_roots() -> List[Path]:
@@ -837,7 +841,8 @@ def _media_delivery_denied_paths() -> List[Path]:
     home = Path(os.path.expanduser("~"))
     return [*map(Path, _MEDIA_DELIVERY_DENIED_PREFIXES),
             *(home / sub for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS),
-            *(r / rel for r in (_HERMES_HOME, _HERMES_ROOT) for rel in _ROOT_CREDENTIAL_PATHS)]
+            # Sibling profiles too: HERMES_HOME=<root>/profiles/A must not deliver B's secrets.
+            *(r / rel for r in (_HERMES_HOME, _HERMES_ROOT, *_profile_dirs()) for rel in _ROOT_CREDENTIAL_PATHS)]
 
 
 def _resolve_path(path: Path, *, strict: bool = False, expand: bool = False) -> Optional[Path]:
@@ -849,14 +854,22 @@ def _resolve_path(path: Path, *, strict: bool = False, expand: bool = False) -> 
         return None
 
 
+def _casefold_path(path: Optional[Path]) -> Optional[Path]:
+    """Casefolded on darwin: APFS is case-insensitive by default but ``resolve()`` keeps the
+    caller's spelling, so ``~/.hermes/.OP.ENV`` must still match ``.op.env`` (over-blocks only
+    on a case-sensitive volume). Comparison-only — never open the returned path."""
+    return Path(str(path).casefold()) if path is not None and sys.platform == "darwin" else path
+
+
 def _path_under_denied_prefix(resolved: Path) -> bool:
     """True if ``resolved`` lives under a deny-listed system path — except a denied prefix that
     IS the running user's own home: ``/root`` is listed so a non-root gateway can't deliver
     another user's home, but a root-run gateway's own deliverables live under ``$HOME=/root``.
     Credential sub-dirs (``~/.ssh``, ``~/.hermes/.env``) stay blocked (more-specific entries)."""
-    home = _resolve_path(Path(os.path.expanduser("~")))
+    home = _casefold_path(_resolve_path(Path(os.path.expanduser("~"))))
+    resolved = _casefold_path(resolved)
     for denied in _media_delivery_denied_paths():
-        resolved_denied = _resolve_path(denied, expand=True)
+        resolved_denied = _casefold_path(_resolve_path(denied, expand=True))
         if resolved_denied is None:
             continue
         hit = resolved == resolved_denied or _path_is_within(resolved, resolved_denied)

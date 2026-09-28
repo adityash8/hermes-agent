@@ -89,3 +89,30 @@ def test_fs_endpoints_require_auth(tmp_path):
     assert list_response.status_code == 401
     assert read_response.status_code == 401
     assert default_response.status_code == 401
+
+
+@pytest.mark.parametrize("endpoint", ["/api/fs/read-text", "/api/fs/read-data-url", "/api/fs/download"])
+@pytest.mark.parametrize("rel", [".env", ".OP.ENV", "auth.json", "cache/op_cache.json", "mcp-tokens/github.json"])
+def test_fs_reads_reject_sensitive_files(client, tmp_path, endpoint, rel):
+    target = tmp_path / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("SECRET=1")
+
+    response = client.get(endpoint, params={"path": str(target)})
+
+    assert response.status_code == 403
+    assert "SECRET" not in response.text
+
+
+def test_fs_list_hides_sensitive_entries(client, tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "main.py").write_text("print()")
+    (root / ".env").write_text("SECRET=1")
+    (root / "Auth.JSON").write_text("{}")
+    (root / "mcp-tokens").mkdir()
+
+    response = client.get("/api/fs/list", params={"path": str(root)})
+
+    assert response.status_code == 200
+    assert [entry["name"] for entry in response.json()["entries"]] == ["main.py"]

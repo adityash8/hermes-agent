@@ -56,6 +56,47 @@ def test_media_delivery_denies_onepassword_token_and_cache(tmp_path, monkeypatch
     assert base.validate_media_delivery_path(str(path)) is None
 
 
+@pytest.mark.parametrize(
+    "rel", [".env", "auth.json", ".op.env", ".anthropic_oauth.json", "cache/op_cache.json",
+            "cache/bws_cache.json", "mcp-tokens/gh.json"])
+def test_media_delivery_denies_sibling_profile_credentials(tmp_path, monkeypatch, rel):
+    """HERMES_HOME=<root>/profiles/coder must not deliver <root>/profiles/writer's secrets."""
+    import gateway.platforms.base as base
+
+    monkeypatch.delenv(base.MEDIA_DELIVERY_STRICT_ENV, raising=False)
+    root = tmp_path / ".hermes"
+    active = root / "profiles" / "coder"
+    active.mkdir(parents=True)
+    monkeypatch.setattr(base, "_HERMES_HOME", active)
+    monkeypatch.setattr(base, "_HERMES_ROOT", root)
+    sibling = root / "profiles" / "writer"
+    path = sibling / rel
+    path.parent.mkdir(parents=True)
+    path.write_text("secret")
+    notes = sibling / "notes.txt"
+    notes.write_text("public")
+
+    assert base.validate_media_delivery_path(str(path)) is None
+    assert base.validate_media_delivery_path(str(notes)) == str(notes.resolve())
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("rel", [".OP.ENV", "CACHE/OP_CACHE.JSON", "Auth.Json", ".ENV", "MCP-Tokens/gh.json"])
+def test_media_delivery_denies_case_variant_credentials(tmp_path, monkeypatch, rel):
+    """APFS opens ``.OP.ENV`` as ``.op.env`` but ``resolve()`` keeps the caller's spelling."""
+    import gateway.platforms.base as base
+
+    monkeypatch.delenv(base.MEDIA_DELIVERY_STRICT_ENV, raising=False)
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setattr(base, "_HERMES_HOME", hermes_home)
+    monkeypatch.setattr(base, "_HERMES_ROOT", hermes_home)
+    real = hermes_home / rel.lower()
+    real.parent.mkdir(parents=True)
+    real.write_text("secret")
+
+    assert base.validate_media_delivery_path(str(hermes_home / rel)) is None
+
+
 class TestInboundMediaSizeCap:
     """gateway.max_inbound_media_bytes caps inbound media buffered into RAM (#13145)."""
 

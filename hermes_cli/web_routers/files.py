@@ -158,6 +158,10 @@ def _io_errors(denied: str, failed: str):
 
 def _fs_regular_file(path: Path) -> tuple[Path, os.stat_result]:
     target = _fs_path(str(path))
+    # Every /api/fs read (text, data-url, download) funnels through here, and
+    # _fs_path resolves ANY absolute path — so the credential guard lives here.
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
     try:
         st = target.stat()
     except (FileNotFoundError, NotADirectoryError):
@@ -612,7 +616,7 @@ async def fs_list(path: str):
         entries = []
         with os.scandir(target) as scan:
             for entry in scan:
-                if entry.name in _FS_READDIR_HIDDEN:
+                if entry.name in _FS_READDIR_HIDDEN or _is_sensitive_path(target / entry.name):
                     continue
                 entries.append({
                     "name": entry.name,
@@ -702,8 +706,6 @@ async def fs_read_data_url(path: str):
 @router.get("/api/fs/download")
 async def fs_download(path: str):
     target, _st = _fs_regular_file(_fs_path(path))
-    if _is_sensitive_path(target):
-        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
     return FileResponse(
         path=str(target),
         media_type=_fs_mime_type(target),
