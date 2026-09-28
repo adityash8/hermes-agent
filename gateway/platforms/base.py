@@ -774,7 +774,8 @@ _ROOT_CREDENTIAL_PATHS = (
     ".env", "auth.json", "auth.lock", "credentials", "config.yaml", ".anthropic_oauth.json",
     "google_token.json", "google_oauth_pending.json", os.path.join("auth", "google_oauth.json"),
     "webhook_subscriptions.json", os.path.join("cache", "bws_cache.json"),
-    os.path.join("cache", "bws_cache.enc.json"), "pairing", "mcp-tokens")
+    os.path.join("cache", "bws_cache.enc.json"), ".op.env", os.path.join("cache", "op_cache.json"),
+    "pairing", "mcp-tokens")
 
 
 def _profile_cache_roots() -> List[Path]:

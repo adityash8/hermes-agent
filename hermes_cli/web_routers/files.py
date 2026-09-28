@@ -67,6 +67,7 @@ _SENSITIVE_MANAGED_FILE_BASENAMES = frozenset({
     "auth.json", "auth.lock", "credentials", "config.yaml", ".anthropic_oauth.json",
     "google_token.json", "google_oauth_pending.json", "google_oauth.json",
     "webhook_subscriptions.json", "bws_cache.json", "bws_cache.enc.json",
+    ".op.env", "op_cache.json",  # 1Password service-account token + plaintext cache
     ".git-credentials",  # git's credential-store cache (file_safety blocks it too)
 })
 

@@ -86,8 +86,11 @@ def build_write_denied_paths(home: str) -> set[str]:
     # Both the active-profile and top-level copies: overwriting the root .env leaks
     # credentials across every profile that inherits from it; the root Anthropic
     # PKCE store is still read by default/non-profile sessions when a profile is
-    # active; bws_cache.enc.json is the Bitwarden Secrets Manager encrypted cache.
-    hermes_files = (".env", ".anthropic_oauth.json", os.path.join("cache", "bws_cache.enc.json"))
+    # active; bws_cache.enc.json is the Bitwarden Secrets Manager encrypted cache;
+    # .op.env holds the 1Password service-account token and op_cache.json its
+    # resolved-secret cache.
+    hermes_files = (".env", ".op.env", ".anthropic_oauth.json", os.path.join("cache", "bws_cache.enc.json"),
+                    os.path.join("cache", "op_cache.json"))
     paths = [
         *(os.path.join(home, *f) for f in home_files),
         *(str(base / f) for f in hermes_files for base in (_hermes_home_path(), _hermes_root_path())),
@@ -195,10 +198,12 @@ _DID_SUFFIX = (
 
 # Exact-file credential stores under HERMES_HOME / <root>. The agent never
 # needs these directly — provider tools consume them through internal channels.
-# bws_cache.json is the Bitwarden Secrets Manager disk cache: plaintext secret values.
+# bws_cache.json / op_cache.json are the Bitwarden / 1Password disk caches: plaintext
+# secret values. .op.env holds the 1Password service-account token.
 _CREDENTIAL_FILE_NAMES = (
-    "auth.json", "auth.lock", ".anthropic_oauth.json", ".env", "webhook_subscriptions.json",
+    "auth.json", "auth.lock", ".anthropic_oauth.json", ".env", ".op.env", "webhook_subscriptions.json",
     os.path.join("auth", "google_oauth.json"), os.path.join("cache", "bws_cache.json"),
+    os.path.join("cache", "op_cache.json"),
 )
 
 # Directory-prefix read denies under HERMES_HOME / <root>: (subdir, message for
