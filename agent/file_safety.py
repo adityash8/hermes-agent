@@ -46,10 +46,13 @@ def _guard_root_path() -> Path:
 
 
 def _profile_dirs() -> list[Path]:
-    """Every ``<root>/profiles/<name>`` dir (active and siblings), enumerated at check time."""
-    with suppress(OSError):
-        return [p for p in (_guard_root_path() / "profiles").iterdir() if p.is_dir()]
-    return []
+    """Every ``<root>/profiles/<name>`` dir (active and siblings) under the spelled root and the
+    real root, enumerated at check time."""
+    dirs: list[Path] = []
+    for root in dict.fromkeys((_hermes_root_path(), _guard_root_path())):
+        with suppress(OSError):
+            dirs.extend(p for p in (root / "profiles").iterdir() if p.is_dir())
+    return dirs
 
 
 def _hermes_dirs() -> list[Path]:

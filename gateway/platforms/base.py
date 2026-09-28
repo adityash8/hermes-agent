@@ -802,11 +802,13 @@ def _guard_root() -> Path:
 
 
 def _profile_dirs() -> List[Path]:
-    """Every ``<root>/profiles/<name>`` dir, enumerated at check time (active and siblings)."""
-    try:
-        return [p for p in (_guard_root() / "profiles").iterdir() if p.is_dir()]
-    except OSError:
-        return []
+    """Every ``<root>/profiles/<name>`` dir (active and siblings) under ``_HERMES_ROOT`` and the
+    real root, enumerated at check time."""
+    dirs: List[Path] = []
+    for root in dict.fromkeys((_HERMES_ROOT, _guard_root())):
+        with contextlib.suppress(OSError):
+            dirs.extend(p for p in (root / "profiles").iterdir() if p.is_dir())
+    return dirs
 
 
 def _kanban_attachment_roots() -> List[Path]:

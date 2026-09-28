@@ -106,6 +106,36 @@ def test_media_delivery_denies_root_and_sibling_credentials_under_symlinked_home
     assert base.validate_media_delivery_path(str(notes)) == str(notes.resolve())
 
 
+@pytest.mark.require_symlinks
+def test_media_delivery_covers_spelled_root_siblings_when_active_profile_symlinked_out(
+        tmp_path, monkeypatch):
+    """<root>/profiles/coder -> storage elsewhere: siblings under the spelled <root>/profiles stay
+    undeliverable for secrets and keep their cache allowlist."""
+    import gateway.platforms.base as base
+
+    monkeypatch.delenv(base.MEDIA_DELIVERY_STRICT_ENV, raising=False)
+    root = tmp_path / "hermes"
+    storage = tmp_path / "storage" / "profiles" / "coder"
+    storage.mkdir(parents=True)
+    (root / "profiles").mkdir(parents=True)
+    (root / "profiles" / "coder").symlink_to(storage)
+    monkeypatch.setattr(base, "_HERMES_HOME", root / "profiles" / "coder")
+    monkeypatch.setattr(base, "_HERMES_ROOT", root)
+    writer = root / "profiles" / "writer"
+    secret = writer / ".op.env"
+    image = writer / "cache" / "images" / "pic.png"
+    for path in (secret, image):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
+
+    assert base.validate_media_delivery_path(str(secret)) is None
+    # Strict mode, recency trust off: only the allowlist can admit the sibling's cached image.
+    monkeypatch.setattr(base, "MEDIA_DELIVERY_SAFE_ROOTS", ())
+    monkeypatch.setenv(base.MEDIA_DELIVERY_STRICT_ENV, "1")
+    monkeypatch.setenv(base.MEDIA_DELIVERY_TRUST_RECENT_ENV, "0")
+    assert base.validate_media_delivery_path(str(image)) == str(image.resolve())
+
+
 @pytest.mark.macos_only
 @pytest.mark.parametrize("rel", [".OP.ENV", "CACHE/OP_CACHE.JSON", "Auth.Json", ".ENV", "MCP-Tokens/gh.json"])
 def test_media_delivery_denies_case_variant_credentials(tmp_path, monkeypatch, rel):

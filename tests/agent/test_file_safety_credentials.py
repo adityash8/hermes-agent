@@ -443,6 +443,28 @@ def test_symlinked_profile_home_still_guards_root_and_siblings(tmp_path, monkeyp
     assert is_write_denied(str(root / "pairing" / "device")) is True
 
 
+@pytest.mark.require_symlinks
+def test_symlinked_out_profile_still_guards_spelled_root_siblings(tmp_path, monkeypatch):
+    """<root>/profiles/coder symlinked to storage elsewhere: siblings that really live under the
+    spelled <root>/profiles keep their credential guard."""
+    from agent.file_safety import get_read_block_error, is_write_denied
+
+    root = tmp_path / "hermes"
+    storage = tmp_path / "storage" / "profiles" / "coder"
+    storage.mkdir(parents=True)
+    (root / "profiles").mkdir(parents=True)
+    (root / "profiles" / "coder").symlink_to(storage)
+    sibling = root / "profiles" / "writer"
+    sibling.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "coder"))
+
+    assert "credential store" in (get_read_block_error(str(_create(sibling, ".op.env"))) or "")
+    assert "credential store" in (get_read_block_error(str(_create(sibling, "auth.json"))) or "")
+    assert is_write_denied(str(sibling / ".env")) is True
+    assert get_read_block_error(str(_create(sibling, "notes.txt"))) is None
+
+
 def test_sibling_profile_ordinary_file_readable(sibling_profile):
     from agent.file_safety import get_read_block_error, is_write_denied
 
