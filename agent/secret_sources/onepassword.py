@@ -236,10 +236,10 @@ def _resolve_references(op: Path, references: List[str], *, account: str = "",
             logger.debug("1Password: batched resolve failed (%s); retrying per reference", exc)
             injected = {}
         for ref, raw in injected.items():
-            # Same trailing-newline rule as `op read`; empties are re-read below
-            # so the reported error comes from `op read`.
+            # Same trailing-newline rule as `op read`; empties and spans op left
+            # unexpanded are re-read below so the reported error comes from `op read`.
             value = raw.rstrip("\r\n")
-            if value.strip():
+            if value.strip() and value != f"{{{{ {ref} }}}}":
                 values[ref] = value
 
     errors: Dict[str, str] = {}

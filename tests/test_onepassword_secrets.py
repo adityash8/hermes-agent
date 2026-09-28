@@ -280,6 +280,29 @@ def test_partial_inject_output_retries_only_missing_refs(monkeypatch, tmp_path):
                                       ["read", "--account", "acme", "--", "op://V/I/b"]]
 
 
+def test_unexpanded_inject_span_is_reread_not_applied(monkeypatch, tmp_path):
+    # If op inject ever exits 0 but leaves a `{{ ref }}` span untouched, that
+    # literal must not be applied (or cached) as the secret.
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    calls = []
+    dispatch = _dispatching_run({"op://V/I/a": "va", "op://V/I/b": "vb"}, calls)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[1] == "inject":
+            calls.append(list(cmd))
+            return _ok(kwargs["input"].replace("{{ op://V/I/a }}", "va"))
+        return dispatch(cmd, **kwargs)
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    secrets, warnings = op.fetch_onepassword_secrets(
+        references={"A": "op://V/I/a", "B": "op://V/I/b"}, binary=fake_op, use_cache=False,
+    )
+    assert secrets == {"A": "va", "B": "vb"}
+    assert warnings == []
+    assert [c[1:] for c in calls] == [["inject"], ["read", "--", "op://V/I/b"]]
+
+
 def test_fallback_reads_see_per_fetch_source_environment(monkeypatch, tmp_path):
     # Profile hydration installs a per-fetch env view (a ContextVar); the pooled
     # `op read` threads must build their child env from it, not os.environ.
