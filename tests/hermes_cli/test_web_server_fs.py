@@ -183,3 +183,78 @@ def test_fs_list_hides_hermes_managed_entries_in_hermes_home(client):
     assert "notes.md" in names
     assert "config.yaml" not in names
     assert "mcp-tokens" not in names
+
+
+@pytest.mark.require_symlinks
+@pytest.mark.parametrize("endpoint", _FS_READ_ENDPOINTS)
+@pytest.mark.parametrize("entry,rel", [
+    (".env", ".env"), ("config.yaml", "config.yaml"), ("auth.json", "auth.json"),
+    ("mcp-tokens", "mcp-tokens/github.json"),
+])
+def test_fs_reads_reject_hermes_stores_symlinked_out(client, tmp_path, endpoint, entry, rel):
+    """A dotfiles-managed HERMES_HOME entry resolves to an innocuous name; still a Hermes secret."""
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    store = tmp_path / "dotfiles" / "store"
+    _write_secret(store / Path(rel).relative_to(entry))
+    (home / entry).symlink_to(store)
+
+    response = client.get(endpoint, params={"path": str(home / rel)})
+
+    assert response.status_code == 403
+    assert "SECRET" not in response.text
+
+
+@pytest.mark.require_symlinks
+def test_fs_list_hides_hermes_stores_symlinked_out(client, tmp_path):
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    dotfiles = tmp_path / "dotfiles"
+    _write_secret(dotfiles / "tokens" / "github.json")
+    (dotfiles / "hermes-config").write_text("model: x")
+    (home / "mcp-tokens").symlink_to(dotfiles / "tokens")
+    (home / "config.yaml").symlink_to(dotfiles / "hermes-config")
+    (home / "notes.md").write_text("notes")
+
+    def names(path):
+        response = client.get("/api/fs/list", params={"path": str(path)})
+        assert response.status_code == 200
+        return {entry["name"] for entry in response.json()["entries"]}
+
+    assert "notes.md" in names(home)
+    assert not {"config.yaml", "mcp-tokens"} & names(home)
+    assert names(home / "mcp-tokens") == set()
+
+
+@pytest.mark.parametrize("rel", [
+    ".env.example", "tests/fixtures/config.yaml", "src/pairing/README.md", "src/mcp-tokens/index.ts",
+])
+def test_fs_reads_allow_managed_names_in_checkout_under_hermes_home(client, rel):
+    """The default install puts the source checkout at ~/.hermes/hermes-agent; only direct
+    Hermes entries are secrets, not same-named files deeper in a repo."""
+    from hermes_constants import get_hermes_home
+
+    target = get_hermes_home() / "hermes-agent" / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("project-file")
+
+    response = client.get("/api/fs/read-text", params={"path": str(target)})
+
+    assert response.status_code == 200
+    assert "project-file" in response.text
+
+
+def test_fs_list_shows_managed_names_in_checkout_under_hermes_home(client):
+    from hermes_constants import get_hermes_home
+
+    src = get_hermes_home() / "hermes-agent" / "src"
+    (src / "pairing").mkdir(parents=True)
+    (src / "mcp-tokens").mkdir()
+    (src / "config.yaml").write_text("name: app")
+
+    response = client.get("/api/fs/list", params={"path": str(src)})
+
+    assert response.status_code == 200
+    assert {entry["name"] for entry in response.json()["entries"]} == {"pairing", "mcp-tokens", "config.yaml"}

@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 from contextlib import suppress
-from typing import Optional
+from typing import Callable, Iterable, Optional
 
 
 def _constants_path(getter_name: str) -> Path:
@@ -65,14 +65,18 @@ def _hermes_dirs() -> list[Path]:
         (_hermes_home_path(), _hermes_root_path(), _guard_root_path(), *_profile_dirs()))))
 
 
-def is_hermes_path(path: str | Path) -> bool:
-    """True when ``path`` resolves inside the active HERMES_HOME, the root or any profile.
-    Fails closed (True) when ``path`` cannot be resolved, e.g. a symlink loop."""
-    try:
-        resolved = _fold(Path(path).expanduser().resolve())
-    except (OSError, RuntimeError):
-        return True
-    return any(_is_under(resolved, _fold(hd)) for hd in _hermes_dirs())
+def hermes_entry_matcher(names: Iterable[str]) -> Callable[[Path], bool]:
+    """Predicate over an already-resolved path: True when it is, or lies below, ``<hd>/<name>``
+    for any Hermes dir ``hd`` (active home, root, every profile) and ``name`` in ``names``.
+    Entries are resolved once up front, so a store symlinked out of Hermes (a dotfiles-managed
+    ``~/.hermes/.env``) still matches its target."""
+    entries = [str(_fold(e)) for e in _resolve_each(hd / name for hd in _hermes_dirs() for name in names)]
+
+    def matches(resolved: Path) -> bool:
+        folded = str(_fold(resolved))
+        return any(_is_under(folded, entry) for entry in entries)
+
+    return matches
 
 
 def _resolve_each(paths) -> list[Path]:

@@ -19,7 +19,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -107,23 +107,42 @@ def _is_sensitive_path(path: Path) -> bool:
 # Names that are ordinary in projects: a repo's config.yaml, and the .env
 # templates agent.file_safety names as the readable documented-shape substitute.
 # /api/fs resolves ANY absolute path, so these — and the
-# _SENSITIVE_MANAGED_DIR_NAMES trees — block only inside a Hermes dir; every
-# other sensitive basename (.env, credentials, auth.json, the secret caches) is
-# a secret wherever it sits and blocks everywhere.
+# _SENSITIVE_MANAGED_DIR_NAMES trees — block only as direct entries of a Hermes
+# dir (a checkout under ~/.hermes keeps its .env.example and nested
+# config.yaml / pairing/); every other sensitive basename (.env, credentials,
+# auth.json, the secret caches) is a secret wherever it sits and blocks everywhere.
 _HERMES_ONLY_SENSITIVE_BASENAMES = frozenset({"config.yaml", ".env.example", ".env.sample", ".env.template"})
 
+# Hermes entries matched on their resolved target, so a credential store
+# symlinked out of Hermes (dotfiles-managed ~/.hermes/.env) stays hidden even
+# though its target's basename is innocuous. Mirrors
+# gateway.platforms.base._ROOT_CREDENTIAL_PATHS.
+_FS_HERMES_ENTRY_NAMES = (
+    *_HERMES_ONLY_SENSITIVE_BASENAMES, *_SENSITIVE_MANAGED_DIR_NAMES, *_SENSITIVE_MANAGED_FILE_BASENAMES,
+    ".env", os.path.join("auth", "google_oauth.json"), os.path.join("cache", "bws_cache.json"),
+    os.path.join("cache", "bws_cache.enc.json"), os.path.join("cache", "op_cache.json"),
+)
 
-def _fs_read_blocked(path: Path) -> bool:
-    """Credential guard for /api/fs list/read/download (the managed-files API,
-    rooted in Hermes, keeps the full :func:`_is_sensitive_path` list)."""
-    if not _is_sensitive_path(path):
-        return False
-    name = path.name.lower()
-    if _is_sensitive_filename(name) and name not in _HERMES_ONLY_SENSITIVE_BASENAMES:
-        return True
-    from agent.file_safety import is_hermes_path
 
-    return is_hermes_path(path)
+def _fs_read_guard() -> Callable[[Path], bool]:
+    """Credential guard for /api/fs list/read/download, built once per request
+    (the managed-files API, rooted in Hermes, keeps the full
+    :func:`_is_sensitive_path` list)."""
+    from agent.file_safety import hermes_entry_matcher
+
+    in_hermes_entry = hermes_entry_matcher(_FS_HERMES_ENTRY_NAMES)
+
+    def blocked(path: Path) -> bool:
+        name = path.name.lower()
+        if _is_sensitive_filename(name) and name not in _HERMES_ONLY_SENSITIVE_BASENAMES:
+            return True
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError):  # symlink loop: fail closed for guarded names only
+            return _is_sensitive_path(path)
+        return in_hermes_entry(resolved)
+
+    return blocked
 
 
 _FS_TEXT_SOURCE_MAX_BYTES = 64 * 1024 * 1024
@@ -182,7 +201,7 @@ def _fs_regular_file(path: Path) -> tuple[Path, os.stat_result]:
     target = _fs_path(str(path))
     # Every /api/fs read (text, data-url, download) funnels through here, and
     # _fs_path resolves ANY absolute path — so the credential guard lives here.
-    if _fs_read_blocked(target):
+    if _fs_read_guard()(target):
         raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
     try:
         st = target.stat()
@@ -636,9 +655,10 @@ async def fs_list(path: str):
     target = _fs_path(path)
     try:
         entries = []
+        blocked = _fs_read_guard()
         with os.scandir(target) as scan:
             for entry in scan:
-                if entry.name in _FS_READDIR_HIDDEN or _fs_read_blocked(target / entry.name):
+                if entry.name in _FS_READDIR_HIDDEN or blocked(target / entry.name):
                     continue
                 entries.append({
                     "name": entry.name,
