@@ -67,14 +67,18 @@ def _hermes_dirs() -> list[Path]:
 
 def hermes_entry_matcher(names: Iterable[str]) -> Callable[[Path], bool]:
     """Predicate over an already-resolved path: True when it is, or lies below, ``<hd>/<name>``
-    for any Hermes dir ``hd`` (active home, root, every profile) and ``name`` in ``names``.
-    Entries are resolved once up front, so a store symlinked out of Hermes (a dotfiles-managed
-    ``~/.hermes/.env``) still matches its target."""
-    entries = [str(_fold(e)) for e in _resolve_each(hd / name for hd in _hermes_dirs() for name in names)]
+    for any Hermes dir ``hd`` (active home, root, every profile) and ``name`` in ``names``, or a
+    copy Hermes writes beside it (``config.yaml.bak.<ts>``, ``auth.json.corrupt``). Entries are
+    resolved once up front, so a store symlinked out of Hermes (a dotfiles-managed
+    ``~/.hermes/.env``) still matches its target. One set lookup plus one C-level prefix scan
+    per call, so listing a huge directory stays cheap."""
+    spelled = [hd / name for hd in _hermes_dirs() for name in names]
+    entries = {str(_fold(e)) for e in _resolve_each(spelled)}
+    prefixes = (*(e + os.sep for e in entries), *(str(_fold(s)) + "." for s in spelled))
 
     def matches(resolved: Path) -> bool:
         folded = str(_fold(resolved))
-        return any(_is_under(folded, entry) for entry in entries)
+        return folded in entries or folded.startswith(prefixes)
 
     return matches
 

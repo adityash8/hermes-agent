@@ -229,7 +229,8 @@ def test_fs_list_hides_hermes_stores_symlinked_out(client, tmp_path):
 
 
 @pytest.mark.parametrize("rel", [
-    ".env.example", "tests/fixtures/config.yaml", "src/pairing/README.md", "src/mcp-tokens/index.ts",
+    ".env.example", "config.yaml.example", "tests/fixtures/config.yaml", "src/pairing/README.md",
+    "src/mcp-tokens/index.ts",
 ])
 def test_fs_reads_allow_managed_names_in_checkout_under_hermes_home(client, rel):
     """The default install puts the source checkout at ~/.hermes/hermes-agent; only direct
@@ -258,3 +259,29 @@ def test_fs_list_shows_managed_names_in_checkout_under_hermes_home(client):
 
     assert response.status_code == 200
     assert {entry["name"] for entry in response.json()["entries"]} == {"pairing", "mcp-tokens", "config.yaml"}
+
+
+def test_fs_hides_hermes_written_copies_of_credential_stores(client):
+    """Hermes snapshots config.yaml before setup and on a parse failure, and auth.json when it is
+    corrupt, beside the original; the copies hold the same secrets."""
+    from hermes_cli.config import _backup_corrupt_config
+    from hermes_cli.setup import _backup_config_file
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    config = home / "config.yaml"
+    _write_secret(config)
+    _write_secret(home / "auth.json.corrupt")
+    copies = [_backup_config_file(config), _backup_corrupt_config(config), home / "auth.json.corrupt"]
+    (home / "notes.yaml.bak").write_text("notes")
+
+    response = client.get("/api/fs/list", params={"path": str(home)})
+    listed = {entry["name"] for entry in response.json()["entries"]}
+
+    assert "notes.yaml.bak" in listed
+    for copy in copies:
+        assert copy is not None and copy.name not in listed
+        for endpoint in _FS_READ_ENDPOINTS:
+            response = client.get(endpoint, params={"path": str(copy)})
+            assert response.status_code == 403
+            assert "SECRET" not in response.text

@@ -132,15 +132,17 @@ def _fs_read_guard() -> Callable[[Path], bool]:
 
     in_hermes_entry = hermes_entry_matcher(_FS_HERMES_ENTRY_NAMES)
 
-    def blocked(path: Path) -> bool:
+    def blocked(path: Path, *, resolved: bool = False) -> bool:
+        """``resolved=True`` skips re-resolving a path already known to be real."""
         name = path.name.lower()
         if _is_sensitive_filename(name) and name not in _HERMES_ONLY_SENSITIVE_BASENAMES:
             return True
-        try:
-            resolved = path.resolve()
-        except (OSError, RuntimeError):  # symlink loop: fail closed for guarded names only
-            return _is_sensitive_path(path)
-        return in_hermes_entry(resolved)
+        if not resolved:
+            try:
+                path = path.resolve()
+            except (OSError, RuntimeError):  # symlink loop: fail closed for guarded names only
+                return _is_sensitive_path(path)
+        return in_hermes_entry(path)
 
     return blocked
 
@@ -658,7 +660,8 @@ async def fs_list(path: str):
         blocked = _fs_read_guard()
         with os.scandir(target) as scan:
             for entry in scan:
-                if entry.name in _FS_READDIR_HIDDEN or blocked(target / entry.name):
+                # target is already resolved, so only a symlink entry needs resolving again.
+                if entry.name in _FS_READDIR_HIDDEN or blocked(target / entry.name, resolved=not entry.is_symlink()):
                     continue
                 entries.append({
                     "name": entry.name,
