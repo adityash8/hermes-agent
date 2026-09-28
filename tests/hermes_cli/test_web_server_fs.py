@@ -91,12 +91,20 @@ def test_fs_endpoints_require_auth(tmp_path):
     assert default_response.status_code == 401
 
 
-@pytest.mark.parametrize("endpoint", ["/api/fs/read-text", "/api/fs/read-data-url", "/api/fs/download"])
-@pytest.mark.parametrize("rel", [".env", ".OP.ENV", "auth.json", "cache/op_cache.json", "mcp-tokens/github.json"])
-def test_fs_reads_reject_sensitive_files(client, tmp_path, endpoint, rel):
-    target = tmp_path / rel
+_FS_READ_ENDPOINTS = ["/api/fs/read-text", "/api/fs/read-data-url", "/api/fs/download"]
+
+
+def _write_secret(target: Path) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("SECRET=1")
+    return target
+
+
+@pytest.mark.parametrize("endpoint", _FS_READ_ENDPOINTS)
+@pytest.mark.parametrize("rel", [".env", ".OP.ENV", "auth.json", "credentials", "cache/op_cache.json"])
+def test_fs_reads_reject_sensitive_files(client, tmp_path, endpoint, rel):
+    """Secret-bearing basenames are blocked anywhere on disk, not just in Hermes dirs."""
+    target = _write_secret(tmp_path / "project" / rel)
 
     response = client.get(endpoint, params={"path": str(target)})
 
@@ -104,15 +112,59 @@ def test_fs_reads_reject_sensitive_files(client, tmp_path, endpoint, rel):
     assert "SECRET" not in response.text
 
 
+@pytest.mark.parametrize("endpoint", _FS_READ_ENDPOINTS)
+@pytest.mark.parametrize("rel", ["config.yaml", "mcp-tokens/github.json", "pairing/device"])
+def test_fs_reads_reject_hermes_managed_names_in_hermes_home(client, endpoint, rel):
+    from hermes_constants import get_hermes_home
+
+    target = _write_secret(get_hermes_home() / rel)
+
+    response = client.get(endpoint, params={"path": str(target)})
+
+    assert response.status_code == 403
+    assert "SECRET" not in response.text
+
+
+@pytest.mark.parametrize("rel", ["config.yaml", "mcp-tokens/index.ts", "pairing/README.md"])
+def test_fs_reads_allow_hermes_managed_names_in_projects(client, tmp_path, rel):
+    """/api/fs serves arbitrary project paths; a repo's config.yaml is not a Hermes secret."""
+    target = tmp_path / "project" / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("project-file")
+
+    response = client.get("/api/fs/read-text", params={"path": str(target)})
+
+    assert response.status_code == 200
+    assert "project-file" in response.text
+
+
 def test_fs_list_hides_sensitive_entries(client, tmp_path):
     root = tmp_path / "project"
     root.mkdir()
     (root / "main.py").write_text("print()")
+    (root / "config.yaml").write_text("name: app")
+    (root / "pairing").mkdir()
     (root / ".env").write_text("SECRET=1")
     (root / "Auth.JSON").write_text("{}")
-    (root / "mcp-tokens").mkdir()
 
     response = client.get("/api/fs/list", params={"path": str(root)})
 
     assert response.status_code == 200
-    assert [entry["name"] for entry in response.json()["entries"]] == ["main.py"]
+    assert [entry["name"] for entry in response.json()["entries"]] == ["pairing", "config.yaml", "main.py"]
+
+
+def test_fs_list_hides_hermes_managed_entries_in_hermes_home(client):
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    (home / "notes.md").write_text("notes")
+    (home / "config.yaml").write_text("model: x")
+    (home / "mcp-tokens").mkdir()
+
+    response = client.get("/api/fs/list", params={"path": str(home)})
+
+    assert response.status_code == 200
+    names = [entry["name"] for entry in response.json()["entries"]]
+    assert "notes.md" in names
+    assert "config.yaml" not in names
+    assert "mcp-tokens" not in names

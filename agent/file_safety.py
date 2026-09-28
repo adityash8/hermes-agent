@@ -50,6 +50,12 @@ def _hermes_dirs() -> list[Path]:
     return list(dict.fromkeys(_resolve_each((_hermes_home_path(), _hermes_root_path(), *_profile_dirs()))))
 
 
+def is_hermes_path(path: str | Path) -> bool:
+    """True when ``path`` resolves inside the active HERMES_HOME, the root or any profile."""
+    resolved = _fold(Path(path).expanduser().resolve())
+    return any(_is_under(resolved, _fold(hd)) for hd in _hermes_dirs())
+
+
 def _resolve_each(paths) -> list[Path]:
     """``p.resolve()`` for each path, skipping ones that fail to resolve."""
     out: list[Path] = []
@@ -161,8 +167,8 @@ _HERMES_PROTECTED_SUBPATHS = ("state.db", "sessions", "mcp-tokens", "pairing")
 
 def _classify_write_denial(path: str) -> Optional[str]:
     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
-    home, resolved = _home_and_resolved(path)
-    resolved = _fold(resolved)
+    home, raw = _home_and_resolved(path)
+    resolved = _fold(raw)
 
     # Approval-gated paths are allowed at this layer so interactive tools can
     # prompt; checked first so the ``.ssh/`` prefix deny doesn't swallow them.
@@ -180,8 +186,10 @@ def _classify_write_denial(path: str) -> Optional[str]:
                 if _is_under(resolved, _fold(os.path.realpath(os.path.join(str(base), sub)))):
                     return "credential"
 
+    # Allowlist: compare the unfolded path. Folding here would treat ``.../PROJ`` as
+    # inside root ``.../proj`` — a distinct directory on a case-sensitive volume.
     safe_roots = get_safe_write_roots()
-    if safe_roots and not any(_is_under(resolved, _fold(root)) for root in safe_roots):
+    if safe_roots and not any(_is_under(raw, root) for root in safe_roots):
         return "safe_root"
 
     return None

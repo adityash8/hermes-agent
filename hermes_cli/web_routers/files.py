@@ -104,6 +104,27 @@ def _is_sensitive_path(path: Path) -> bool:
     return any(part.lower() in _SENSITIVE_MANAGED_DIR_NAMES for part in path.parts)
 
 
+# Hermes-managed names that are ordinary in projects (a repo's config.yaml, a
+# pairing/ package). /api/fs resolves ANY absolute path, so these — and the
+# _SENSITIVE_MANAGED_DIR_NAMES trees — block only inside a Hermes dir; every
+# other sensitive basename (.env, credentials, auth.json, the secret caches) is
+# a secret wherever it sits and blocks everywhere.
+_HERMES_ONLY_SENSITIVE_BASENAMES = frozenset({"config.yaml"})
+
+
+def _fs_read_blocked(path: Path) -> bool:
+    """Credential guard for /api/fs list/read/download (the managed-files API,
+    rooted in Hermes, keeps the full :func:`_is_sensitive_path` list)."""
+    if not _is_sensitive_path(path):
+        return False
+    name = path.name.lower()
+    if _is_sensitive_filename(name) and name not in _HERMES_ONLY_SENSITIVE_BASENAMES:
+        return True
+    from agent.file_safety import is_hermes_path
+
+    return is_hermes_path(path)
+
+
 _FS_TEXT_SOURCE_MAX_BYTES = 64 * 1024 * 1024
 _FS_TEXT_PREVIEW_MAX_BYTES = 512 * 1024
 # Spot-editor save ceiling: the editor only opens non-truncated text (<= the
@@ -160,7 +181,7 @@ def _fs_regular_file(path: Path) -> tuple[Path, os.stat_result]:
     target = _fs_path(str(path))
     # Every /api/fs read (text, data-url, download) funnels through here, and
     # _fs_path resolves ANY absolute path — so the credential guard lives here.
-    if _is_sensitive_path(target):
+    if _fs_read_blocked(target):
         raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
     try:
         st = target.stat()
@@ -616,7 +637,7 @@ async def fs_list(path: str):
         entries = []
         with os.scandir(target) as scan:
             for entry in scan:
-                if entry.name in _FS_READDIR_HIDDEN or _is_sensitive_path(target / entry.name):
+                if entry.name in _FS_READDIR_HIDDEN or _fs_read_blocked(target / entry.name):
                     continue
                 entries.append({
                     "name": entry.name,

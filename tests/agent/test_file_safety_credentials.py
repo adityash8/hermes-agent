@@ -362,6 +362,20 @@ def test_case_variant_ssh_config_stays_approval_gated():
     assert is_write_denied(variant) is False
 
 
+@pytest.mark.macos_only
+def test_case_variant_outside_safe_root_denied(tmp_path, monkeypatch):
+    """The safe-root allowlist compares the caller's spelling: ``PROJ`` is a distinct
+    directory from root ``proj`` on a case-sensitive volume, so it stays outside."""
+    from agent.file_safety import is_write_denied
+
+    root = tmp_path / "proj"
+    root.mkdir()
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(root))
+
+    assert is_write_denied(str(root / "ok.txt")) is False
+    assert is_write_denied(str(tmp_path / "PROJ" / "evil.txt")) is True
+
+
 @pytest.fixture()
 def sibling_profile(tmp_path, monkeypatch):
     """Active profile ``coder``; returns the sibling profile ``writer``'s dir."""
