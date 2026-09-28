@@ -54,6 +54,19 @@ class TestGetDefaultHermesRoot:
         monkeypatch.setenv("HERMES_HOME", str(profile))
         assert get_default_hermes_root() == docker_root
 
+    @pytest.mark.require_symlinks
+    def test_symlinked_docker_profile_returns_real_root(self, tmp_path, monkeypatch):
+        """HERMES_HOME=<alias> -> <root>/profiles/<name> still yields <root>,
+        so sibling profiles stay enumerable (and credential-guarded)."""
+        docker_root = tmp_path / "opt" / "data"
+        profile = docker_root / "profiles" / "coder"
+        profile.mkdir(parents=True)
+        alias = tmp_path / "link_coder"
+        alias.symlink_to(profile)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+        monkeypatch.setenv("HERMES_HOME", str(alias))
+        assert get_default_hermes_root() == docker_root.resolve()
+
     @pytest.mark.windows_only
     def test_no_hermes_home_returns_localappdata_root_on_windows(self, tmp_path, monkeypatch):
         """Native Windows falls back to %LOCALAPPDATA%\\hermes, not ~/.hermes."""

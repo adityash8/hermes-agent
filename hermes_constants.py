@@ -157,7 +157,11 @@ def get_default_hermes_root() -> Path:
         try:
             env_path.resolve().relative_to(native_home.resolve())  # under ~/.hermes (normal or profile mode)
         except ValueError:  # Docker/custom root: <root>/profiles/<name> -> <root>, else HERMES_HOME itself
-            result = env_path.parent.parent if env_path.parent.name == "profiles" else env_path
+            if env_path.parent.name == "profiles":
+                result = env_path.parent.parent
+            else:  # a symlink alias of <root>/profiles/<name> still has <root> (and sibling profiles)
+                real = env_path.resolve()
+                result = real.parent.parent if real.parent.name == "profiles" else env_path
     _default_hermes_root_memo = (str(native_home), env_home, result)
     return result
 

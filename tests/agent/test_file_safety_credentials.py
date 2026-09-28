@@ -422,6 +422,27 @@ def test_sibling_profile_credential_store_write_denied(sibling_profile, rel):
     assert is_write_denied(str(sibling_profile / rel)) is True
 
 
+@pytest.mark.require_symlinks
+def test_symlinked_profile_home_still_guards_root_and_siblings(tmp_path, monkeypatch):
+    """HERMES_HOME as a symlink alias of <root>/profiles/coder: the root and the sibling
+    profile keep their credential guard (real root resolution, nothing patched in fs)."""
+    from agent.file_safety import get_read_block_error, is_write_denied
+
+    root = tmp_path / "data" / "hermes"
+    (root / "profiles" / "coder").mkdir(parents=True)
+    sibling = root / "profiles" / "writer"
+    sibling.mkdir()
+    alias = tmp_path / "link_coder"
+    alias.symlink_to(root / "profiles" / "coder")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.setenv("HERMES_HOME", str(alias))
+
+    assert "credential store" in (get_read_block_error(str(_create(root, "auth.json"))) or "")
+    assert "credential store" in (get_read_block_error(str(_create(sibling, ".op.env"))) or "")
+    assert is_write_denied(str(sibling / ".env")) is True
+    assert is_write_denied(str(root / "pairing" / "device")) is True
+
+
 def test_sibling_profile_ordinary_file_readable(sibling_profile):
     from agent.file_safety import get_read_block_error, is_write_denied
 
