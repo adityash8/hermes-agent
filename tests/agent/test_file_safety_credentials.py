@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.macos_path_aliases import ALIAS_KINDS, macos_alias
+
 
 @pytest.fixture()
 def fake_home(tmp_path, monkeypatch):
@@ -374,6 +376,53 @@ def test_case_variant_outside_safe_root_denied(tmp_path, monkeypatch):
 
     assert is_write_denied(str(root / "ok.txt")) is False
     assert is_write_denied(str(tmp_path / "PROJ" / "evil.txt")) is True
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("kind", ALIAS_KINDS)
+@pytest.mark.parametrize("rel", ["auth.json", ".op.env", "cache/bws_cache.json", "mcp-tokens/gh.json"])
+def test_macos_alias_spelling_read_blocked(fake_home, kind, rel):
+    """Firmlink / volfs spellings open the store but keep their own prefix through ``resolve()``."""
+    from agent.file_safety import get_read_block_error
+
+    assert get_read_block_error(macos_alias(_create(fake_home, rel), kind)) is not None
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("kind", ALIAS_KINDS)
+@pytest.mark.parametrize("rel", [".env", ".op.env", "state.db", "mcp-tokens/gh.json"])
+def test_macos_alias_spelling_write_denied(fake_home, kind, rel):
+    from agent.file_safety import is_write_denied
+
+    target = fake_home / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if kind == "volfs-inode":  # an inode spelling needs an existing file
+        target.write_text("x")
+    assert is_write_denied(macos_alias(target, kind)) is True
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("kind", ALIAS_KINDS)
+def test_macos_alias_configured_hermes_home_guards_plain_spelling(tmp_path, monkeypatch, kind):
+    """HERMES_HOME itself configured through an alias: the plain spelling stays guarded."""
+    import agent.file_safety as fs
+
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    monkeypatch.setattr(fs, "_hermes_home_path", lambda: Path(macos_alias(home, kind)))
+
+    assert "credential store" in (fs.get_read_block_error(str(_create(home, "auth.json"))) or "")
+    assert fs.is_write_denied(str(home / ".env")) is True
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("kind", ALIAS_KINDS)
+def test_macos_alias_spelling_of_ordinary_file_allowed(fake_home, kind):
+    from agent.file_safety import get_read_block_error, is_write_denied
+
+    notes = macos_alias(_create(fake_home, "notes.txt"), kind)
+    assert get_read_block_error(notes) is None
+    assert is_write_denied(notes) is False
 
 
 @pytest.fixture()

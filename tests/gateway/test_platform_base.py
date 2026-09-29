@@ -2,6 +2,7 @@
 
 import os
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -21,6 +22,7 @@ from gateway.platforms.base import (
     _prefix_within_utf16_limit,
     cache_audio_from_bytes,
 )
+from tests.macos_path_aliases import ALIAS_KINDS, macos_alias
 
 
 def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):
@@ -151,6 +153,50 @@ def test_media_delivery_denies_case_variant_credentials(tmp_path, monkeypatch, r
     real.write_text("secret")
 
     assert base.validate_media_delivery_path(str(hermes_home / rel)) is None
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("kind", ALIAS_KINDS)
+@pytest.mark.parametrize("rel", [".env", "auth.json", ".op.env", "mcp-tokens/gh.json"])
+def test_media_delivery_denies_macos_alias_spellings(tmp_path, monkeypatch, kind, rel):
+    """Firmlink / volfs spellings open the secret but keep their own prefix through ``resolve()``."""
+    import gateway.platforms.base as base
+
+    monkeypatch.delenv(base.MEDIA_DELIVERY_STRICT_ENV, raising=False)
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setattr(base, "_HERMES_HOME", hermes_home)
+    monkeypatch.setattr(base, "_HERMES_ROOT", hermes_home)
+    secret = hermes_home / rel
+    secret.parent.mkdir(parents=True)
+    secret.write_text("secret")
+
+    assert base.validate_media_delivery_path(macos_alias(secret, kind)) is None
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("kind", ["data-volume", "nofollow"])  # volfs / .resolve fail strict resolve()
+def test_media_delivery_allows_macos_alias_of_ordinary_file(tmp_path, monkeypatch, kind):
+    import gateway.platforms.base as base
+
+    monkeypatch.delenv(base.MEDIA_DELIVERY_STRICT_ENV, raising=False)
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setattr(base, "_HERMES_HOME", hermes_home)
+    monkeypatch.setattr(base, "_HERMES_ROOT", hermes_home)
+    notes = hermes_home / "notes.txt"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("public")
+
+    alias = macos_alias(notes, kind)
+    assert base.validate_media_delivery_path(alias) == alias
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("kind", ALIAS_KINDS)
+def test_media_delivery_denies_macos_alias_of_system_paths(monkeypatch, kind):
+    import gateway.platforms.base as base
+
+    monkeypatch.delenv(base.MEDIA_DELIVERY_STRICT_ENV, raising=False)
+    assert base.validate_media_delivery_path(macos_alias(Path("/etc/hosts"), kind)) is None
 
 
 class TestInboundMediaSizeCap:

@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import web_server
+from tests.macos_path_aliases import ALIAS_KINDS, macos_alias
 
 pytest.importorskip("starlette.testclient")
 from starlette.testclient import TestClient
@@ -285,3 +286,40 @@ def test_fs_hides_hermes_written_copies_of_credential_stores(client):
             response = client.get(endpoint, params={"path": str(copy)})
             assert response.status_code == 403
             assert "SECRET" not in response.text
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("kind", ALIAS_KINDS)
+@pytest.mark.parametrize("endpoint", _FS_READ_ENDPOINTS)
+@pytest.mark.parametrize("rel", [".env", "config.yaml", "mcp-tokens/github.json", "pairing/device"])
+def test_fs_reads_reject_macos_alias_spellings(client, endpoint, kind, rel):
+    """Firmlink / volfs spellings open the store but keep their own prefix through ``resolve()``."""
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    target = _write_secret(home / rel)
+    (home / "notes.md").write_text("notes")
+
+    response = client.get(endpoint, params={"path": macos_alias(target, kind)})
+
+    assert response.status_code == 403
+    assert "SECRET" not in response.text
+    assert client.get(endpoint, params={"path": macos_alias(home / "notes.md", kind)}).status_code == 200
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("kind", ALIAS_KINDS)
+def test_fs_list_hides_hermes_entries_via_macos_alias(client, kind):
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    (home / "notes.md").write_text("notes")
+    (home / "config.yaml").write_text("model: x")
+    (home / "mcp-tokens").mkdir()
+
+    response = client.get("/api/fs/list", params={"path": macos_alias(home, kind)})
+
+    assert response.status_code == 200
+    names = {entry["name"] for entry in response.json()["entries"]}
+    assert "notes.md" in names
+    assert not {"config.yaml", "mcp-tokens"} & names

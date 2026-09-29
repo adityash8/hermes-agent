@@ -13,6 +13,8 @@ from pathlib import Path
 from contextlib import suppress
 from typing import Callable, Iterable, Optional
 
+from utils import path_spellings
+
 
 def _constants_path(getter_name: str) -> Path:
     """Call ``hermes_constants.<getter_name>()`` (local import avoids cycles); ``~/.hermes`` on any failure."""
@@ -66,7 +68,8 @@ def _hermes_dirs() -> list[Path]:
 
 
 def hermes_entry_matcher(names: Iterable[str]) -> Callable[[Path], bool]:
-    """Predicate over an already-resolved path: True when it is, or lies below, ``<hd>/<name>``
+    """Predicate over one :func:`utils.path_spellings` spelling of a resolved path (callers test
+    each): True when it is, or lies below, ``<hd>/<name>``
     for any Hermes dir ``hd`` (active home, root, every profile) and ``name`` in ``names``, or a
     copy Hermes writes beside it (``config.yaml.bak.<ts>``, ``auth.json.corrupt``). Entries are
     resolved once up front, so a store symlinked out of Hermes (a dotfiles-managed
@@ -84,11 +87,12 @@ def hermes_entry_matcher(names: Iterable[str]) -> Callable[[Path], bool]:
 
 
 def _resolve_each(paths) -> list[Path]:
-    """``p.resolve()`` for each path, skipping ones that fail to resolve."""
+    """Every :func:`utils.path_spellings` spelling of ``p.resolve()`` for each path, skipping ones
+    that fail to resolve. Deny side only."""
     out: list[Path] = []
     for p in paths:
         with suppress(Exception):
-            out.append(p.resolve())
+            out.extend(path_spellings(p.resolve()))
     return out
 
 
@@ -195,23 +199,21 @@ _HERMES_PROTECTED_SUBPATHS = ("state.db", "sessions", "mcp-tokens", "pairing")
 def _classify_write_denial(path: str) -> Optional[str]:
     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
     home, raw = _home_and_resolved(path)
-    resolved = _fold(raw)
 
     # Approval-gated paths are allowed at this layer so interactive tools can
     # prompt; checked first so the ``.ssh/`` prefix deny doesn't swallow them.
-    if _is_write_approval_path(home, resolved):
+    if _is_write_approval_path(home, _fold(raw)):
         return None
 
-    if resolved in {_fold(p) for p in build_write_denied_paths(home)} or any(
-        resolved.startswith(_fold(prefix)) for prefix in build_write_denied_prefixes(home)
-    ):
-        return "credential"
-
-    for base in _hermes_dirs():
-        for sub in _HERMES_PROTECTED_SUBPATHS:
-            with suppress(Exception):
-                if _is_under(resolved, _fold(os.path.realpath(os.path.join(str(base), sub)))):
-                    return "credential"
+    denied = {_fold(p) for p in build_write_denied_paths(home)}
+    denied_prefixes = [_fold(prefix) for prefix in build_write_denied_prefixes(home)]
+    protected = [_fold(str(p)) for base in _hermes_dirs() for sub in _HERMES_PROTECTED_SUBPATHS
+                 for p in _resolve_each([Path(base, sub)])]
+    for resolved in (_fold(str(p)) for p in path_spellings(Path(raw))):
+        if resolved in denied or resolved.startswith(tuple(denied_prefixes)) or any(
+            _is_under(resolved, sub) for sub in protected
+        ):
+            return "credential"
 
     # Allowlist: compare the unfolded path. Folding here would treat ``.../PROJ`` as
     # inside root ``.../proj`` — a distinct directory on a case-sensitive volume.
@@ -291,8 +293,16 @@ def get_read_block_error(path: str) -> Optional[str]:
     ``TERMINAL_CWD``) MUST pass an absolute path: ``resolve()`` here anchors at
     the process cwd, so a relative ``"auth.json"`` would miss the denylist.
     """
-    resolved = _fold(Path(path).expanduser().resolve())
     hermes_dirs = _hermes_dirs()
+    for resolved in map(_fold, path_spellings(Path(path).expanduser().resolve())):
+        reason = _read_block_reason(resolved, hermes_dirs)
+        if reason:
+            return f"Access denied: {path} {reason}"
+    return None
+
+
+def _read_block_reason(resolved: Path, hermes_dirs: list[Path]) -> Optional[str]:
+    """:func:`get_read_block_error`'s reason for one folded spelling, or None."""
     reason = None
     if any(_is_under(resolved, _fold(hd / "skills" / ".hub")) for hd in hermes_dirs):
         reason = (
@@ -317,7 +327,7 @@ def get_read_block_error(path: str) -> Optional[str]:
                 "is a secret-bearing environment file and cannot be read to prevent credential "
                 "leakage. If you need to check the file structure, read .env.example instead." + _DID_SUFFIX
             )
-    return f"Access denied: {path} {reason}" if reason else None
+    return reason
 
 
 def raise_if_read_blocked(path: str) -> None:

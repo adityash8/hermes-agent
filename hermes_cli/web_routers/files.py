@@ -32,6 +32,7 @@ from hermes_cli.web_server_files import (
 from hermes_cli.web_models import (
     ChatImageUpload, FsWriteText, ManagedDirectoryCreate, ManagedFileDelete, ManagedFileUpload,
 )
+from utils import path_spellings
 
 router = APIRouter()
 
@@ -132,17 +133,22 @@ def _fs_read_guard() -> Callable[[Path], bool]:
 
     in_hermes_entry = hermes_entry_matcher(_FS_HERMES_ENTRY_NAMES)
 
-    def blocked(path: Path, *, resolved: bool = False) -> bool:
-        """``resolved=True`` skips re-resolving a path already known to be real."""
+    def guarded_name(path: Path) -> bool:
         name = path.name.lower()
-        if _is_sensitive_filename(name) and name not in _HERMES_ONLY_SENSITIVE_BASENAMES:
+        return _is_sensitive_filename(name) and name not in _HERMES_ONLY_SENSITIVE_BASENAMES
+
+    def blocked(path: Path, *, resolved: bool = False) -> bool:
+        """``resolved=True`` skips re-resolving a path already known to be real (the caller
+        passes each :func:`utils.path_spellings` spelling itself)."""
+        if guarded_name(path):
             return True
-        if not resolved:
-            try:
-                path = path.resolve()
-            except (OSError, RuntimeError):  # symlink loop: fail closed for guarded names only
-                return _is_sensitive_path(path)
-        return in_hermes_entry(path)
+        if resolved:
+            return in_hermes_entry(path)
+        try:
+            spellings = path_spellings(path.resolve())
+        except (OSError, RuntimeError):  # symlink loop: fail closed for guarded names only
+            return _is_sensitive_path(path)
+        return any(guarded_name(p) or in_hermes_entry(p) for p in spellings)
 
     return blocked
 
@@ -658,10 +664,14 @@ async def fs_list(path: str):
     try:
         entries = []
         blocked = _fs_read_guard()
+        # target is already resolved, so only a symlink entry needs resolving again; a macOS
+        # firmlink / volfs alias of target is checked in its kernel spelling too.
+        targets = path_spellings(target)
         with os.scandir(target) as scan:
             for entry in scan:
-                # target is already resolved, so only a symlink entry needs resolving again.
-                if entry.name in _FS_READDIR_HIDDEN or blocked(target / entry.name, resolved=not entry.is_symlink()):
+                real = not entry.is_symlink()
+                if entry.name in _FS_READDIR_HIDDEN or any(
+                        blocked(t / entry.name, resolved=real) for t in (targets if real else targets[:1])):
                     continue
                 entries.append({
                     "name": entry.name,

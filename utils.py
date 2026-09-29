@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import stat
+import sys
 import tempfile
 import time
 from contextlib import suppress
@@ -242,6 +243,35 @@ def warn_if_credential_file_broadly_readable(path: Union[str, Path], *, label: s
     (log or logger).warning("%s%s is group/world-readable (mode 0%o) and contains secrets. Run: chmod 600 %s",
                             f"{label} " if label else "", p.name, stat.S_IMODE(file_mode), p)
     return True
+
+
+def path_spellings(resolved: Path) -> list[Path]:
+    """``resolved`` plus, on macOS, the kernel's own spelling of it when that differs.
+
+    ``Path.resolve()`` / ``realpath`` keep firmlink and volfs aliases that open the same inode
+    (``/System/Volumes/Data/Users/…``, ``/.nofollow/…``, ``/.resolve/1/…``, ``/.vol/<dev>/<ino>``),
+    so a deny check must test both spellings. ``F_GETPATH`` names the deepest existing regular
+    file or directory (never a device or fifo) and the missing tail is re-appended. Deny side
+    only: a hardlinked file's kernel name may be its other link, so never allowlist on it.
+    """
+    if sys.platform != "darwin":
+        return [resolved]
+    import fcntl
+
+    tail: list[str] = []
+    for probe in (resolved, *resolved.parents):
+        with suppress(OSError):
+            mode = os.stat(probe).st_mode
+            if stat.S_ISDIR(mode) or stat.S_ISREG(mode):
+                fd = os.open(probe, os.O_EVTONLY | os.O_NONBLOCK | os.O_CLOEXEC)  # no read access needed
+                try:
+                    real = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0]
+                finally:
+                    os.close(fd)
+                kernel = Path(os.fsdecode(real), *reversed(tail))
+                return [resolved] if kernel == resolved else [resolved, kernel]
+        tail.append(probe.name)
+    return [resolved]
 
 
 class IndentDumper(yaml.SafeDumper):

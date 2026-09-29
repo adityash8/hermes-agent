@@ -19,7 +19,7 @@ import weakref
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
-from utils import normalize_proxy_url
+from utils import normalize_proxy_url, path_spellings
 
 logger = logging.getLogger(__name__)
 
@@ -878,16 +878,19 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     """True if ``resolved`` lives under a deny-listed system path — except a denied prefix that
     IS the running user's own home: ``/root`` is listed so a non-root gateway can't deliver
     another user's home, but a root-run gateway's own deliverables live under ``$HOME=/root``.
-    Credential sub-dirs (``~/.ssh``, ``~/.hermes/.env``) stay blocked (more-specific entries)."""
-    home = _casefold_path(_resolve_path(Path(os.path.expanduser("~"))))
-    resolved = _casefold_path(resolved)
+    Credential sub-dirs (``~/.ssh``, ``~/.hermes/.env``) stay blocked (more-specific entries).
+    Both sides are compared in every :func:`utils.path_spellings` spelling: macOS firmlink /
+    volfs aliases (``/System/Volumes/Data/Users/…``, ``/.vol/<dev>/<ino>``) survive ``resolve()``."""
+    home = _resolve_path(Path(os.path.expanduser("~")))
+    homes = set() if home is None else set(map(_casefold_path, path_spellings(home)))
+    spellings = [_casefold_path(p) for p in path_spellings(resolved)]
     for denied in _media_delivery_denied_paths():
-        resolved_denied = _casefold_path(_resolve_path(denied, expand=True))
+        resolved_denied = _resolve_path(denied, expand=True)
         if resolved_denied is None:
             continue
-        hit = resolved == resolved_denied or _path_is_within(resolved, resolved_denied)
-        if hit and resolved_denied != home:
-            return True
+        for d in map(_casefold_path, path_spellings(resolved_denied)):
+            if d not in homes and any(p == d or _path_is_within(p, d) for p in spellings):
+                return True
     return False
 
 
