@@ -149,7 +149,7 @@ def wire(monkeypatch):
         })
 
     def resolve(provider, **kwargs):
-        assert provider in {"openai", "openrouter"}
+        assert provider in {"openai", "openrouter", "xai-oauth"}
         assert kwargs == {"model": "synthetic-main", "raw_codex": True, "api_mode": "chat_completions"}
         return OpenAI(api_key="synthetic", base_url="https://synthetic.invalid/v1",
                       http_client=httpx.Client(transport=httpx.MockTransport(receive))), "synthetic-main"
@@ -703,7 +703,7 @@ def native_owner(runner, corpus):
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="synthetic"))
     runner.session_store = None
     runner._busy_text_mode = "queue"
-    runner._wire_adapter_handlers(adapter, authorization_check=lambda *a: True)
+    runner._wire_adapter_handlers(adapter, authorization_check=lambda *a, **kw: True)
     adapter._bot_user_id = "bot-synthetic"
     client = AsyncMock()
     client.users_info.return_value = {"ok": True, "user": {"id": "owner-user", "is_bot": False,
@@ -885,7 +885,7 @@ async def test_owner_relay_retains_prompt_and_media_path(native_owner, runner, p
     from gateway.relay.adapter import RelayAdapter
 
     adapter = object.__new__(RelayAdapter)
-    runner._wire_adapter_handlers(adapter, authorization_check=lambda *a: True)
+    runner._wire_adapter_handlers(adapter, authorization_check=lambda *a, **kw: True)
     adapter._seen_inbound = {}
     adapter._capture_scope = adapter._stamp_slack_session_thread = lambda e: None
     adapter._consume_prompt_response = AsyncMock(return_value=prompt)
@@ -906,7 +906,7 @@ async def test_denied_relay_cannot_poison_reply_or_replay_state(runner, corpus, 
     from gateway.relay.adapter import RelayAdapter
 
     adapter = object.__new__(RelayAdapter)
-    runner._wire_adapter_handlers(adapter, authorization_check=lambda *a: True)
+    runner._wire_adapter_handlers(adapter, authorization_check=lambda *a, **kw: True)
     adapter._seen_inbound = {}
     caches = ("_platform_by_chat", "_dm_user_by_chat", "_scope_by_chat",
               "_chat_type_by_chat", "_last_inbound_ts_by_chat")
@@ -941,7 +941,7 @@ async def test_real_relay_ingress_never_downloads_or_resolves_prompts(runner, wi
     from gateway.relay.adapter import RelayAdapter
 
     adapter = object.__new__(RelayAdapter)
-    runner._wire_adapter_handlers(adapter, authorization_check=lambda *a: True)
+    runner._wire_adapter_handlers(adapter, authorization_check=lambda *a, **kw: True)
     adapter._seen_inbound = {}
     adapter._capture_scope = adapter._stamp_slack_session_thread = lambda e: None
     adapter._localize_inbound_media = adapter._consume_prompt_response = forbidden

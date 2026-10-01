@@ -3,8 +3,8 @@
 Channels listed here ALWAYS require an explicit bot @mention, even when
 ``require_mention`` is disabled globally or the channel would otherwise be
 free-response — the opposite direction of ``free_response_channels`` (#13855).
-Wake checks (bot-authored thread, previously mentioned thread, active session)
-still apply, so ongoing conversations are not cut off.
+Historical thread membership cannot authorize a new turn. Live requester
+steering is covered by the native participation ingress tests.
 """
 
 import sys
@@ -86,6 +86,7 @@ def adapter():
     )
     a._bot_user_id = BOT_USER_ID
     a._running = True
+    a.set_authorization_check(lambda user_id, *args, **kwargs: bool(user_id))
     a.handle_message = AsyncMock()
     a._fetch_thread_context = AsyncMock(return_value="")
     a._fetch_thread_parent_text = AsyncMock(return_value="")
@@ -144,8 +145,8 @@ def test_yaml_bridge_sets_env(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_forced_channel_wake_checks_still_apply(adapter):
-    """A previously mentioned thread still auto-follows in a forced channel."""
+async def test_forced_channel_does_not_admit_historical_thread_membership(adapter):
+    """A previous mention cannot override current forced-channel admission."""
     adapter.config.extra["require_mention"] = False
     adapter.config.extra["require_mention_channels"] = CHANNEL_ID
     adapter._mentioned_threads.add("100.000")
@@ -154,6 +155,6 @@ async def test_forced_channel_wake_checks_still_apply(adapter):
         _event("follow-up", ts="101.000", thread_ts="100.000")
     )
 
-    adapter.handle_message.assert_called_once()
+    adapter.handle_message.assert_not_called()
 
 

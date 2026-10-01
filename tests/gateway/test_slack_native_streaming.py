@@ -18,6 +18,8 @@ Behaviour contract:
   * disconnect(): dangling streams sealed.
 """
 
+import asyncio
+
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -226,5 +228,78 @@ class TestDisconnectCleanup:
         adapter._stop_socket_mode_handler = AsyncMock()
         adapter._release_platform_lock = MagicMock()
         await adapter.disconnect()
-        client.chat_stopStream.assert_awaited()
+        client.api_call.assert_awaited_once_with(
+            "chat.stopStream", json={"channel": "D1", "ts": "123.456"})
         assert not adapter._active_streams
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream_kind", ["draft", "task_card"])
+async def test_disconnect_cleans_native_task_stream_without_output_authority(monkeypatch, stream_kind):
+    adapter, _ = _make_adapter()
+    adapter._bot_user_id = "UBOT"
+    adapter._team_bot_user_ids = {"T1": "UBOT"}
+    adapter._authorization_check = lambda *args, **kwargs: True
+    adapter._resolve_user_is_bot = AsyncMock(return_value=False)
+    adapter._resolve_user_name = AsyncMock(return_value="Human")
+    adapter._resolve_channel_name = AsyncMock(return_value="Channel")
+    adapter._hydrate_thread_context = AsyncMock(return_value=(None, [], []))
+    adapter._start_typing_refresh = MagicMock(return_value=None)
+    adapter._stop_socket_mode_handler = AsyncMock()
+    adapter._close_workspace_clients = AsyncMock()
+    adapter._release_platform_lock = MagicMock()
+    requests = []
+
+    async def transport(*, api_url, req_args, **kwargs):
+        requests.append((api_url.rsplit("/", 1)[-1], req_args.get("json")))
+        return {"status_code": 200, "headers": {}, "data": {"ok": True, "ts": "200.000001"}}
+
+    monkeypatch.setattr("slack_sdk.web.async_base_client._request_with_session", transport)
+    client = adapter._new_web_client("fake", None)
+    adapter._team_clients["T1"] = client
+    adapter._get_client = MagicMock(return_value=client)
+    created = asyncio.Event()
+    metadata = {"team_id": "T1", "thread_id": "100.000001", "user_id": "UHUMAN"}
+
+    async def handler(event):
+        if stream_kind == "draft":
+            result = await adapter.send_draft("C1", 7, "Partial", metadata=metadata)
+        else:
+            result = await adapter.send_native_task_card_progress(
+                "C1", [{"id": "work", "title": "Work"}], metadata=metadata)
+        assert result.success
+        created.set()
+
+    adapter.set_message_handler(handler)
+    await adapter._handle_slack_message({
+        "type": "message", "channel": "C1", "team": "T1", "user": "UHUMAN",
+        "client_msg_id": "120.000001", "ts": "120.000001", "thread_ts": "100.000001",
+        "text": "<@UBOT> run the task",
+    })
+    await asyncio.wait_for(created.wait(), 2)
+    await asyncio.gather(*adapter._background_tasks)
+    assert not adapter._session_tasks
+    requests.clear()
+
+    # Shutdown must not acquire permission to append text or stop a foreign stream.
+    key = ("T1", "C1", "100.000001")
+    foreign = {"ts": "foreign", "surface": key}
+    await adapter._cleanup_existing_stream(key, foreign)
+    if stream_kind == "draft":
+        known = adapter._active_streams["C1"]
+        await adapter._cleanup_existing_stream(("T2", "C1", key[2]), known)
+        await adapter._cleanup_existing_stream(key, dict(known))
+        assert not await adapter._seal_stream("C1", known, final_text="Partial leak")
+    else:
+        known = adapter._native_task_card_streams[key]
+        await adapter._cleanup_existing_stream(("T2", "C1", key[2]), known)
+    assert not await adapter._seal_stream(
+        "C1", {"ts": "foreign", "surface": ("T1", "C1", "100.000001")}, final_text="leak")
+    result = await adapter.send("C1", "leak", metadata=metadata)
+    assert not result.success
+    assert requests == []
+
+    await adapter.disconnect()
+    assert requests == [("chat.stopStream", {"channel": "C1", "ts": "200.000001"})]
+    assert not adapter._active_streams
+    assert not adapter._native_task_card_streams

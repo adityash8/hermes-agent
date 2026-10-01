@@ -43,6 +43,7 @@ def _ensure_slack_mock():
 _ensure_slack_mock()
 
 from plugins.platforms.slack.adapter import SlackAdapter
+from tests.gateway.slack_admission_helpers import slack_task
 from gateway.config import PlatformConfig, Platform
 
 
@@ -89,13 +90,15 @@ class TestSlackExecApproval:
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+        adapter.set_authorization_check(lambda user_id, *_, **kwargs: user_id == "U_REQUESTER")
 
-        result = await adapter.send_exec_approval(
-            chat_id="C1",
-            command="rm -rf /important",
-            session_key="agent:main:slack:group:C1:1111",
-            description="dangerous deletion",
-        )
+        with slack_task(adapter, "C1", "U_REQUESTER", "agent:main:slack:group:C1:1111", team_id="T1", thread_id="100.1"):
+            result = await adapter.send_exec_approval(
+                chat_id="C1",
+                command="rm -rf /important",
+                session_key="agent:main:slack:group:C1:1111",
+                description="dangerous deletion", metadata={"thread_id": "100.1"},
+            )
 
         assert result.success is True
         assert result.message_id == "1234.5678"
@@ -126,11 +129,13 @@ class TestSlackExecApproval:
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+        adapter.set_authorization_check(lambda user_id, *_, **kwargs: user_id == "U_REQUESTER")
 
-        await adapter.send_exec_approval(
-            chat_id="C1", command="rm -rf /", session_key="s",
-            allow_permanent=False, smart_denied=True,
-        )
+        with slack_task(adapter, "C1", "U_REQUESTER", "s", team_id="T1", thread_id="100.1"):
+            await adapter.send_exec_approval(
+                chat_id="C1", command="rm -rf /", session_key="s",
+                allow_permanent=False, smart_denied=True, metadata={"thread_id": "100.1"},
+            )
 
         kwargs = mock_client.chat_postMessage.call_args.kwargs
         elements = kwargs["blocks"][1]["elements"]
@@ -149,7 +154,7 @@ class TestSlackApprovalAction:
 
 
     @pytest.mark.asyncio
-    async def test_truncates_inflated_original_text(self):
+    async def test_truncates_inflated_original_text(self, monkeypatch):
         """Interaction payload re-escapes HTML entities; text must be capped."""
         adapter = _make_adapter()
         _attach_auth_runner(adapter)
@@ -172,8 +177,19 @@ class TestSlackApprovalAction:
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_update = AsyncMock()
 
-        with patch("tools.approval.resolve_gateway_approval", return_value=1):
-            await adapter._handle_approval_action(ack, body, action)
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+
+        entry = _ApprovalEntry({"request_id": "approval-1"})
+        monkeypatch.setitem(approval._gateway_queues, "session-key", [entry])
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1.2"})
+        with slack_task(adapter, "C1", "U_ALICE", "session-key", team_id="T1", thread_id="100.1"):
+            assert (await adapter.send_exec_approval(
+                "C1", "echo test", "session-key",
+                metadata={"thread_id": "100.1", "approval_request_id": "approval-1"})).success
+        body["team"] = {"id": "T1"}
+        await adapter._handle_approval_action(ack, body, action)
+        assert entry.event.is_set() and entry.result == "once"
 
         update_kwargs = mock_client.chat_update.call_args[1]
         section_text = update_kwargs["blocks"][0]["text"]["text"]
@@ -186,7 +202,7 @@ class TestSlackApprovalAction:
         monkeypatch.delenv("SLACK_ALLOWED_USERS", raising=False)
         monkeypatch.delenv("SLACK_ALLOW_ALL_USERS", raising=False)
         monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
-        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_OWNER")
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_ATTACKER")
 
         ack = AsyncMock()
         body = {
@@ -199,8 +215,25 @@ class TestSlackApprovalAction:
             "value": "agent:main:slack:group:C1:1111",
         }
 
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+
+        session_key = action["value"]
+        entry = _ApprovalEntry({"request_id": "revoked-user-approval"})
+        monkeypatch.setitem(approval._gateway_queues, session_key, [entry])
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+        # Preserve an actual prompt, as when its requester loses authorization.
+        with slack_task(adapter, "C1", "U_ATTACKER", session_key, team_id="T1", thread_id="100.1"):
+            assert (await adapter.send_exec_approval(
+                "C1", "echo test", session_key,
+                metadata={"thread_id": "100.1", "approval_request_id": "revoked-user-approval"})).success
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_OWNER")
+        body["team"] = {"id": "T1"}
         with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
             await adapter._handle_approval_action(ack, body, action)
+        assert not entry.event.is_set()
+        client.chat_update.assert_not_awaited()
 
         ack.assert_called_once()
         mock_resolve.assert_not_called()
@@ -258,8 +291,18 @@ class TestSlackSlashConfirmAction:
         mock_client.chat_update = AsyncMock()
         mock_client.chat_postMessage = AsyncMock()
 
-        with patch("tools.slash_confirm.resolve", new=AsyncMock(return_value="ok")):
-            await adapter._handle_slash_confirm_action(ack, body, action)
+        from tools import slash_confirm
+
+        session_key = "agent:main:slack:group:C1:1111"
+        handler = AsyncMock(return_value="ok")
+        slash_confirm.register(session_key, "confirm-1", "/reset", handler)
+        mock_client.chat_postMessage.return_value = {"ts": "2222.3333"}
+        with slack_task(adapter, "C1", "U_OWNER", session_key, team_id="T1", thread_id="100.1"):
+            assert (await adapter.send_slash_confirm(
+                "C1", "Confirm", "Reset?", session_key, "confirm-1", metadata={"thread_id": "100.1"})).success
+        body["team"] = {"id": "T1"}
+        await adapter._handle_slash_confirm_action(ack, body, action)
+        handler.assert_awaited_once()
 
         update_kwargs = mock_client.chat_update.call_args[1]
         section_text = update_kwargs["blocks"][0]["text"]["text"]

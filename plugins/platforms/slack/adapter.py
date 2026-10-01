@@ -42,13 +42,15 @@ from gateway.platforms.base import (
     cache_document_from_bytes_async, cache_video_from_bytes_async)
 
 try:  # sibling module; support both package and flat plugin-dir import
-    from .deletion import SlackDeletionMixin, deletion_guard
+    from .deletion import deletion_guard
+    from .participation import SlackParticipationMixin, participation_interaction, fenced_slack_client
     from .block_kit import render_blocks, sanitize_blocks
-    from .client_context import admit_event, dispatch_scoped, interaction_is_legacy
+    from .client_context import admit_event, dispatch_scoped, interaction_is_legacy, send_codewords
 except ImportError:  # pragma: no cover - plugin loaded outside package context
-    from deletion import SlackDeletionMixin, deletion_guard  # ty: ignore[unresolved-import]
+    from deletion import deletion_guard  # ty: ignore[unresolved-import]
+    from participation import SlackParticipationMixin, participation_interaction, fenced_slack_client  # ty: ignore[unresolved-import]
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
-    from client_context import admit_event, dispatch_scoped, interaction_is_legacy  # ty: ignore[unresolved-import]
+    from client_context import admit_event, dispatch_scoped, interaction_is_legacy, send_codewords  # ty: ignore[unresolved-import]
 
 
 logger = logging.getLogger(__name__)
@@ -835,7 +837,7 @@ def _extra_or_env_channel_set_getter(
     return getter
 
 
-class SlackAdapter(SlackDeletionMixin):
+class SlackAdapter(SlackParticipationMixin):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
@@ -1494,10 +1496,7 @@ class SlackAdapter(SlackDeletionMixin):
 
         @self._app.command(_slash_pattern)
         async def handle_hermes_command(ack, command):
-            slash = (command.get("command") or "").lstrip("/")
-            if slash == "hermes":
-                slash = "jarvis"
-            await ack(response_type="ephemeral", text=f"Running `/{slash}`…")
+            await ack()
             await self._handle_slash_command(command)
 
         # Approval buttons, slash-confirm buttons (tools/slash_confirm.py), feedback.
@@ -1552,9 +1551,11 @@ class SlackAdapter(SlackDeletionMixin):
         if _plugin_handlers:
             logger.info("[Slack] Wired %d plugin action handler(s)", len(_plugin_handlers))
 
-    @staticmethod
-    def _new_web_client(token: str, proxy_url: Optional[str]) -> Any:
-        client = AsyncWebClient(token=token, user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX)
+    def _new_web_client(self, token: str, proxy_url: Optional[str]) -> Any:
+        client = fenced_slack_client(
+            AsyncWebClient, self._check_deletion_scope, token=token,
+            user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX, retry_handlers=[])
+        # SDK-internal retries cannot recheck revocation. Adapter retries re-enter the fence.
         _apply_slack_proxy(client, proxy_url)
         return client
 
@@ -1568,6 +1569,9 @@ class SlackAdapter(SlackDeletionMixin):
         bot_name = auth_response.get("user", "unknown")
         team_name = auth_response.get("team", "unknown")
         self._team_clients[team_id] = client
+        # Bolt retains a separate primary client for the same verified token.
+        if self._app is not None and getattr(self._app.client, "token", None) == token:
+            self._app.client._slack_authenticated_team_id = team_id
         self._team_bot_user_ids[team_id] = bot_user_id
         self._team_bot_names[team_id] = bot_name
         if self._bot_user_id is None:
@@ -1721,14 +1725,17 @@ class SlackAdapter(SlackDeletionMixin):
         self._running = False
         # Seal dangling native streams so no live-typing indicator survives a restart.
         for chat_id, stream in list(self._active_streams.items()):
-            await self._seal_stream(chat_id, stream)
+            await self._cleanup_existing_stream(stream.get("surface"), stream)
         self._active_streams.clear()
         # A watchdog that lost the cancel race must not block cleanup/lock release.
         await self._cancel_socket_watchdog("[Slack] Watchdog task raised during disconnect")
         # Finalize native streams while workspace clients are still live —
         # shutdown safety net for cancellation/reconnect races.
         for key, stream in list(self._native_task_card_streams.items()):
-            await self._stop_native_task_card_stream(key, stream)
+            async with stream.lock:
+                await self._cleanup_existing_stream(key, stream)
+                stream.stopped = True
+                self._native_task_card_streams.pop(key, None)
         await self._stop_socket_mode_handler()
         await self._close_workspace_clients()
         self._app = self._app_token = self._proxy_url = self._bot_user_id = None
@@ -1736,6 +1743,31 @@ class SlackAdapter(SlackDeletionMixin):
         self._channel_team, self._dm_conversation_cache = {}, {}
         self._release_platform_lock()
         logger.info("[Slack] Disconnected")
+
+    async def _cleanup_existing_stream(self, key, stream) -> None:
+        """End only a registered stream, without granting any content-write authority."""
+        if not key:
+            return
+        if isinstance(stream, dict):
+            known = (self._active_streams.get(key[1]) is stream
+                     and stream.get("surface") == key)
+            stream_ts = stream.get("ts")
+        else:
+            known = (self._native_task_card_streams.get(key) is stream
+                     and not stream.stopped
+                     and key == (stream.team_id, stream.channel, stream.thread_ts))
+            stream_ts = stream.stream_ts
+        if not known or not stream_ts:
+            return
+        try:
+            client = self._get_client(key[1], team_id=key[0])
+            api_call = client.api_call
+            # Bypass participation only for this fixed, content-free cleanup call.
+            # No ContextVar exemption can escape into callbacks or sibling tasks.
+            cleanup_call = vars(api_call).get("_slack_unfenced_method", api_call)
+            await cleanup_call("chat.stopStream", json={"channel": key[1], "ts": stream_ts})
+        except Exception:
+            self._trace_participation(key, stream_ts, "cleanup_failed", "deny")
 
     @staticmethod
     def _metadata_team_id(metadata: Optional[Dict[str, Any]]) -> str:
@@ -1768,6 +1800,30 @@ class SlackAdapter(SlackDeletionMixin):
         return (str(team_id), str(message_id)) if team_id else str(message_id)
 
     def scope_id_for_chat(self, chat_id: str) -> Optional[str]:
+        """Grant from gateway.restricted_users, else the platform default.
+
+        An empty grant means this sender gets no tools. None means unrestricted.
+        """
+        from gateway.run import _load_gateway_config
+        from plugins.platforms.slack.restricted_grant import grant_toolsets
+
+        source_user = getattr(getattr(self, "_toolset_source", None), "user_id", None)
+        # toolsets_for_source is the real seam; this helper is not used.
+        return None
+
+    def toolsets_for_source(self, source):
+        from gateway.run import _load_gateway_config
+        from plugins.platforms.slack.restricted_grant import grant_toolsets
+
+        user_id = getattr(source, "user_id", None)
+        chat_id = getattr(source, "chat_id", None)
+        try:
+            config = _load_gateway_config()
+        except Exception:
+            return None
+        granted = grant_toolsets(config, user_id, chat_id)
+        return granted
+
         """Return the workspace id owning ``chat_id``.
         ``None`` for unknown channels and for channels claimed by several workspaces (dropped from
         the map) — no scope beats a wrong one."""
@@ -2007,6 +2063,12 @@ class SlackAdapter(SlackDeletionMixin):
         blocked = self._outbound_blocked(chat_id, "outbound generic send to")
         if blocked:
             return blocked
+        if hasattr(content, "_restricted_validate"):
+            from gateway.client_context_restricted import send
+            return await send(self, chat_id, content, reply_to, metadata)
+        if (self._codewords_surface((self._metadata_team_id(metadata), chat_id, ""))
+                or hasattr(content, "_codewords_validate") or hasattr(content, "_text_only_validate")):
+            return await send_codewords(self, chat_id, content, reply_to, metadata)
         chat_id = await self._dm_target(chat_id, metadata)
         thread_ts = None
         try:
@@ -2929,8 +2991,9 @@ class SlackAdapter(SlackDeletionMixin):
             return False
         try:
             client = self._get_client(channel, team_id=team_id or None)
-            method = client.reactions_remove if remove else client.reactions_add
-            await method(channel=channel, timestamp=timestamp, name=emoji)
+            method = "reactions_remove" if remove else "reactions_add"
+            await self._deletion_call(
+                client, method, team_id=team_id, channel=channel, timestamp=timestamp, name=emoji)
             return True
         except Exception as e:
             logger.debug(
@@ -2960,6 +3023,12 @@ class SlackAdapter(SlackDeletionMixin):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
+        try:
+            from .codewords_ux import processing_start
+        except ImportError:
+            from codewords_ux import processing_start  # ty: ignore[unresolved-import]
+        if await processing_start(self, event):
+            return
         target = self._reacting_target(event)
         if target is None:
             return
@@ -2970,6 +3039,12 @@ class SlackAdapter(SlackDeletionMixin):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction."""
+        try:
+            from .codewords_ux import processing_complete
+        except ImportError:
+            from codewords_ux import processing_complete  # ty: ignore[unresolved-import]
+        if await processing_complete(self, event, outcome):
+            return
         target = self._reacting_target(event)
         if target is None:
             return
@@ -3796,48 +3871,10 @@ class SlackAdapter(SlackDeletionMixin):
     async def _should_wake_on_unmentioned_message(
         self, event_thread_ts, channel_id: str, user_id: str, is_thread_reply: bool,
         team_id: str = "", chat_type: str = "group") -> bool:
-        """Return True if the bot should wake on an un-mentioned message. Checks, in order: root
-        sent via send() (_bot_message_ts); thread previously @-mentioned; active session;
-        bot-authored root via raw chat.postMessage; thread parent @-mentioned the bot.
-
-        1. 2. _mentioned_threads        (someone @-mentioned us earlier) 3. _has_active_session... (there's
-        already an agent session) 4. _bot_authored_thread_root (#63530: the bot posted the thread root via
-        direct chat.postMessage, outside the gateway send() path — derived from the Slack API, so it also
-        survives restarts).
-        """
-        if not event_thread_ts:
-            return False
-        thread_marker = self._workspace_message_marker(team_id, event_thread_ts)
-        # Check scoped marker AND bare ts: entries recorded before team_id was
-        # known are bare, and a scoped-vs-bare mismatch must not silence the bot.
-        if is_thread_reply and (
-            thread_marker in self._bot_message_ts or event_thread_ts in self._bot_message_ts):
-            return True
-        if thread_marker in self._mentioned_threads or event_thread_ts in self._mentioned_threads:
-            return True
-        if is_thread_reply and self._has_active_session_for_thread(
-            channel_id=channel_id, thread_ts=event_thread_ts, user_id=user_id, team_id=team_id,
-            chat_type=chat_type):
-            return True
-        if is_thread_reply and await self._bot_authored_thread_root(
-            channel_id=channel_id, thread_ts=event_thread_ts, team_id=team_id):
-            return True
-        # Thread PARENT @-mentioned the bot before this process (restart): a bare "run" is for us.
-        # 5th check (#24848): the thread PARENT @-mentioned the bot, but the mention event predates this
-        # process (restart) or the parent asked the bot to wait for a follow-up (e.g. A plain reply like
-        # "run" in that thread is addressed to the bot even though the reply itself carries no mention.
-        if is_thread_reply:
-            bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
-            if bot_uid:
-                parent_text = await self._fetch_thread_parent_text(
-                    channel_id=channel_id, thread_ts=event_thread_ts, team_id=team_id,
-                    strip_bot_mention=False)
-                if parent_text and f"<@{bot_uid}>" in parent_text:
-                    # Remember so later replies skip the fetch.
-                    if not self._slack_strict_mention():
-                        self._register_mentioned_thread(event_thread_ts)
-                    return True
-        return False
+        """Only the requester of a live task may continue without a new mention."""
+        key = (team_id or "", channel_id, str(event_thread_ts or ""))
+        owner = self._requester_task(key, user_id)
+        return owner is not None
 
     @staticmethod
     def _append_block_text(text: str, blocks: list, bot_uid: str) -> str:
@@ -3860,10 +3897,12 @@ class SlackAdapter(SlackDeletionMixin):
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         return getattr(runner, "_is_user_authorized", None)
 
-    def _early_reject_unauthorized(self, user_id: str, channel_id: str, is_dm: bool) -> bool:
+    def _early_reject_unauthorized(self, user_id: str, channel_id: str, is_dm: bool, *, source=None) -> bool:
         """True (logged) when the sender is definitively unauthorized. Injected profile-bound check
         first (works under multiplex, where the handler has no ``__self__``), then runner
         introspection. Unknown (None) is NOT a rejection."""
+        if source is not None:
+            return not self._is_interactive_user_authorized(user_id, source=source)
         chat_type = "dm" if is_dm else "group"
         decision = (
             self._is_sender_authorized(user_id, chat_type, channel_id)
@@ -3883,46 +3922,30 @@ class SlackAdapter(SlackDeletionMixin):
     async def _channel_gate_allows(
         self, *, channel_id: str, routing_text: str, bot_uid: str, is_mentioned: bool,
         is_thread_reply: bool, event_thread_ts, user_id: str, team_id: str, is_dm: bool,
-        force_process: bool, allow_thread_lookup: bool = True) -> bool:
-        """Channel/MPIM gate: respond in a free-response channel (still gated by
-        ``thread_require_mention``), when @mentioned, or when a wake check passes. Always silent
-        outside ``allowed_channels`` or when addressed to another user; ``force_process`` skips only
-        the mention rule."""
+        force_process: bool, allow_thread_lookup: bool = True, source=None) -> bool:
+        """Native addressing plus real task ownership; channel history is never a grant."""
         allowed_channels = self._slack_allowed_channels()
         if allowed_channels and channel_id not in allowed_channels:
-            logger.debug("[Slack] Ignoring message in non-allowed channel: %s", channel_id)
+            return False
+        if not self._is_interactive_user_authorized(
+                user_id, channel_id=channel_id, team_id=team_id,
+                thread_id=event_thread_ts, source=source):
             return False
         self_uids = {u for u in (bot_uid, self._bot_user_id) if u}
-        if (
-            self._slack_ignore_other_user_mentions() and not is_mentioned
-            and not self._slack_message_mentions_self(routing_text, self_uids)
-            and self._slack_message_addressed_to_other_user(routing_text, self_uids)):
-            logger.debug(
-                "[Slack] Ignoring message addressed to another user in channel %s", channel_id)
+        direct = bool((bot_uid and f"<@{bot_uid}>" in routing_text)
+                      or self._slack_message_matches_mention_patterns(routing_text))
+        if not direct and self._slack_message_addressed_to_other_user(routing_text, self_uids):
             return False
-        thread_gated = self._slack_thread_require_mention() and is_thread_reply and not is_mentioned
-        if force_process:
+        if force_process or direct or self._free_response_admission(channel_id, is_thread_reply):
             return True
-        free_channel = channel_id not in self._slack_require_mention_channels() and (
-            channel_id in self._slack_free_response_channels() or not self._slack_require_mention())
-        if not free_channel and self._slack_strict_mention() and not is_mentioned:
-            return False  # Strict mode: ignore until @-mentioned again
-        if thread_gated:
-            logger.debug(
-                "[Slack] Ignoring thread reply without mention "
-                "(thread_require_mention=true): channel=%s thread_ts=%s", channel_id,
-                event_thread_ts)
+        if allow_thread_lookup and self._has_pending_requester_reply(
+                (team_id or "", channel_id, str(event_thread_ts or "")), user_id):
+            return True
+        if (not allow_thread_lookup or self._slack_strict_mention()
+                or (is_thread_reply and self._slack_thread_require_mention())):
             return False
-        if free_channel:
-            return True
-        if not is_mentioned:
-            if not allow_thread_lookup:
-                return False
-            return await self._should_wake_on_unmentioned_message(
-                event_thread_ts=event_thread_ts, channel_id=channel_id, user_id=user_id,
-                team_id=team_id, is_thread_reply=is_thread_reply,
-                chat_type="dm" if is_dm else "group")
-        return True
+        return await self._should_wake_on_unmentioned_message(
+            event_thread_ts, channel_id, user_id, is_thread_reply, team_id)
 
     def _normalize_changed_message(self, event: dict) -> Optional[dict]:
         """Turn a ``message_changed`` envelope into a plain message event.
@@ -4198,6 +4221,9 @@ class SlackAdapter(SlackDeletionMixin):
         if self._is_ignored_channel(channel_id):
             logger.info("[Slack] Ignoring message in configured ignored channel %s", channel_id)
             return None
+        if not await self._response_needed(
+                event, dedup_team_id, channel_id, _slack_mention_detection_text(event)):
+            return None
         if await self._drop_bot_sender(event):
             return None
         return event, dedup_team_id, channel_id
@@ -4299,29 +4325,32 @@ class SlackAdapter(SlackDeletionMixin):
         is_one_to_one_dm = channel_type == "im"
         # Reject unauthorized users before the expensive lookups/downloads;
         # the runner's own auth check only runs after MessageEvent is built.
-        if self._early_reject_unauthorized(user_id, channel_id, is_dm):
-            return
         thread_ts = self._session_thread_ts(event, ts, is_dm, assistant_meta)
+        authorization_source = self.build_source(
+            chat_id=channel_id, chat_type="dm" if is_dm else "group", user_id=user_id,
+            thread_id=thread_ts, scope_id=team_id or None,
+            is_bot=self._event_declares_bot_sender(event))
+        if not self._is_interactive_user_authorized(user_id, source=authorization_source):
+            return
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
         # Mentions may live only in Block Kit blocks.
         # See #52387.
         routing_text = _slack_mention_detection_text(event) or original_text or ""
-        is_mentioned = bool(
-            (bot_uid and f"<@{bot_uid}>" in routing_text)
-            or self._slack_message_matches_mention_patterns(routing_text))
+        routing_text = self._participation_text(routing_text)
+        is_mentioned = bool(bot_uid and f"<@{bot_uid}>" in routing_text)
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
         # Internal triggers (reactions) skip the mention requirement but NOT
         # allowed_channels or user authorization.
-        force_process = bool(event.get("_hermes_force_process"))
+        force_process = event.get("_hermes_force_process") is True
         if await self._peer_bot_drop(event, user_id, bot_uid, channel_id, team_id, is_mentioned):
             return
         if (
-            not is_one_to_one_dm and bot_uid and not await self._channel_gate_allows(
+            not is_one_to_one_dm and not await self._channel_gate_allows(
             channel_id=channel_id, routing_text=routing_text, bot_uid=bot_uid,
             is_mentioned=is_mentioned, is_thread_reply=is_thread_reply,
             event_thread_ts=event_thread_ts, user_id=user_id, team_id=team_id, is_dm=is_dm,
-            force_process=force_process)):
+            force_process=force_process, source=authorization_source)):
             return
         deletion_key = self._deletion_key(channel_id, thread_ts, {"team_id": team_id})
         if not await self._deletion_accept_summon(
@@ -4370,6 +4399,11 @@ class SlackAdapter(SlackDeletionMixin):
         if (self._deletion_record(deletion_key).get("muted")
                 or self._deletion_generation(deletion_key) != deletion_generation):
             return
+        msg_event.metadata["_slack_native_ingress"] = True
+        msg_event.metadata["_slack_direct_request"] = bool(
+            force_process or (bot_uid and f"<@{bot_uid}>" in routing_text)
+            or self._slack_message_matches_mention_patterns(routing_text)
+            or self._free_response_admission(channel_id, is_thread_reply))
         await self.handle_message(msg_event)
 
     async def _build_message_event(
@@ -4602,7 +4636,8 @@ class SlackAdapter(SlackDeletionMixin):
         self, chat_id: str, metadata: Optional[Dict[str, Any]],
         build: Callable[[], Tuple[str, list]], label: str, *,
         resolved: Optional[Dict[Any, bool]] = None, resolved_max: int = 0,
-        team_scoped_key: bool = True, sanitize: bool = True) -> SendResult:
+        team_scoped_key: bool = True, sanitize: bool = True,
+        clarify_id: Optional[str] = None, confirm_id: Optional[str] = None) -> SendResult:
         """Shared body of the Block Kit prompt senders: DM-resolve, ``build()`` -> ``(fallback
         text, blocks)``, post, then mark the message unresolved in ``resolved`` (double-click
         guard). Any failure is logged as ``<label> failed`` and returned, never raised."""
@@ -4614,6 +4649,9 @@ class SlackAdapter(SlackDeletionMixin):
             result = await self._post_interactive_blocks(
                 chat_id, text, blocks, metadata, sanitize=sanitize, team_scoped=team_scoped_key)
             msg_ts = result.get("ts", "")
+            if msg_ts:
+                self._remember_prompt_participation(
+                    chat_id, msg_ts, metadata, clarify_id=clarify_id, confirm_id=confirm_id)
             if msg_ts and resolved is not None:
                 key = msg_ts
                 if team_scoped_key:
@@ -4685,7 +4723,8 @@ class SlackAdapter(SlackDeletionMixin):
                         self._button("Cancel", "hermes_confirm_cancel", value, style="danger")]}]
             return f"{title or 'Confirm'}: {body[:100]}", blocks
 
-        return await self._send_interactive_prompt(chat_id, metadata, _build, "send_slash_confirm")
+        return await self._send_interactive_prompt(
+            chat_id, metadata, _build, "send_slash_confirm", confirm_id=confirm_id)
 
     async def send_clarify(
         self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
@@ -4694,9 +4733,13 @@ class SlackAdapter(SlackDeletionMixin):
         (value ``clarify_id|idx``) plus "✏️ Other…" (``hermes_clarify_other``), which flips the
         entry into text-capture mode for the gateway's text-intercept. No choices → base impl."""
         if not choices:
-            return await super().send_clarify(
+            result = await super().send_clarify(
                 chat_id=chat_id, question=question, choices=choices, clarify_id=clarify_id,
                 session_key=session_key, metadata=metadata)
+            if result.success and result.message_id:
+                self._remember_prompt_participation(
+                    chat_id, result.message_id, metadata, clarify_id=clarify_id)
+            return result
 
         def _build() -> Tuple[str, list]:
             # Escape mrkdwn control chars so the question renders literally;
@@ -4728,16 +4771,27 @@ class SlackAdapter(SlackDeletionMixin):
         return await self._send_interactive_prompt(
             chat_id, metadata, _build, "send_clarify",
             resolved=self._clarify_resolved, resolved_max=self._CLARIFY_RESOLVED_MAX,
-            team_scoped_key=False, sanitize=False)
+            team_scoped_key=False, sanitize=False, clarify_id=clarify_id)
 
     def _is_interactive_user_authorized(
         self, user_id: str, *, channel_id: str = "", user_name: Optional[str] = None,
-        team_id: str = "") -> bool:
-        """Return whether a Slack interactive caller may perform gated actions."""
-        normalized_user_id = str(user_id or "").strip()
-        if not normalized_user_id:
+        team_id: str = "", thread_id: Optional[str] = None, source=None) -> bool:
+        """Reauthorize the original Slack source, including thread routing and bot identity."""
+        source = source or self.build_source(
+            chat_id=channel_id, chat_type="dm" if str(channel_id or "").startswith("D") else "group",
+            user_id=user_id, user_name=user_name, scope_id=team_id or None, thread_id=thread_id)
+        isolated = getattr(self, "_client_context_codewords", None)
+        if (isolated is not None and isolated(source) is True
+                or hasattr(source, "_codewords_native_identity") or hasattr(source, "_codewords_policy")
+                or hasattr(source, "_text_only_native_identity") or hasattr(source, "_text_only_policy")):
+            # This native receipt grants only the isolated task. Administrators
+            # without one cannot revive an old unrestricted target-channel task.
+            authorize = getattr(self, "_client_context_codewords_authorized", None)
+            return authorize is not None and authorize(source) is True
+        normalized_user_id = str(source.user_id or "").strip()
+        if not normalized_user_id and not source.is_bot:
             return False
-        chat_type = "dm" if str(channel_id or "").startswith("D") else "group"
+        channel_id, team_id, chat_type = source.chat_id, source.scope_id or "", source.chat_type
         # Preferred: the injected profile-bound check (``set_authorization_check``); unlike the
         # ``__self__`` introspection below it works under multiplex (handler is a closure).
         # getattr: object.__new__ test doubles never ran BasePlatformAdapter.__init__.
@@ -4746,27 +4800,34 @@ class SlackAdapter(SlackDeletionMixin):
         # the ``__self__`` introspection below it also resolves on a multiplexed adapter, whose message
         # handler is a profile closure with no ``__self__`` (#72657, same class as Telegram's #86296).
         if getattr(self, "_authorization_check", None) is not None:
-            injected = self._is_sender_authorized(
-                normalized_user_id, chat_type, str(channel_id or ""))
-            if injected is not None:
-                return injected
+            try:
+                callback = self._authorization_check
+                parameters = inspect.signature(callback).parameters
+                if "source" in parameters:
+                    return callback(source.user_id, chat_type, channel_id, source=source) is True
+                extra = {}
+                if source.thread_id is not None:
+                    extra["thread_id"] = source.thread_id
+                if source.is_bot:
+                    extra["is_bot"] = True
+                return callback(source.user_id, chat_type, channel_id, **extra) is True
+            except Exception:
+                self._trace_participation(
+                    (team_id, channel_id, source.thread_id or ""), "", "authorization_failed", "deny")
+                return False
         auth_fn = self._runner_auth_fn()
         if callable(auth_fn):
             try:
-                from gateway.session import SessionSource
-                source = SessionSource(
-                    platform=Platform.SLACK, chat_id=str(channel_id or normalized_user_id),
-                    chat_type=chat_type, user_id=normalized_user_id,
-                    user_name=str(user_name).strip() if user_name else None,
-                    scope_id=str(team_id) if team_id else None)
                 return bool(auth_fn(source))
             except Exception:
-                logger.debug(
-                    "[Slack] Falling back to env-only interactive auth for user %s",
-                    normalized_user_id, exc_info=True)
+                self._trace_participation(
+                    (team_id, channel_id, ""), "", "authorization_failed", "deny")
+                return False
         # Env-only fallback. Per-profile accessor: under multiplex a scoped miss
         # returns "" rather than leaking the DEFAULT profile's os.environ allowlist.
         from gateway.authz_mixin import _platform_gate_env as _env
+        if source.is_bot:
+            return _env("SLACK_ALLOW_BOTS").lower().strip() in {"mentions", "all"}
         if _env("SLACK_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}:
             return True
         allowed_ids = {
@@ -4795,7 +4856,13 @@ class SlackAdapter(SlackDeletionMixin):
         Returns ``(team_id, action_id, value, message, msg_ts, channel_id, user_name, user_id)`` or
         None (logged) when the user is not authorized."""
         await ack()
-        if not await interaction_is_legacy(self, body):
+        try:
+            from .participation import _participation_scope
+        except ImportError:
+            from participation import _participation_scope
+        grant = _participation_scope.get()
+        source = self._grant_source(grant) if grant is not None and grant.adapter is self else None
+        if not await interaction_is_legacy(self, body, original_source=source):
             return None
         team_id = self._event_team_id({}, body)
         action_id, value, message, msg_ts, channel_id, user_name, user_id = (
@@ -4803,6 +4870,10 @@ class SlackAdapter(SlackDeletionMixin):
         auth_kwargs: Dict[str, Any] = {"channel_id": channel_id, "user_name": user_name}
         if team_scoped:
             auth_kwargs["team_id"] = team_id
+        if source is not None:
+            auth_kwargs["source"] = source
+        else:
+            auth_kwargs["thread_id"] = message.get("thread_ts")
         if not self._is_interactive_user_authorized(user_id, **auth_kwargs):
             logger.warning(
                 "[Slack] Unauthorized %s click by %s (%s) - ignoring", kind, user_name, user_id)
@@ -4849,6 +4920,7 @@ class SlackAdapter(SlackDeletionMixin):
         "once": "✅ Approved once by {user}", "always": "🔒 Always approved by {user}",
         "cancel": "❌ Cancelled by {user}"}
 
+    @participation_interaction("slash-confirm")
     async def _handle_slash_confirm_action(self, ack, body, action) -> None:
         """Handle a slash-confirm button click from Block Kit."""
         started = await self._begin_interaction(ack, body, action, "slash-confirm")
@@ -4893,6 +4965,7 @@ class SlackAdapter(SlackDeletionMixin):
             "[Slack] Feedback button clicked: value=%s user=%s channel=%s ts=%s", value, user_id,
             channel_id, message.get("ts", ""))
 
+    @participation_interaction("approval")
     async def _handle_approval_action(self, ack, body, action) -> None:
         """Handle an approval button click from Block Kit."""
         started = await self._begin_interaction(ack, body, action, "approval")
@@ -4911,7 +4984,9 @@ class SlackAdapter(SlackDeletionMixin):
         # timeout (count == 0) shows "expired", not "approved".
         try:
             from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(session_key, choice)
+            request_id = self._interaction_approval_id()
+            count = resolve_gateway_approval(
+                session_key, choice, **({"request_id": request_id} if request_id else {}))
             logger.info(
                 "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)", count,
                 session_key, choice, user_name)
@@ -4934,6 +5009,7 @@ class SlackAdapter(SlackDeletionMixin):
             channel_id, msg_ts, question_text, decision_text, "Clarification", "clarify", sanitize=False
         )
 
+    @participation_interaction("clarify")
     async def _handle_clarify_action(self, ack, body, action) -> None:
         """Handle a clarify button click (a choice or "Other") from Block Kit."""
         started = await self._begin_interaction(ack, body, action, "clarify", team_scoped=False)
@@ -5300,6 +5376,8 @@ class SlackAdapter(SlackDeletionMixin):
         user_id = command.get("user_id", "")
         channel_id = command.get("channel_id", "")
         team_id = command.get("team_id", "")
+        if self._codewords_surface((team_id, channel_id, "")):
+            return
         if team_id and channel_id:
             self._remember_channel_team(channel_id, team_id)
         text = self._slash_command_text(command)
@@ -5326,6 +5404,8 @@ class SlackAdapter(SlackDeletionMixin):
         # concurrent slashes from multiple users.
         _slash_user_id_token = _slash_user_id.set(user_id or None)
         try:
+            event.metadata["_slack_native_ingress"] = True
+            event.metadata["_slack_direct_request"] = True
             await self.handle_message(event)
         finally:
             _slash_user_id.reset(_slash_user_id_token)

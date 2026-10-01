@@ -110,12 +110,16 @@ class TestTokenHubEffortVocabulary:
 
 class TestCodexUltraForEveryModel:
     def test_ultra_never_leaks_and_respects_per_model_ceiling(self):
-        """'ultra' must never reach the Codex wire. Live-verified vocabulary
-        (#68365): gpt-5.6 accepts max (its ceiling), gpt-5.5/o5 do not —
-        their ceiling is xhigh."""
+        """``ultra`` never reaches Codex. Max is live-proven for gpt-5.6 and
+        the explicit gpt-6 Astra/Sol/Luna names; legacy and unknown models cap
+        at xhigh."""
         transport = get_transport("codex_responses")
         expected = {
             "gpt-5.6-codex": "max",
+            "gpt-6-luna": "max",
+            "gpt-6-astra": "max",
+            "gpt-6-sol": "max",
+            "gpt-6-unverified": "xhigh",
             "o5-pro": "xhigh",
             "gpt-5.5": "xhigh",
             "some-responses-model": "xhigh",

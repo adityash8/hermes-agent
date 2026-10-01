@@ -9,6 +9,7 @@ import html
 import json
 import re
 import sys
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from gateway.client_context_policy import (
@@ -43,20 +44,38 @@ SYSTEM = (
 class ScopedReply(str):
     """Server-owned text-only delivery marker, never supplied by a peer."""
 
+    _codewords_validate: Callable[[], None] | None = None
+
 
 def applies(config, source) -> bool:
+    from gateway.client_context_restricted import selected as restricted
+    if restricted(source):
+        return True
     if getattr(source.platform, "value", source.platform) != "slack":
         return False
+    if not hasattr(source, "chat_id"):
+        return True  # Native Slack admission must protect the restricted sender even when revoked.
     # GatewayConfig stores explicit fields in __dict__. Do not synthesize a setting
     # through a dynamic attribute proxy used by callers/tests.
     value = vars(config).get("client_context", {"enabled": False}) if config is not None else {"enabled": False}
-    return not (isinstance(value, dict) and set(value) == {"enabled"} and value["enabled"] is False)
+    from gateway.client_context_codewords import CONFIG_KEYS, selected
+    bounded = isinstance(value, dict) and bool(CONFIG_KEYS.intersection(value))
+    legacy = {k: v for k, v in value.items() if k not in CONFIG_KEYS} if isinstance(value, dict) else value
+    legacy_on = not (isinstance(legacy, dict) and set(legacy) == {"enabled"} and legacy["enabled"] is False)
+    if bounded and value.get("enabled") is not True:
+        legacy_on = False  # Malformed new opt-in cannot activate the global registry gate.
+    return legacy_on or selected(config, source) or (bounded and not hasattr(source, "chat_id"))
 
 
 def configured(config) -> Options:
     # Multiplex profile credentials/config need their own activation proof; deny this MVP there.
     require(not getattr(config, "multiplex_profiles", False))
-    opts = options(getattr(config, "client_context", None))
+    value = getattr(config, "client_context", None)
+    if isinstance(value, dict):
+        from gateway.client_context_codewords import CONFIG_KEYS
+
+        value = {k: v for k, v in value.items() if k not in CONFIG_KEYS}
+    opts = options(value)
     require(opts is not None)
     return opts  # type: ignore[return-value]
 
@@ -69,9 +88,26 @@ def route_options(config, source) -> Options | None:
 
 async def admission(runner, source) -> str:
     """Classify authenticated transport identity before any legacy capability runs."""
+    from gateway.client_context_codewords import selected, route, native_identity, has_receipt
+    if (hasattr(source, "_text_only_native_identity") or hasattr(source, "_text_only_policy")
+            or has_receipt(source) and not selected(getattr(runner, "config", None), source)):
+        return "deny"  # Revoked native receipts must not become legacy hook/background grants.
     if not applies(getattr(runner, "config", None), source):
         return "legacy"
     try:
+        if selected(runner.config, source):
+            require(getattr(source, "_codewords_native_identity", None) == native_identity(source))
+            policy = route(runner.config, source)
+            previous = getattr(source, "_codewords_policy", policy)
+            require(previous == policy)
+            source._codewords_policy = policy
+            return "scoped"
+        from gateway import client_context_restricted as restricted
+        if restricted.selected(source):
+            restricted.native(source, runner._adapter_for_source(source))
+            require(runner._is_user_authorized_for_source(source))
+            restricted.policy()
+            return "scoped"
         require(runner._is_user_authorized_for_source(source))
         opts = await asyncio.to_thread(route_options, runner.config, source)
         return "legacy" if opts is None else "scoped"
@@ -85,6 +121,9 @@ async def adapter_admission(adapter, source) -> str:
     callback = getattr(adapter, "_client_context_admission", None)
     if callback is not None:
         return await callback(source)
+    from gateway.client_context_restricted import selected as restricted
+    if restricted(source):
+        return "deny"
     return "deny" if adapter.client_context_enabled else "legacy"
 
 
@@ -248,9 +287,17 @@ async def answer(opts: Options, source, question: str):
 
 async def handle_turn(runner, event, source, key: str, generation: int):
     """Returns (handled, text); the generation check also applies to denials/failures."""
+    from gateway import client_context_codewords as codewords
+    if (codewords.selected(getattr(runner, "config", None), source)
+            or codewords.has_request(event) or codewords.has_receipt(source)):
+        return await codewords.handle_turn(runner, event, source, key, generation)
+    from gateway import client_context_restricted as restricted
+    if restricted.selected(source) or hasattr(event, "_restricted_request"):
+        return await restricted.handle_turn(runner, event, source, key, generation)
     forced = getattr(event, "_client_context_required", False) is True
     if not forced and not applies(getattr(runner, "config", None), source):
-        if getattr(source.platform, "value", source.platform) == "slack":
+        if (getattr(source.platform, "value", source.platform) == "slack"
+                and not codewords.CONFIG_KEYS.intersection(vars(runner.config).get("client_context") or {})):
             from gateway.client_context_turn import clear_history
 
             clear_history(runner)
@@ -331,10 +378,16 @@ async def handle_turn(runner, event, source, key: str, generation: int):
 
 async def handle_ingress(runner, event):
     """Gate before pre-dispatch plugins, commands, reply intercepts or restored sessions."""
+    from gateway import client_context_codewords as codewords
     source = event.source
+    bounded = (codewords.selected(getattr(runner, "config", None), source)
+               or codewords.has_request(event) or codewords.has_receipt(source))
+    from gateway import client_context_restricted as restricted
+    restricted_turn = not bounded and (restricted.selected(source) or hasattr(event, "_restricted_request"))
     forced = getattr(event, "_client_context_required", False) is True
-    if not forced and not applies(getattr(runner, "config", None), source):
-        if getattr(source.platform, "value", source.platform) == "slack":
+    if not bounded and not restricted_turn and not forced and not applies(getattr(runner, "config", None), source):
+        if (getattr(source.platform, "value", source.platform) == "slack"
+                and not codewords.CONFIG_KEYS.intersection(vars(runner.config).get("client_context") or {})):
             from gateway.client_context_turn import clear_history
 
             clear_history(runner)
@@ -342,8 +395,13 @@ async def handle_ingress(runner, event):
     event._client_context_required = True
     try:
         require(not event.internal and not source.is_bot and not source.profile_route_rejected)
-        require(runner._is_user_authorized_for_source(source))
-        opts = await asyncio.to_thread(route_options, runner.config, source)
+        if bounded:
+            opts = codewords.validate_event(runner.config, event)
+        elif restricted_turn:
+            opts = restricted.validate_event(runner, event)
+        else:
+            require(runner._is_user_authorized_for_source(source))
+            opts = await asyncio.to_thread(route_options, runner.config, source)
         if opts is None:
             require(not forced)
             event._client_context_required = False
@@ -351,8 +409,11 @@ async def handle_ingress(runner, event):
     except Exception:
         from gateway.client_context_turn import clear_history
 
-        clear_history(runner)
+        if not bounded and not restricted_turn:
+            clear_history(runner)
         await runner._hmwa_stop_typing_for_turn(event, source)
+        if restricted_turn:
+            return True, None
         return True, ScopedReply(DENIED)
 
     from agent.estop import paused_reply
@@ -360,21 +421,33 @@ async def handle_ingress(runner, event):
     from gateway.client_context_turn import clear_history
 
     if _is_slack_ignored_channel(runner.config, source.chat_id):
-        clear_history(runner)
+        if not bounded and not restricted_turn:
+            clear_history(runner)
         return True, None
     if paused_reply() or any(getattr(runner, flag, False) for flag in (
         "_draining", "_external_drain_active", "_startup_restore_in_progress",
     )):
-        clear_history(runner)
+        if not bounded and not restricted_turn:
+            clear_history(runner)
         await runner._hmwa_stop_typing_for_turn(event, source)
+        if restricted_turn:
+            return True, None
         return True, ScopedReply(FAILED)
     key = runner._session_key_for_source(source)
+    if restricted_turn:
+        key = restricted.session_key(key, source)
     if runner._is_session_running(key):
-        clear_history(runner)
+        if not bounded and not restricted_turn:
+            clear_history(runner)
+        if restricted_turn:
+            return True, None
         return True, ScopedReply("a source question is already running. please resend when it finishes.")
     lease, limit = runner._claim_active_session_slot(key, source)
     if limit is not None:
-        clear_history(runner)
+        if not bounded and not restricted_turn:
+            clear_history(runner)
+        if restricted_turn:
+            return True, None
         return True, ScopedReply(FAILED)
     state = runner._session_state(key)
     state.turn.lease = lease
@@ -400,7 +473,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--user")
     parser.add_argument("--chat-type", default="channel", choices=("dm", "channel", "group", "thread"))
     parser.add_argument("--question")
-    parser.add_argument("--provider", choices=("openai", "openai-codex", "openrouter"))
+    parser.add_argument("--provider", choices=("openai", "openai-codex", "openrouter", "xai-oauth"))
     parser.add_argument("--model")
     args = parser.parse_args(argv)
     try:

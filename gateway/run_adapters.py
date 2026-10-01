@@ -8,6 +8,7 @@ adapters for GatewayRunner (mixin bound via the MRO).
 from __future__ import annotations
 
 import logging
+from copy import copy
 from typing import TYPE_CHECKING
 import asyncio
 import contextlib
@@ -1042,6 +1043,10 @@ class GatewayAdapterLifecycleMixin:
         # A relay adapter can front Slack even when its primary platform is different.
         adapter.client_context_enabled = applies(getattr(self, "config", None), SimpleNamespace(platform=Platform.SLACK))
         adapter._client_context_admission = lambda source: admission(self, source)
+        from gateway.client_context_codewords import authorized, selected
+        adapter._client_context_applies = lambda source: applies(self.config, source)
+        adapter._client_context_codewords = lambda source: selected(self.config, source)
+        adapter._client_context_codewords_authorized = lambda source: authorized(self.config, source)
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
         adapter.set_busy_session_handler(busy_session_handler or self._handle_active_session_busy_message)
@@ -1497,13 +1502,16 @@ class GatewayAdapterLifecycleMixin:
         def check(
             user_id: str, chat_type: Optional[str] = None, chat_id: Optional[str] = None, *,
             is_bot: bool = False, thread_id: Optional[str] = None,
+            source: Optional[SessionSource] = None,
         ) -> bool:
-            if not user_id:
-                return False
-            source = SessionSource(
+            source = copy(source) if source is not None else SessionSource(
                 platform=platform, chat_id=chat_id or "", chat_type=chat_type or "group",
                 user_id=user_id, thread_id=thread_id, is_bot=bool(is_bot), profile=profile_name,
             )
+            if source.platform != platform or (not source.user_id and not source.is_bot):
+                return False
+            if profile_name is not None:
+                source.profile = profile_name
             # Same transport provenance as ``build_source``, so policy reads resolve the receiving adapter.
             registry = (
                 (getattr(self, "_profile_adapters", None) or {}).get(profile_name)

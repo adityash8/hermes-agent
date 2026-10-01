@@ -116,6 +116,17 @@ def _validate_delete_target(skill_dir: Path) -> Optional[str]:
     if _is_path_redirect(skill_dir):
         return (f"Refusing to delete '{skill_dir}': the skill directory is a "
                 f"symlink/junction. Remove the link target manually if intended.")
+    from agent.skill_utils import get_all_skills_dirs
+    for root in get_all_skills_dirs():
+        if skill_dir.is_relative_to(root):
+            # A root link is an intentional profile topology. Projections BELOW
+            # it must not grant recursive deletion of a shared package.
+            current = skill_dir
+            while current != root:
+                if _is_path_redirect(current):
+                    return f"Refusing to delete '{skill_dir}': a containing directory is a symlink/junction."
+                current = current.parent
+            break
     try:
         skill_dir.resolve()
     except OSError as exc:
@@ -168,7 +179,24 @@ def _background_review_write_guard(
     if not _is_background_review():
         return None
     refuse = f"Refusing background curator {action} for"
-    if _is_pinned(name, "pinned skill guard"):
+    try:
+        # ``_find_skill`` accepts directory and frontmatter aliases. Provenance,
+        # however, is written when a package is created and is keyed by its
+        # physical directory name. Never let a caller-selected alias borrow a
+        # different package's curator-management record.
+        package_identity = skill_dir.resolve().name
+    except OSError:
+        return _refusal(
+            f"{refuse} skill '{name}': agent ownership could not be verified because "
+            "the physical package identity is unavailable.")
+    if not package_identity:
+        return _refusal(
+            f"{refuse} skill '{name}': agent ownership could not be verified because "
+            "the physical package identity is empty.")
+    from tools.skills_tool_plugin import _safe_frontmatter
+    frontmatter = _safe_frontmatter(skill_dir / "SKILL.md")
+    identities = {name, package_identity, str(frontmatter.get("name", package_identity))}
+    if any(_is_pinned(identity, "pinned skill guard") for identity in identities):
         return _refusal(
             f"{refuse} pinned skill '{name}': pinned skills "
             f"are off-limits to autonomous maintenance. Ask the user to run `hermes curator "
@@ -187,13 +215,16 @@ def _background_review_write_guard(
             (skill_usage.is_protected_builtin, "protected built-in"),
             (skill_usage.is_hub_installed, "hub-installed"),
             (skill_usage.is_bundled, "bundled")):
-            if predicate(name):
+            if any(predicate(identity) for identity in identities):
                 return _refusal(f"{refuse} {label} skill '{name}'.")
         # Not curator-managed (no `created_by: "agent"`) => user-owned. A MISSING
         # record and an explicit `created_by: null` must resolve IDENTICALLY (keying
         # on presence made the policy depend on the guard's own side effect: the
         # first write created a null record, the next identical write was refused).
-        usage_rec = skill_usage.load_usage().get(name)
+        # ``.usage.json`` ownership is bound to the physical package identity,
+        # not a frontmatter/requested alias. Missing or unreadable provenance is
+        # deliberately refused below rather than falling back to an alias.
+        usage_rec = skill_usage.load_usage().get(package_identity)
         # Skills that are not curator-managed are off-limits to autonomous curation. This prevents the LLM
         # consolidation pass from mutating skills the user owns (manually authored, URL-installed, or
         # created by a foreground `skill_manage(create)` at the user's request), which lack the `created_by:
@@ -234,7 +265,10 @@ def _background_review_preflight(action: str, name: str) -> Optional[Dict[str, A
     if action not in {"edit", "patch", "delete", "write_file", "remove_file"}:
         return None
     from tools import skill_manager_tool as _smt
-    existing = _smt._find_skill(name)
+    try:
+        existing = _smt._find_skill(name)
+    except ValueError as exc:
+        return _refusal(str(exc))
     return _background_review_write_guard(name, existing["path"], action) if existing else None
 
 

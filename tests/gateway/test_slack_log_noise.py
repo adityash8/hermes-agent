@@ -30,6 +30,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.gateway.slack_admission_helpers import slack_task
+
 _repo = str(Path(__file__).resolve().parents[2])
 if _repo not in sys.path:
     sys.path.insert(0, _repo)
@@ -235,6 +237,7 @@ class TestClarifyLogPrivacy:
             return None
 
         adapter.set_message_handler(_handler)
+        adapter.set_authorization_check(lambda user_id, *_, **kwargs: user_id == "U_NORBERT")
 
         body = {
             "message": {
@@ -248,13 +251,14 @@ class TestClarifyLogPrivacy:
         }
         action = {"action_id": "hermes_clarify_choice_1", "value": "cid-priv|1"}
 
+        adapter._team_clients["T1"].chat_postMessage = AsyncMock(return_value={"ts": "9.9"})
+        with slack_task(adapter, "C1", "U_NORBERT", "sk-priv", team_id="T1", thread_id="100.1"):
+            assert (await adapter.send_clarify(
+                "C1", "Pick", ["noop", secret_choice], "cid-priv", "sk-priv", metadata={"thread_id": "100.1"})).success
+        body["team"] = {"id": "T1"}
+
         with caplog.at_level(logging.DEBUG, logger=ADAPTER_LOGGER):
-            with patch.object(
-                adapter,
-                "_is_interactive_user_authorized",
-                return_value=True,
-            ):
-                await adapter._handle_clarify_action(AsyncMock(), body, action)
+            await adapter._handle_clarify_action(AsyncMock(), body, action)
 
         info_and_above = [
             r.getMessage() for r in caplog.records if r.levelno >= logging.INFO

@@ -1038,6 +1038,20 @@ class TestOpenRouterPaidLaneGuard:
         assert client is mock_client
         assert model == "nvidia/nemotron-3-ultra-550b-a55b:free"
 
+    def test_free_only_allows_exact_openrouter_free_router(self, monkeypatch):
+        """The documented zero-cost OpenRouter router is allowed without a broad prefix."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": True,
+                                               "openrouter_model": "openrouter/free"}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock(name="openrouter_client")
+            mock_openai.return_value = mock_client
+            client, model = _try_openrouter()
+        assert client is mock_client
+        assert model == "openrouter/free"
+
     def test_configured_model_overrides_hardcoded_default(self, monkeypatch):
         """auxiliary.openrouter_model replaces _OPENROUTER_MODEL."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
@@ -1144,7 +1158,10 @@ class TestOpenRouterPaidLaneGuard:
         assert _is_free_model("nvidia/nemotron-3-ultra-550b-a55b:free")
         # Stealth-preview SKUs are free-tier without a :free suffix (issue #91843).
         assert _is_free_model("stealth/ox-alpha")
+        assert _is_free_model("openrouter/free")
         assert not _is_free_model("google/gemini-3.6-flash")
+        assert not _is_free_model("openrouter/free-preview")
+        assert not _is_free_model("openrouter/free/anything")
         assert not _is_free_model("my-stealth/model")
         assert not _is_free_model("")
         assert not _is_free_model(None)
@@ -3056,6 +3073,22 @@ class TestCodexAdapterReasoningTranslation:
             extra_body={"reasoning": {"effort": "low"}},
         )
         assert captured.get("reasoning") == {"effort": "low", "summary": "auto"}
+
+    @pytest.mark.parametrize(("model", "wire_effort"), [
+        ("gpt-6-luna", "max"),
+        ("gpt-6-astra", "max"),
+        ("gpt-6-sol", "max"),
+        ("gpt-6-unverified", "xhigh"),
+    ])
+    def test_gpt6_effort_uses_explicit_model_ceiling(self, model, wire_effort):
+        """Auxiliary Codex uses the same conservative per-model ceiling as main transport."""
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            extra_body={"reasoning": {"effort": "max"}},
+        )
+        assert captured.get("reasoning") == {"effort": wire_effort, "summary": "auto"}
 
 
 

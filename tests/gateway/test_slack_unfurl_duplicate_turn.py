@@ -65,6 +65,7 @@ USER = "U0374GH838U"
 
 def _make_adapter(delivered):
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+    adapter.set_authorization_check(lambda user_id, *args, **kwargs: bool(user_id))
     adapter._bot_user_id = "U0BCLP7DB7B"
 
     async def _capture(event):

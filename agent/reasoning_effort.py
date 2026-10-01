@@ -28,9 +28,18 @@ EFFORT_LADDER: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "x
 OPENAI_COMPAT_WIRE_EFFORTS: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 #: OpenAI/Codex Responses per model generation (live-verified): ``minimal`` is rejected by
-#: both (clamps to low); ``max`` is gpt-5.6-only.
+#: both (clamps to low). ``max`` is available for gpt-5.6 and the separately
+#: live-proven GPT-6 Astra/Sol/Luna variants; do not extend it to unverified GPT-6 variants.
 CODEX_GPT56_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh", "max")
 CODEX_LEGACY_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "xhigh")
+CODEX_GPT6_EFFORTS: tuple[str, ...] = CODEX_GPT56_EFFORTS
+CODEX_GPT6_EFFORTS_BY_MODEL: dict[str, tuple[str, ...]] = {
+    # Astra, Sol, and Luna max tiers are live-proven. Other GPT-6 names retain
+    # the existing legacy ceiling until catalog or live metadata proves otherwise.
+    "gpt-6-astra": CODEX_GPT6_EFFORTS,
+    "gpt-6-sol": CODEX_GPT6_EFFORTS,
+    "gpt-6-luna": CODEX_GPT6_EFFORTS,
+}
 
 #: xAI Responses — Grok 4.6+ accepts xhigh; older Grok tops out at high.
 XAI_GROK46_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
@@ -80,7 +89,11 @@ META_AI_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh")
 
 def codex_supported_efforts(model: Optional[str]) -> tuple[str, ...]:
     """Supported effort set for an OpenAI/Codex Responses model."""
-    return CODEX_GPT56_EFFORTS if "gpt-5.6" in (model or "").lower() else CODEX_LEGACY_EFFORTS
+    slug = (model or "").strip().lower().split("/")[-1]
+    return CODEX_GPT6_EFFORTS_BY_MODEL.get(
+        slug,
+        CODEX_GPT56_EFFORTS if "gpt-5.6" in slug else CODEX_LEGACY_EFFORTS,
+    )
 
 
 def kimi_supported_efforts(model: Optional[str]) -> tuple[str, ...]:

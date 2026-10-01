@@ -6,7 +6,7 @@ Resolve provider API keys from [1Password](https://1password.com/) at process st
 
 1. You install the official [1Password CLI](https://developer.1password.com/docs/cli/get-started/) (`op`) and authenticate it — either with a **service-account token** (headless servers) or an **interactive/desktop session** (your laptop).
 2. You map environment-variable names to `op://` references in `~/.hermes/config.yaml`.
-3. Every time `hermes` (or the gateway, or a cron job) starts, after `~/.hermes/.env` has loaded, Hermes runs `op read` for each reference and sets the resolved values into `os.environ`.
+3. Every time `hermes` (or the gateway, or a cron job) starts, after `~/.hermes/.env` has loaded, Hermes resolves all references with a single `op inject` call (a reference shared by several variables is fetched once) and sets the resolved values into `os.environ`. If that batched call fails — `op inject` is all-or-nothing, so one bad reference fails it — Hermes retries each unresolved reference with its own `op read` (up to 8 in parallel), so warnings still name exactly which reference failed.
 4. By default Hermes **overrides** values already in your environment, so 1Password is the source of truth — rotate a credential once and every Hermes process picks it up on next start. Flip `override_existing: false` if you want `.env` to win instead.
 
 Hermes never authenticates on your behalf and never downloads `op`: it shells out to your already-installed, already-trusted CLI. If `op` is missing, your session is locked, or a reference is wrong, Hermes prints a one-line warning and continues with whatever credentials `.env` already had — it never blocks startup.
@@ -124,7 +124,7 @@ secrets:
 |---|---|---|
 | `enabled` | `false` | Master switch. When false, `op` is never invoked. |
 | `env` | `{}` | Mapping of env-var name → `op://vault/item/field` reference. Entries whose name isn't a valid env-var name, or whose value isn't an `op://` reference, are skipped with a warning. |
-| `account` | `""` | Account shorthand / sign-in address passed as `op read --account`. Empty uses `op`'s default account. |
+| `account` | `""` | Account shorthand / sign-in address passed to `op` as `--account`. Empty uses `op`'s default account. |
 | `service_account_token_env` | `OP_SERVICE_ACCOUNT_TOKEN` | Env var Hermes reads the service-account token from. Its value is exported to the `op` child as `OP_SERVICE_ACCOUNT_TOKEN` (the name `op` expects). Leave the var unset to use a desktop/interactive session. |
 | `binary_path` | `""` | Absolute path to `op`. When set, it is used verbatim and `PATH` is **not** consulted — pin this to avoid trusting whatever `op` appears first on `PATH`. |
 | `cache_ttl_seconds` | `300` | How long resolved values are reused (in-process and on disk). Set to `0` to disable **both** cache layers — no values are written to disk at all. |
@@ -132,7 +132,7 @@ secrets:
 
 ## Failure modes
 
-1Password never blocks Hermes startup. If anything goes wrong you'll see a one-line warning in stderr and Hermes continues:
+1Password never blocks Hermes startup. If anything goes wrong you'll see a one-line warning in stderr and Hermes continues. Per-reference warnings are prefixed with the affected variable names (e.g. `OPENAI_API_KEY: op read failed for 'op://…': …`) and never include a value:
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -158,7 +158,8 @@ Successful, complete pulls are cached in-process and on disk under `<hermes_home
 - A 1Password service-account token can read every secret the account has access to. Store it in `~/.hermes/.env` (not `config.yaml`), and revoke + regenerate from 1Password if it leaks.
 - Hermes refuses to let a resolved value overwrite the token env var itself, even with `override_existing: true`.
 - The `op` child process gets a minimal allowlisted environment (auth/session vars + `PATH`/`HOME`), not a copy of the full `os.environ`, so post-dotenv provider credentials aren't all inherited by the child.
-- References are validated to start with `op://`, and the reference is passed after a `--` option terminator so a crafted value can't be parsed as an `op` flag.
+- References are validated to start with `op://`. The batched `op inject` receives them in a template on stdin, never on the command line; the per-reference `op read` passes each after a `--` option terminator so a crafted value can't be parsed as an `op` flag.
+- `op inject` expands `$VAR` / `${VAR}` inside a reference, so any reference containing `$`, `{`, `}`, or a line break skips the batch and is always resolved literally with `op read`.
 
 ## When NOT to use this
 

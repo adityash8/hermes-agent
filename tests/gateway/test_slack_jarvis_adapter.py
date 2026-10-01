@@ -7,6 +7,7 @@ import pytest
 from gateway.config import PlatformConfig
 from gateway.platforms.base import MessageType
 from plugins.platforms.slack.adapter import SlackAdapter
+from tests.gateway.slack_admission_helpers import slack_task
 
 
 @pytest.mark.asyncio
@@ -29,6 +30,7 @@ async def test_jarvis_and_legacy_umbrella_route_without_exposing_legacy_ack(
     monkeypatch, empty_registry, umbrella, text, expected, message_type
 ):
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+    adapter.set_authorization_check(lambda user_id, *args, **kwargs: bool(user_id))
     adapter._app = MagicMock()
     handle_message = AsyncMock()
     monkeypatch.setattr(adapter, "handle_message", handle_message)
@@ -49,7 +51,7 @@ async def test_jarvis_and_legacy_umbrella_route_without_exposing_legacy_ack(
     }
     await listener(ack, payload)
 
-    ack.assert_awaited_once_with(response_type="ephemeral", text="Running `/jarvis`…")
+    ack.assert_awaited_once_with()
     assert handle_message.await_args is not None
     event = handle_message.await_args.args[0]
     assert event.text == expected
@@ -63,6 +65,7 @@ async def test_jarvis_and_legacy_umbrella_route_without_exposing_legacy_ack(
 @pytest.mark.asyncio
 async def test_jarvis_owned_labels_preserve_payloads_and_callback_ids(monkeypatch):
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
+    adapter.set_authorization_check(lambda user_id, *args, **kwargs: bool(user_id))
     adapter._app = MagicMock()
     client = AsyncMock()
     client.chat_postMessage.return_value = {"ok": True, "ts": "123.456"}
@@ -70,36 +73,39 @@ async def test_jarvis_owned_labels_preserve_payloads_and_callback_ids(monkeypatc
     monkeypatch.setattr(adapter, "_get_client", MagicMock(return_value=client))
     monkeypatch.setattr(adapter, "stop_typing", AsyncMock())
 
-    assert await adapter.create_handoff_thread("C1", "Hermes research") == "123.456"
-    assert client.chat_postMessage.await_args.kwargs["text"] == ":thread: Jarvis handoff — *Hermes research*"
+    with slack_task(adapter, "C1", "U1", "hermes-session"):
+        assert await adapter.create_handoff_thread("C1", "Hermes research") == "123.456"
+        assert client.chat_postMessage.await_args.kwargs["text"] == ":thread: Jarvis handoff — *Hermes research*"
 
-    task = {"id": "hermes-task", "title": "Research Hermes", "status": "in_progress"}
-    result = await adapter.send_native_task_card_progress("C1", [task], reply_to="111.222")
-    assert result.success
-    chunks = client.api_call.await_args.kwargs["json"]["chunks"]
-    assert chunks[0]["title"] == "Jarvis is working"
-    assert chunks[1]["id"] == task["id"]
-    assert chunks[1]["title"] == task["title"]
+    metadata = {"thread_id": "111.222"}
+    with slack_task(adapter, "C1", "U1", "hermes-session", thread_id="111.222"):
+        task = {"id": "hermes-task", "title": "Research Hermes", "status": "in_progress"}
+        result = await adapter.send_native_task_card_progress("C1", [task], reply_to="111.222")
+        assert result.success
+        chunks = client.api_call.await_args.kwargs["json"]["chunks"]
+        assert chunks[0]["title"] == "Jarvis is working"
+        assert chunks[1]["id"] == task["id"]
+        assert chunks[1]["title"] == task["title"]
 
-    content = "Hermes document: /hermes HERMES_HOME ~/.hermes https://hermes.example.test"
-    assert (await adapter.send("C1", content)).success
-    assert content in client.chat_postMessage.await_args.kwargs["text"]
+        content = "Hermes document: /hermes HERMES_HOME ~/.hermes https://hermes.example.test"
+        assert (await adapter.send("C1", content, metadata=metadata)).success
+        assert content in client.chat_postMessage.await_args.kwargs["text"]
 
-    command = "hermes status --path ~/.hermes"
-    assert (await adapter.send_exec_approval("C1", command, "hermes-session")).success
-    approval = client.chat_postMessage.await_args.kwargs
-    assert command in approval["blocks"][0]["text"]["text"]
-    buttons = approval["blocks"][1]["elements"]
-    assert [button["action_id"] for button in buttons] == [
-        "hermes_approve_once", "hermes_approve_session", "hermes_approve_always", "hermes_deny",
-    ]
-    assert all(button["value"] == "hermes-session" for button in buttons)
+        command = "hermes status --path ~/.hermes"
+        assert (await adapter.send_exec_approval("C1", command, "hermes-session", metadata=metadata)).success
+        approval = client.chat_postMessage.await_args.kwargs
+        assert command in approval["blocks"][0]["text"]["text"]
+        buttons = approval["blocks"][1]["elements"]
+        assert [button["action_id"] for button in buttons] == [
+            "hermes_approve_once", "hermes_approve_session", "hermes_approve_always", "hermes_deny",
+        ]
+        assert all(button["value"] == "hermes-session" for button in buttons)
 
-    assert (await adapter.send_slash_confirm(
-        "C1", "Hermes document", content, "hermes-session", "hermes-confirm"
-    )).success
-    confirm = client.chat_postMessage.await_args.kwargs
-    assert content in confirm["blocks"][0]["text"]["text"]
-    assert [button["action_id"] for button in confirm["blocks"][1]["elements"]] == [
-        "hermes_confirm_once", "hermes_confirm_always", "hermes_confirm_cancel",
-    ]
+        assert (await adapter.send_slash_confirm(
+            "C1", "Hermes document", content, "hermes-session", "hermes-confirm", metadata=metadata
+        )).success
+        confirm = client.chat_postMessage.await_args.kwargs
+        assert content in confirm["blocks"][0]["text"]["text"]
+        assert [button["action_id"] for button in confirm["blocks"][1]["elements"]] == [
+            "hermes_confirm_once", "hermes_confirm_always", "hermes_confirm_cancel",
+        ]

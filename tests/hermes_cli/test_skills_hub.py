@@ -93,7 +93,11 @@ def _capture_update(monkeypatch, results) -> tuple[str, list[tuple[str, str, boo
     monkeypatch.setattr(hub, "HubLockFile", lambda: type("L", (), {
         "get_installed": lambda self, name: {"install_path": "category/" + name}
     })())
-    monkeypatch.setattr(cli_hub, "do_install", lambda identifier, category="", force=False, console=None, source_id=None: installs.append((identifier, category, force)))
+    monkeypatch.setattr(
+        cli_hub, "do_install",
+        lambda identifier, category="", force=False, console=None, source_id=None,
+        preserve_install_path=False: installs.append((identifier, category, force)),
+    )
 
     do_update(console=console)
     return sink.getvalue(), installs
@@ -454,7 +458,8 @@ def _update_env(monkeypatch, tmp_path, *, edit_after_install: bool):
     installs = []
     monkeypatch.setattr(
         cli_hub, "do_install",
-        lambda identifier, category="", force=False, console=None, source_id=None:
+        lambda identifier, category="", force=False, console=None, source_id=None,
+        preserve_install_path=False:
             installs.append(identifier),
     )
 

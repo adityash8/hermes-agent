@@ -735,20 +735,35 @@ def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bo
 
 def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*; prunes
-    EXCLUDED_SKILL_DIRS and support dirs of skill roots. Org mirrors are
+    hidden child dirs, EXCLUDED_SKILL_DIRS and support dirs of skill roots.
+    An explicitly supplied hidden root remains discoverable. Org mirrors are
     TOKEN-GATED: only the active org's subdir is walked, so leaving an org
     stops its skills resolving without manual cleanup."""
     skills_dir_str = str(skills_dir)
     active_org = read_active_org_id(skills_dir)
     org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
     matches: list[str] = []
+    visited: set[Tuple[int, int]] = set()
     for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+        try:
+            stat = os.stat(root)
+        except OSError:
+            dirs[:] = []
+            continue
+        identity = (stat.st_dev, stat.st_ino)
+        if identity in visited:
+            dirs[:] = []
+            continue
+        visited.add(identity)
+        dirs.sort()  # Deterministic projection choice when links share a target.
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)
         elif root == org_root:
             dirs[:] = [d for d in dirs if d == active_org]
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
+        dirs[:] = [d for d in dirs if not d.startswith(".")
+                   and d not in EXCLUDED_SKILL_DIRS
+                   and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
         if filename in files:
             matches.append(os.path.join(root, filename))
     yield from map(Path, sorted(matches))

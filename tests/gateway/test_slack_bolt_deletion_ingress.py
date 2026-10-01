@@ -15,7 +15,7 @@ from gateway.config import PlatformConfig
 from plugins.platforms.slack import adapter as slack_module
 
 
-META = {"team_id": "T1", "thread_id": "100.000001"}
+META = {"job_id": "deletion-test", "team_id": "T1", "thread_id": "100.000001"}
 BODY = {
     "type": "event_callback", "team_id": "T1", "event_id": "EvDelete",
     "authorizations": [{"team_id": "T1", "user_id": "UBOT", "is_bot": True}],
@@ -65,7 +65,9 @@ async def test_real_bolt_deletion_reaches_thread_fence(monkeypatch, previous_aut
     response = await adapter._app.async_dispatch(AsyncBoltRequest(body=body, mode="socket_mode"))
     assert response.status == 200
     handler.assert_awaited_once()
-    assert not (await adapter.send("C1", "resurrected", metadata=META)).success
+    result = await adapter.send("C1", "resurrected", metadata=META)
+    assert not result.success
+    assert result.error == "slack_thread_deleted"
     assert post.await_count == 1
     assert adapter._deletion_record(("T1", "C1", META["thread_id"]))["muted"]
     await adapter.disconnect()

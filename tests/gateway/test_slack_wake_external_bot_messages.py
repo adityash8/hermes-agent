@@ -1,27 +1,7 @@
-"""Regression tests for #63530 — Slack adapter drops human replies in
-threads whose root was posted by the bot via direct chat.postMessage
-(outside the gateway's send() path).
+"""Historical bot-authored thread roots are context, never fresh turn authority.
 
-Background: the adapter's wake-decision at the un-mentioned branch in
-_handle_slack_message uses three checks:
-
-  1. thread_ts ∈ _bot_message_ts          (only populated by send() / files_upload_v2)
-  2. thread_ts ∈ _mentioned_threads        (only populated on @mention)
-  3. _has_active_session_for_thread(...)   (survives restarts)
-
-When a skill posts a triage message into a Slack thread via the Web API
-directly (chat.postMessage, no gateway run), the bot's own ts is NOT
-recorded in _bot_message_ts. A human reply in that thread, without an
-@-mention and without an existing session, falls through all three
-checks and is silently dropped. The same gap opens after a gateway
-restart: _bot_message_ts is process memory, so threads the bot started
-before the restart no longer wake it.
-
-Fix: a 4th check — was the thread root authored by the bot? Root
-authorship is derived from the Slack API (conversations.replies), so it
-survives restarts, unlike the in-memory ts set. The wake decision is
-extracted into _should_wake_on_unmentioned_message so it's directly
-testable without spinning up Slack.
+The context helpers still recover root authorship across restarts; admission
+requires a direct request, configured opt-in, or live requester task.
 """
 
 import sys
@@ -128,11 +108,8 @@ async def test_wake_decision_returns_false_when_not_thread_reply():
 
 
 @pytest.mark.asyncio
-async def test_wake_decision_returns_true_when_bot_authored_thread_root():
-    """The new behavior (#63530): a human reply in a thread whose root was
-    authored by the bot via direct chat.postMessage (outside gateway send)
-    wakes the bot even though none of the legacy 3 checks pass — including
-    after a restart, when _bot_message_ts is empty."""
+async def test_wake_decision_rejects_historical_bot_authored_thread_root():
+    """A past bot post alone cannot admit a new unmentioned request."""
     adapter = _make_adapter(bot_authored_root=True)
     wake = await adapter._should_wake_on_unmentioned_message(
         event_thread_ts=THREAD_TS,
@@ -140,10 +117,8 @@ async def test_wake_decision_returns_true_when_bot_authored_thread_root():
         user_id=USER_ID,
         is_thread_reply=True,
     )
-    assert wake is True, (
-        "human reply in a thread whose root was bot-posted (not via gateway "
-        "send) should wake the bot — #63530"
-    )
+    assert wake is False
+    adapter._bot_authored_thread_root.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

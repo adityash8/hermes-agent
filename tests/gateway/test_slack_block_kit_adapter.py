@@ -61,7 +61,7 @@ class TestSendMessageBlocks:
     @pytest.mark.asyncio
     async def test_disabled_by_default_no_blocks(self):
         adapter, client = _make_adapter()
-        await adapter.send("C1", RICH_MD)
+        await adapter.send("C1", RICH_MD, metadata={"job_id": "render-test"})
         kwargs = client.chat_postMessage.await_args.kwargs
         assert "blocks" not in kwargs
         assert kwargs["text"]  # plain text still sent
@@ -73,7 +73,7 @@ class TestSendMessageBlocks:
         )
         content = "[Hermes](https://example.com/hermes)"
 
-        await adapter.send("C1", content)
+        await adapter.send("C1", content, metadata={"job_id": "render-test"})
 
         kwargs = client.chat_postMessage.await_args.kwargs
         assert kwargs["text"] == "<https://example.com/hermes|Hermes>"
@@ -85,7 +85,7 @@ class TestSendMessageBlocks:
     async def test_enabled_but_unrenderable_falls_back_to_text(self):
         # 60 dividers -> renderer returns None -> no blocks kwarg, text stands
         adapter, client = _make_adapter({"rich_blocks": True})
-        await adapter.send("C1", "\n\n".join(["---"] * 60))
+        await adapter.send("C1", "\n\n".join(["---"] * 60), metadata={"job_id": "render-test"})
         kwargs = client.chat_postMessage.await_args.kwargs
         assert "blocks" not in kwargs
         assert kwargs["text"]
@@ -95,7 +95,7 @@ class TestSendMessageBlocks:
     async def test_feedback_buttons_opt_in_appended_to_blocks(self):
         adapter, client = _make_adapter({"rich_blocks": True, "feedback_buttons": True})
 
-        await adapter.send("C1", "final answer")
+        await adapter.send("C1", "final answer", metadata={"job_id": "render-test"})
 
         blocks = client.chat_postMessage.await_args.kwargs["blocks"]
         feedback = blocks[-1]
@@ -108,7 +108,7 @@ class TestEditMessageBlocks:
     @pytest.mark.asyncio
     async def test_intermediate_edit_no_blocks(self):
         adapter, client = _make_adapter({"rich_blocks": True})
-        await adapter.edit_message("C1", "111.222", RICH_MD, finalize=False)
+        await adapter.edit_message("C1", "111.222", RICH_MD, finalize=False, metadata={"job_id": "render-test"})
         kwargs = client.chat_update.await_args.kwargs
         assert "blocks" not in kwargs
         assert kwargs["text"]
@@ -116,7 +116,7 @@ class TestEditMessageBlocks:
     @pytest.mark.asyncio
     async def test_finalize_edit_gets_blocks(self):
         adapter, client = _make_adapter({"rich_blocks": True})
-        await adapter.edit_message("C1", "111.222", RICH_MD, finalize=True)
+        await adapter.edit_message("C1", "111.222", RICH_MD, finalize=True, metadata={"job_id": "render-test"})
         kwargs = client.chat_update.await_args.kwargs
         assert "blocks" in kwargs and kwargs["blocks"]
         assert kwargs["text"]
@@ -134,7 +134,7 @@ class TestEditMessageBlocks:
             "111.222",
             RICH_TABLE_MD,
             finalize=True,
-            metadata={"team_id": "T_SECONDARY"},
+            metadata={"job_id": "render-test", "team_id": "T_SECONDARY"},
         )
 
         assert result.success is True
@@ -154,7 +154,7 @@ class TestEditMessageBlocks:
         adapter, client = _make_adapter()
         client.chat_update = AsyncMock(side_effect=TimeoutError("timed out"))
 
-        result = await adapter.edit_message("C1", "111.222", RICH_MD, finalize=True)
+        result = await adapter.edit_message("C1", "111.222", RICH_MD, finalize=True, metadata={"job_id": "render-test"})
 
         assert result.success is False
         assert result.retryable is True
@@ -173,14 +173,14 @@ class TestMarkdownBlockMode:
     @pytest.mark.asyncio
     async def test_disabled_by_default(self):
         adapter, client = _make_adapter()
-        await adapter.send("C1", RICH_TABLE_MD)
+        await adapter.send("C1", RICH_TABLE_MD, metadata={"job_id": "render-test"})
         kwargs = client.chat_postMessage.await_args.kwargs
         assert "blocks" not in kwargs
 
     @pytest.mark.asyncio
     async def test_enabled_sends_markdown_block_with_raw_content(self):
         adapter, client = _make_adapter({"markdown_blocks": True})
-        await adapter.send("C1", RICH_TABLE_MD)
+        await adapter.send("C1", RICH_TABLE_MD, metadata={"job_id": "render-test"})
         kwargs = client.chat_postMessage.await_args.kwargs
         blocks = kwargs["blocks"]
         assert blocks[0]["type"] == "markdown"
@@ -193,7 +193,7 @@ class TestMarkdownBlockMode:
     @pytest.mark.asyncio
     async def test_edit_finalize_uses_markdown_block(self):
         adapter, client = _make_adapter({"markdown_blocks": True})
-        await adapter.edit_message("C1", "111.222", RICH_TABLE_MD, finalize=True)
+        await adapter.edit_message("C1", "111.222", RICH_TABLE_MD, finalize=True, metadata={"job_id": "render-test"})
         kwargs = client.chat_update.await_args.kwargs
         assert kwargs["blocks"][0]["type"] == "markdown"
         assert kwargs["blocks"][0]["text"] == RICH_TABLE_MD

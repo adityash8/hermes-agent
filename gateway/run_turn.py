@@ -2570,6 +2570,10 @@ class GatewayTurnMixin:
         """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
         when multiplexing is off)."""
         with self._profile_scope_for_source(source):
+            adapter = self._adapter_for_source(source)
+            authorize = getattr(adapter, "authorize_turn", None)
+            if callable(authorize) and authorize(source) is False:
+                return {"final_response": "", "messages": history}
             return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
 
     def _run_agent_display_settings(self, source: SessionSource) -> "GatewayRunner._RunAgentDisplay":
@@ -3292,11 +3296,28 @@ class GatewayTurnMixin:
         pending_event = None
         pending = None
         if result and adapter and session_key:
-            pending_event = _dequeue_pending_event(adapter, session_key)
+            defer = getattr(adapter, "defer_pending_turns", None)
+            deferred = callable(defer) and defer(
+                session_key, self._overflow_queue(session_key), draining=self._draining) is True
+            if deferred:
+                if self._draining:
+                    return None, None
+                # Leftover steering belongs to the still-live task. Actual queued
+                # events must return through the adapter with their own permission.
+                pending = result.get("pending_steer")
+                if (not pending and result.get("interrupted")
+                        and not getattr(adapter, "_pending_messages", {}).get(session_key)):
+                    candidate = result.get("interrupt_message")
+                    if candidate and not _is_control_interrupt_message(candidate):
+                        pending = candidate
+            else:
+                pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
-            pending_event = self._promote_queued_event(session_key, adapter, pending_event)
-            if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
+            if not deferred:
+                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+            if (not deferred and result.get("interrupted") and not pending_event
+                    and result.get("interrupt_message")):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):
                     logger.info(

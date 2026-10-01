@@ -2111,14 +2111,19 @@ def _profile_default_headers(provider: str) -> Optional[dict]:
 # Provider resolution helpers
 
 _paid_lane_warned: set = set()
+_FREE_MODEL_IDENTIFIERS = frozenset({"openrouter/free"})
 
 
 def _is_free_model(model: Optional[str]) -> bool:
-    """True when ``model`` is a free SKU (``:free`` suffix or ``stealth/`` prefix) — naming-convention trust."""
+    """True for recognized zero-cost models: ``:free``, ``stealth/``, or exact router IDs."""
     if not model:
         return False
     normalized = str(model).strip()
-    return normalized.endswith(":free") or normalized.startswith("stealth/")
+    return (
+        normalized in _FREE_MODEL_IDENTIFIERS
+        or normalized.endswith(":free")
+        or normalized.startswith("stealth/")
+    )
 
 
 def _aux_openrouter_settings() -> Tuple[bool, str]:
@@ -6786,8 +6791,9 @@ def _ladder_credential_rungs(
 
 
 def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
-    """Last rung: other providers (per-task chain; then auto: main fallback chain + discovery
-    chain, explicit: main-agent-model net). Returns the response or None.
+    """Last rung: a present task fallback_chain is authoritative, even empty or malformed.
+    Only an absent chain permits auto main/discovery or explicit main-model fallback.
+    Returns the response or None.
     Capacity errors (payment/quota, connection, exhausted 429, model incompatible, malformed
     response) bypass the explicit-provider gate — the provider cannot serve this request
     regardless of user intent. Auth errors only fall back in auto mode."""
@@ -6817,13 +6823,14 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     _chain_failed_model = None if reason in ("auth error", "payment error") else route.final_model
     fb_client, fb_model, fb_label = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model)
-    if fb_client is None and is_auto:
+    has_task_chain = "fallback_chain" in _get_auxiliary_task_config(task or "")
+    if fb_client is None and is_auto and not has_task_chain:
         fb_client, fb_model, fb_label = _try_main_fallback_chain(
             task, resolved_provider or "auto", reason=reason)
         if fb_client is None:
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task, reason=reason)
-    elif fb_client is None:
+    elif fb_client is None and not has_task_chain:
         fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
             resolved_provider, task, reason=reason, failed_model=_chain_failed_model)
     if fb_client is not None:
@@ -6834,17 +6841,17 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
             fb_resp = yield _LadderStep("fallback", (fb_client, fb_model, fb_label))
             if fb_resp is not None:
                 return fb_resp
-            if _pass == 0:
+            if _pass == 0 and is_auto and not has_task_chain:
                 fb_client, fb_model, fb_label = _try_payment_fallback(
                     resolved_provider, task, reason="stale fallback credential")
                 if fb_client is None:
                     break
+            else:
+                # Explicit routes and task chains must not discover unapproved providers.
+                break
     # All fallback layers exhausted — one user-visible warning, then re-raise.
-    logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted "
-                   # All fallback layers exhausted — emit a single user-visible warning so the operator
-                   # knows aux task is about to fail. (#26882) The error itself is re-raised below.
-                   # (#26882)
-                   "(fallback_chain + main agent model). Raising original error.",
+    logger.warning("Auxiliary %s%s: %s on %s and all fallbacks exhausted (permitted routes only). "
+                   "Raising original error.",
                    task or "call", tag, reason, resolved_provider)
     return None
 

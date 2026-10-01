@@ -12,6 +12,7 @@ def run(coro):
 def make_adapter(extra=None):
     config = PlatformConfig(extra=extra or {})
     adapter = SlackAdapter(config)
+    adapter.set_authorization_check(lambda user_id, *args, **kwargs: bool(user_id))
     adapter._bot_user_id = "UBOT"
     adapter._team_bot_user_ids["T1"] = "UBOT"
     adapter._has_active_session_for_thread = lambda **_: False

@@ -814,10 +814,21 @@ class ToolRegistry:
         entry = self.get_entry(name, scope=scope)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        from tools.interrupt import tool_execution_allowed
+
+        if not tool_execution_allowed():
+            return tool_error("tool_execution_revoked")
         try:
             if entry.is_async:
                 from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
+
+                async def invoke():
+                    # The async bridge may queue work after the caller's check.
+                    if not tool_execution_allowed():
+                        return tool_error("tool_execution_revoked")
+                    return await entry.handler(args, **kwargs)
+
+                result = _run_async(invoke())
             else:
                 result = entry.handler(args, **kwargs)
             return self._normalize_handler_result(name, result)

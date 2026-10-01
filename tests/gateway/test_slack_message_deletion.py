@@ -8,6 +8,19 @@ from gateway.config import PlatformConfig
 from plugins.platforms.slack.adapter import SlackAdapter
 
 
+@pytest.fixture(autouse=True)
+def approved_delivery_scope():
+    # These transport/deletion tests deliberately send outside a conversational
+    # turn. Give them the scheduler's delivery authority; participation behavior
+    # is exercised separately through native ingress, without this exception.
+    from plugins.platforms.slack.deletion import _scheduled_delivery
+    token = _scheduled_delivery.set(True)
+    try:
+        yield
+    finally:
+        _scheduled_delivery.reset(token)
+
+
 META = {"team_id": "T1", "thread_id": "100.000001"}
 
 

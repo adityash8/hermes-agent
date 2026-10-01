@@ -771,8 +771,12 @@ class GatewaySessionCommandsMixin:
             adapter = self.get_adapter(source.platform)
             if not adapter:
                 return "Platform adapter not found to send the document."
-            await adapter.send_document(chat_id=source.chat_id, file_path=temp_path,
-                                        caption=f"Session export: {filename}", file_name=filename)
+            result = await adapter.send_document(
+                chat_id=source.chat_id, file_path=temp_path,
+                caption=f"Session export: {filename}", file_name=filename,
+                metadata=self._reply_metadata(event))
+            if not result.success:
+                return "Could not deliver the session export."
             return "Export complete."
         except Exception as e:
             logger.warning("Session /save failed: %s", e)

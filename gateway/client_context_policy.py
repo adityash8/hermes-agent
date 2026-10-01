@@ -45,6 +45,17 @@ def identifier(value: object) -> str:
     return str(value)
 
 
+def slack_id(value: object) -> str:
+    """Slack channel/user ids, plus message timestamps (``123.456``).
+
+    Evidence and route ids stay on ``identifier``. A dotted timestamp is not a
+    path, URL, or broadened grant — rejecting it drops the turn before reply.
+    """
+    require(isinstance(value, str) and re.fullmatch(
+        r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,79}(?:\.[a-zA-Z0-9]{1,10})?\Z", value))
+    return str(value)
+
+
 def fields(value: object, expected: set[str]) -> dict:
     require(isinstance(value, dict) and set(value) == expected)
     return value  # type: ignore[return-value]
@@ -167,7 +178,7 @@ def options(value: object) -> Options | None:
         expected.add("read_tools")
     cfg = fields(value, expected)
     require(cfg["enabled"] is True)
-    require(cfg["provider"] in {"openai", "openai-codex", "openrouter"})
+    require(cfg["provider"] in {"openai", "openai-codex", "openrouter", "xai-oauth"})
     require(isinstance(cfg["model"], str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,159}", cfg["model"]))
     require(cfg["model"].lower() not in {"auto", "default"})
     generation, allowed = "", ()

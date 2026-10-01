@@ -907,6 +907,52 @@ class TestBackgroundOwnershipPolicyConsistency:
         assert before["success"] is False
         assert after["success"] is True, after
 
+    def test_background_review_binds_ownership_to_physical_package(self, tmp_path, monkeypatch):
+        """A requested frontmatter alias cannot borrow another package's agent record.
+
+        The usage sidecar is written under the package directory's creation name.
+        Resolution accepts a frontmatter alias, but autonomous ownership must be
+        checked against the resolved package — never the caller-controlled alias.
+        """
+        from tools import skill_usage
+        from tools.skill_manager_guards import mark_background_review_skill_read
+        from tools.skill_provenance import (
+            BACKGROUND_REVIEW,
+            reset_current_write_origin,
+            set_current_write_origin,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        (tmp_path / ".hermes" / "skills").mkdir(parents=True)
+        with _skill_dir(tmp_path):
+            _create_skill("user-dir", VALID_SKILL_CONTENT.replace("test-skill", "agent-owned-alias"))
+            _create_skill("owned-dir", VALID_SKILL_CONTENT.replace("test-skill", "owned-alias"))
+            # This belongs to a different package, but was sufficient to bypass
+            # the old alias-keyed guard.
+            skill_usage.mark_agent_created("agent-owned-alias")
+            skill_usage.mark_agent_created("owned-dir")
+
+            token = set_current_write_origin(BACKGROUND_REVIEW)
+            try:
+                mark_background_review_skill_read(tmp_path / "user-dir" / "SKILL.md")
+                spoofed = json.loads(skill_manage(
+                    action="patch", name="agent-owned-alias",
+                    old_string="Do the thing.", new_string="Spoofed change.",
+                ))
+                mark_background_review_skill_read(tmp_path / "owned-dir" / "SKILL.md")
+                owned = json.loads(skill_manage(
+                    action="patch", name="owned-alias",
+                    old_string="Do the thing.", new_string="Owned change.",
+                ))
+            finally:
+                reset_current_write_origin(token)
+
+        assert spoofed["success"] is False, spoofed
+        assert "curator-managed" in spoofed["error"]
+        assert "Do the thing." in (tmp_path / "user-dir" / "SKILL.md").read_text(encoding="utf-8")
+        assert owned["success"] is True, owned
+        assert "Owned change." in (tmp_path / "owned-dir" / "SKILL.md").read_text(encoding="utf-8")
+
 
 # ---------------------------------------------------------------------------
 # Pinned-skill guard — skill_manage refuses only `delete` on pinned skills.

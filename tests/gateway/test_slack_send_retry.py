@@ -92,7 +92,7 @@ class TestSlackSendRetryable:
         )
         adapter._get_client = lambda cid, team_id="": client
 
-        result = await adapter.send("C123", "hello")
+        result = await adapter.send("C123", "hello", metadata={"job_id": "render-test"})
         assert not result.success
         assert result.retryable is True
         assert result.retry_after == 30.0
@@ -107,7 +107,7 @@ class TestSlackSendRetryable:
         )
         adapter._get_client = lambda cid, team_id="": client
 
-        result = await adapter.send("C123", "hello")
+        result = await adapter.send("C123", "hello", metadata={"job_id": "render-test"})
         assert not result.success
         assert result.retryable is True
         assert result.retry_after is None

@@ -18,7 +18,7 @@ def surface():
     client.chat_delete.return_value = {"ok": True}
     adapter._get_client = MagicMock(return_value=client)
     adapter.stop_typing = AsyncMock()
-    return adapter, client, {"team_id": "T1", "thread_id": "100.000001"}
+    return adapter, client, {"job_id": "deletion-test", "team_id": "T1", "thread_id": "100.000001"}
 
 
 def envelope(channel="C1"):
@@ -37,6 +37,7 @@ async def test_documented_minimal_event_silences_known_own_reply(surface):
     await adapter._handle_slack_message(event, payload)
     result = await adapter.send("C1", "must not resurrect", metadata=metadata)
     assert not result.success
+    assert result.error == "slack_thread_deleted"
     assert client.chat_postMessage.await_count == 1
 
 
@@ -64,9 +65,11 @@ async def test_own_cleanup_minimal_event_does_not_silence(surface):
 @pytest.mark.asyncio
 async def test_deletion_bypasses_normal_message_dedup(surface):
     adapter, client, metadata = surface
-    await adapter.send("C1", "reply", metadata=metadata)
+    assert (await adapter.send("C1", "reply", metadata=metadata)).success
     event, payload = envelope()
     adapter._dedup.is_duplicate(adapter._workspace_event_id("T1", event["ts"]))
     await adapter._handle_slack_message(event, payload)
-    assert not (await adapter.send("C1", "resurrected", metadata=metadata)).success
+    result = await adapter.send("C1", "resurrected", metadata=metadata)
+    assert not result.success
+    assert result.error == "slack_thread_deleted"
     assert client.chat_postMessage.await_count == 1

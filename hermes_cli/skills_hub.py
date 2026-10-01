@@ -645,10 +645,11 @@ def _confirm_install(c: Console, bundle, category: str) -> bool:
 def do_install(identifier: str, category: str = "", force: bool = False,
                console: Optional[Console] = None, skip_confirm: bool = False,
                invalidate_cache: bool = True, name_override: str = "",
-               source_id: Optional[str] = None) -> None:
+               source_id: Optional[str] = None, preserve_install_path: bool = False) -> None:
     """Fetch, quarantine, scan, confirm, and install a skill. ``source_id`` pins resolution to one
     adapter; callers that know the provenance (``do_update``) must pass it so a bare identifier
-    cannot resolve to a same-named skill elsewhere."""
+    cannot resolve to a same-named skill elsewhere. ``preserve_install_path`` keeps a recorded
+    flat destination from being re-categorized by a newer official identifier during update."""
     from tools.skills_hub import HubLockFile, ensure_hub_dirs
     from tools.skills_hub_install import install_from_quarantine, quarantine_bundle
     from tools.skills_guard import should_allow_install
@@ -674,7 +675,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         category = _prompt_for_category(c, _existing_categories())
     # Official skills can be nested ("official/mlops/training/trl-fine-tuning"): keep every
     # identifier segment between "official" and the final slug as the category path.
-    if bundle.source == "official" and not category:
+    if bundle.source == "official" and not category and not preserve_install_path:
         category = "/".join(bundle.identifier.split("/")[1:-1])
 
     existing = HubLockFile().get_installed(bundle.name)
@@ -861,7 +862,7 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None,
         # otherwise fuzzy-resolve inside do_install to a same-named skill in a DIFFERENT
         # registry, overwriting the user's files and rewriting the lock's `source`.
         do_install(entry["identifier"], category=category, force=True, console=c,
-                   source_id=entry.get("source", "") or None)
+                   source_id=entry.get("source", "") or None, preserve_install_path=True)
 
     if len(updates) > len(skipped_local):
         c.print(f"[bold green]Updated {len(updates) - len(skipped_local)} skill(s).[/]\n")

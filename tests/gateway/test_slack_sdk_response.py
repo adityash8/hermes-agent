@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from tests.gateway.slack_admission_helpers import slack_task
+
 
 # Import the real response class first: the mock installer below fills
 # sys.modules with MagicMocks, which would mask an installed slack_sdk.
@@ -107,8 +109,10 @@ response_shape = pytest.mark.parametrize("make_response", _FACTORIES)
 
 
 def _make_adapter():
-    # object.__new__ skips __init__ (heavy setup) — established slack-test pattern.
-    adapter = object.__new__(SlackAdapter)
+    from gateway.config import PlatformConfig
+
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="fake"))
+    adapter.set_authorization_check(lambda user_id, *_: user_id == "U_HUMAN")
     adapter._app = MagicMock()
     adapter._user_name_cache = {}
     adapter._user_is_bot_cache = {}
@@ -200,9 +204,10 @@ class TestSendPaths:
             return_value=make_response({"ok": True})
         )
         adapter._get_client = lambda *_a, **_kw: client
-        result = asyncio.run(
-            adapter._post_ephemeral_fallback("C_GEN", {"user_id": "U_HUMAN"}, "hi")
-        )
+        with slack_task(adapter, "C_GEN", "U_HUMAN", "response-test"):
+            result = asyncio.run(
+                adapter._post_ephemeral_fallback("C_GEN", {"user_id": "U_HUMAN"}, "hi")
+            )
         assert result.success is True
 
     @response_shape
@@ -213,9 +218,10 @@ class TestSendPaths:
             return_value=make_response({"ok": False, "error": "channel_not_found"})
         )
         adapter._get_client = lambda *_a, **_kw: client
-        result = asyncio.run(
-            adapter._post_ephemeral_fallback("C_GEN", {"user_id": "U_HUMAN"}, "hi")
-        )
+        with slack_task(adapter, "C_GEN", "U_HUMAN", "response-test"):
+            result = asyncio.run(
+                adapter._post_ephemeral_fallback("C_GEN", {"user_id": "U_HUMAN"}, "hi")
+            )
         assert result.success is False
         assert "channel_not_found" in result.error
 
@@ -265,7 +271,8 @@ class TestHandoffThread:
             return_value=make_response({"ok": True, "ts": "1700000000.000100"})
         )
         adapter._get_client = lambda *_a, **_kw: client
-        thread_id = asyncio.run(adapter.create_handoff_thread("C_GEN", "review"))
+        with slack_task(adapter, "C_GEN", "U_HUMAN", "response-test"):
+            thread_id = asyncio.run(adapter.create_handoff_thread("C_GEN", "review"))
         assert thread_id == "1700000000.000100"
 
     def test_unreadable_response_yields_no_thread(self):
@@ -274,7 +281,9 @@ class TestHandoffThread:
         client = MagicMock()
         client.chat_postMessage = AsyncMock(return_value=object())
         adapter._get_client = lambda *_a, **_kw: client
-        assert asyncio.run(adapter.create_handoff_thread("C_GEN", "review")) is None
+        with slack_task(adapter, "C_GEN", "U_HUMAN", "response-test"):
+            assert asyncio.run(adapter.create_handoff_thread("C_GEN", "review")) is None
+        client.chat_postMessage.assert_awaited_once()
 
 
 # ── standalone (out-of-process cron/send_message) delivery ─────────────────

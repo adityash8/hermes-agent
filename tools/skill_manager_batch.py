@@ -39,6 +39,14 @@ def _validate_batch_ops(operations, default_name, tool_error):
     # Clobber guard: a DESTRUCTIVE op (create/write_file/remove_file/full rewrite) on
     # a file an earlier op touched would SILENTLY discard its work — reject it.
     # Additive patches are always legal. Paths are normalized against spelling variants.
+    from tools import skill_manager_tool as _smt
+    identities = {}
+    for nm in dict.fromkeys(names):
+        try:
+            existing = _smt._find_skill(nm)
+        except ValueError as exc:
+            return None, tool_error(str(exc), success=False)
+        identities[nm] = str(existing["path"].resolve()) if existing else nm
     touched_files = set()
     for i, op in enumerate(operations):
         act, nm = op["action"], names[i]
@@ -47,7 +55,7 @@ def _validate_batch_ops(operations, default_name, tool_error):
         fp = (op.get("file_path") or "").strip()
         target = ("SKILL.md" if (act == "create" or full_rewrite or not fp)
                   else posixpath.normpath(fp.lstrip("/")))
-        key = (nm, target)
+        key = (identities[nm], target)
         if (act in ("create", "write_file", "remove_file") or full_rewrite) and key in touched_files:
             return fail(i, f": {act} on '{target}' of skill '{nm}' — an earlier op in this "
                            f"batch already touched that file, and this op would silently discard its work. "
@@ -61,12 +69,19 @@ def _snapshot_skills(names, snap_root, find_skill):
     """Copy every touched skill aside. Returns (snapshots, None) or (None, error_text)."""
     snapshots = {}  # skill name -> (pre_dir or None, snapshot_dir or None)
     for nm in dict.fromkeys(names):  # ordered unique
-        pre = find_skill(nm)
-        pre_dir = Path(pre["path"]) if pre else None
-        snap = snap_root / nm if pre_dir is not None and pre_dir.is_dir() else None
-        if snap is not None:
+        try:
+            pre = find_skill(nm)
+        except ValueError as exc:
+            return None, str(exc)
+        # Snapshot the package, never the projection: rollback must leave links
+        # intact, including when a full rewrite changes the frontmatter name.
+        pre_dir = Path(pre["path"]).resolve() if pre else None
+        snap = None
+        if pre_dir is not None and pre_dir.is_dir():
+            # Requested aliases may contain slashes or prefix another alias.
+            snap = snap_root / str(len(snapshots))
             try:
-                shutil.copytree(pre_dir, snap)
+                shutil.copytree(pre_dir, snap, symlinks=True)
             except Exception as exc:  # noqa: BLE001 — no snapshot, no atomicity
                 return None, f"Could not snapshot '{nm}' for atomic batch: {exc}"
         snapshots[nm] = (pre_dir, snap)
@@ -80,21 +95,22 @@ def _restore_snapshot(pre_dir, snap, post_dir) -> None:
             shutil.rmtree(post_dir)
         return
     if not post_exists:
-        shutil.copytree(snap, pre_dir)
+        shutil.copytree(snap, pre_dir, symlinks=True)
         return
     # Move the broken state aside and delete it only after the snapshot is
     # back, so a failed copytree (disk full, locked file) can't mean total loss.
-    aside = post_dir.with_name(post_dir.name + ".rollback-broken")
-    shutil.rmtree(aside, ignore_errors=True)
+    holding = Path(tempfile.mkdtemp(prefix=".skill-rollback-", dir=post_dir.parent))
+    aside = holding / post_dir.name
     post_dir.rename(aside)
     try:
-        shutil.copytree(snap, pre_dir)
+        shutil.copytree(snap, pre_dir, symlinks=True)
     except Exception:
         # Restore failed: put the half-applied state back rather than nothing.
         shutil.rmtree(pre_dir, ignore_errors=True)
         aside.rename(pre_dir)
+        holding.rmdir()
         raise
-    shutil.rmtree(aside, ignore_errors=True)
+    shutil.rmtree(holding)
 
 
 def _rollback(snapshots, find_skill):
@@ -102,8 +118,12 @@ def _rollback(snapshots, find_skill):
     notes = []
     for nm, (pre_dir, snap) in snapshots.items():
         try:
-            post = find_skill(nm)
-            _restore_snapshot(pre_dir, snap, Path(post["path"]) if post else None)
+            if pre_dir is not None:
+                post_dir = pre_dir
+            else:
+                post = find_skill(nm)
+                post_dir = Path(post["path"]) if post else None
+            _restore_snapshot(pre_dir, snap, post_dir)
         except Exception as exc:  # noqa: BLE001
             notes.append(f"ROLLBACK FAILED for '{nm}' ({exc})"
                          + (f"; snapshot preserved at '{snap}'" if snap is not None else ""))

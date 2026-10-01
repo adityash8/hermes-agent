@@ -18,7 +18,8 @@ from gateway.profile_routing import ProfileRoute
 def mux_home(tmp_path, monkeypatch):
     from agent import secret_scope
 
-    home = tmp_path / "hh"
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    home = tmp_path / ".hermes"
     (home / "profiles" / "secondary").mkdir(parents=True)
     (home / ".env").write_text("")
     (home / "profiles" / "secondary" / ".env").write_text("")
@@ -126,6 +127,7 @@ def test_slack_interactive_auth_prefers_wired_profile_check(mux_home, monkeypatc
 
     def slack(with_check):
         sl = object.__new__(SlackAdapter)
+        sl.platform = Platform.SLACK
         sl.config = PlatformConfig(enabled=True, extra={})
         sl._authorization_check = None
         sl._message_handler = runner._make_profile_message_handler("secondary")

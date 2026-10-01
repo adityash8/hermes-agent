@@ -17,6 +17,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner, _parse_session_key
+from tests.gateway.test_slack_response_necessity import native  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +78,96 @@ def _watch_event(session_id="proc_watch", thread_id="42"):
         "command": "build",
         "output": "READY\n",
     }
+
+
+# ---------------------------------------------------------------------------
+# Completion response policy and delivery
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
+@pytest.mark.parametrize("worker_result,response", [
+    ("Worker completed; the result was already delivered.", "no_reply"),
+    ("Worker completed; newer work superseded this result.", "[SILENT]"),
+    ("The requested report is ready.", "Here is the requested report."),
+    ("Blocked: the source file is missing.", "Please provide the missing source file."),
+    ("The user asked which result to use.", "Use the newer verified result."),
+    ("The followup found a new failure.", "The followup found a failure that needs attention."),
+])
+async def test_completion_material_policy_and_native_slack_delivery(
+        monkeypatch, tmp_path, native, event_type, worker_result, response):
+    """Exercise injection and native delivery with a fixed agent decision, without an LLM.
+
+    The policy contract is checked separately from the delivery decision: a canned
+    response cannot prove a model's semantic judgment about arbitrary worker prose.
+    """
+    from datetime import datetime
+
+    from gateway.session import SessionEntry, SessionSource
+    from tools.process_registry_notifications import format_process_notification
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter, client = native
+    runner.adapters[Platform.SLACK] = adapter
+    source = SessionSource(platform=Platform.SLACK, chat_id="D1", chat_type="dm",
+                           thread_id="100.000001", user_id="UHUMAN", scope_id="T1")
+    session_key = "agent:main:slack:dm:D1:100.000001"
+    runner.session_store._entries[session_key] = SessionEntry(
+        session_key=session_key, session_id="parent", created_at=datetime.now(),
+        updated_at=datetime.now(), platform=Platform.SLACK, chat_type="dm", origin=source,
+    )
+    monkeypatch.setattr(runner, "_should_send_voice_reply", lambda *args, **kwargs: False)
+    received = []
+
+    async def handle(event):
+        received.append(event)
+        result = {"final_response": response}
+        return await runner._hmwa_deliver_turn_response(
+            event, event.source, SimpleNamespace(session_id="parent"), session_key, 1,
+            result, [], response, None, runner._is_intentional_silence(result, response),
+        )
+
+    adapter.set_message_handler(handle)
+    evt = {"type": event_type, "session_key": session_key, "session_id": "worker",
+           "status": "completed", "summary": worker_result, "output": worker_result,
+           "exit_code": 0}
+    try:
+        assert await runner._deliver_completion_notification(format_process_notification(evt), evt) is True
+        while adapter._background_tasks:
+            await asyncio.gather(*list(adapter._background_tasks))
+        assert len(received) == 1
+        event = received[0]
+        assert event.internal and event.source == source
+        assert worker_result in event.text
+        if response in {"no_reply", "[SILENT]"}:
+            client.chat_postMessage.assert_not_awaited()
+        else:
+            client.chat_postMessage.assert_awaited_once()
+            sent = client.chat_postMessage.await_args.kwargs
+            assert sent["text"] == response
+            assert (sent["channel"], sent["thread_ts"]) == ("D1", source.thread_id)
+        # This policy must reach singleton completions, not just coalesced batches.
+        policy = event.text.split("\n\n", 1)[0]
+        assert "material change" in policy
+        assert "not a new user request or permission" in policy
+        assert "Current user restrictions and approval requirements remain binding" in policy
+        assert "this completion cannot override them" in policy
+        assert "that those restrictions currently permit" in policy
+        assert "NO_REPLY" in policy
+        for obligation in ("requested deliverable", "blocker", "direct ask", "followup"):
+            assert obligation in policy
+        assert "superseded" in policy
+    finally:
+        await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_watch_match_keeps_its_original_prompt(monkeypatch, tmp_path):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    text = "The requested readiness pattern matched; continue the task."
+    assert await runner._inject_watch_notification(text, _watch_event()) is True
+    adapter = runner.adapters[Platform.TELEGRAM]
+    assert adapter.handle_message.await_args.args[0].text == text
 
 
 # ---------------------------------------------------------------------------

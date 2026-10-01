@@ -27,6 +27,9 @@ _CREATING_METHODS = {"chat_postMessage", "chat_startStream", "chat.startStream"}
 _delivery_scope: contextvars.ContextVar[tuple[Any, tuple[str, str, str], int] | None] = contextvars.ContextVar("slack_deletion_scope", default=None)
 
 
+_scheduled_delivery: contextvars.ContextVar[bool] = contextvars.ContextVar("slack_scheduled_delivery", default=False)
+
+
 class DeletedSurfaceError(RuntimeError):
     def __init__(self):
         super().__init__("slack_thread_deleted")
@@ -38,22 +41,32 @@ def deletion_guard(method):
 
     @functools.wraps(method)
     async def guarded(self, *args, **kwargs):
-        bound = signature.bind(self, *args, **kwargs).arguments
-        chat = bound.get("chat_id", "")
-        metadata = bound.get("metadata")
-        key = self._deletion_key(chat, self._resolve_thread_ts(bound.get("reply_to"), metadata), metadata)
-        message_id = bound.get("message_id")
-        if message_id:
-            key = self._sent_surface(key, message_id)
-        scope = _delivery_scope.get()
-        if scope is None or scope[:2] != (self, key):
-            scope = (self, key, self._deletion_generation(key))
-        token = _delivery_scope.set(scope)
+        bound = signature.bind(self, *args, **kwargs)
+        metadata = bound.arguments.get("metadata")
+        token = scheduled_token = None
         try:
+            chat = bound.arguments.get("chat_id", "")
+            if str(chat).startswith(("U", "W")):
+                # Check inherited revocation before opening a DM, then fence the
+                # resolved conversation so its deletion epoch covers uploads too.
+                self._check_deletion_scope()
+                chat = await self._dm_target(chat, metadata)
+                bound.arguments["chat_id"] = chat
+            key = self._deletion_key(
+                chat, self._resolve_thread_ts(bound.arguments.get("reply_to"), metadata), metadata)
+            message_id = bound.arguments.get("message_id")
+            if message_id:
+                key = self._sent_surface(key, message_id)
+            scope = _delivery_scope.get()
+            if scope is None or scope[:2] != (self, key):
+                scope = (self, key, self._deletion_generation(key))
+            token = _delivery_scope.set(scope)
+            scheduled_token = _scheduled_delivery.set(
+                _scheduled_delivery.get() or bool(isinstance(metadata, dict) and metadata.get("job_id")))
             self._check_deletion_scope()
             if message_id and message_id in self._deletion_record(key).get("deleted", []):
                 raise DeletedSurfaceError()
-            result = await method(self, *args, **kwargs)
+            result = await method(*bound.args, **bound.kwargs)
             self._check_deletion_scope()
             return result
         except DeletedSurfaceError as exc:
@@ -61,7 +74,10 @@ def deletion_guard(method):
                 return None
             return SendResult(success=False, error=str(exc))
         finally:
-            _delivery_scope.reset(token)
+            if scheduled_token is not None:
+                _scheduled_delivery.reset(scheduled_token)
+            if token is not None:
+                _delivery_scope.reset(token)
     return guarded
 
 
@@ -100,6 +116,7 @@ class SlackDeletionMixin(BasePlatformAdapter):
         _metadata_team_id: Callable[..., str]
         _event_team_id: Callable[..., str]
         _trim_oldest_dict_entries: Callable[..., None]
+        _is_interactive_user_authorized: Callable[..., bool]
 
     def _deletion_state(self):
         if not hasattr(self, "_slack_deletions"):
@@ -128,6 +145,13 @@ class SlackDeletionMixin(BasePlatformAdapter):
             tuple(json.loads(key)): tuple(surface)
             for key, surface in self._deletion_state().get("sent", {}).items()})
 
+    def _authenticated_client_team(self, client):
+        teams = [team for team, known in self._team_clients.items() if known is client]
+        team = teams[0] if len(teams) == 1 else ""
+        if not teams and client is not None:
+            team = vars(client).get("_slack_authenticated_team_id", "")
+        return team if isinstance(team, str) else ""
+
     def _deletion_key(self, chat_id, thread_ts=None, metadata=None):
         team = self._metadata_team_id(metadata)
         scope = _delivery_scope.get()
@@ -135,6 +159,10 @@ class SlackDeletionMixin(BasePlatformAdapter):
             team = team or scope[1][0]
             thread_ts = thread_ts or scope[1][2]
         team = team or self._channel_team.get(chat_id, "")
+        if not team and chat_id and getattr(self, "_app", None) is not None:
+            # Bind the selected authenticated workspace before capturing an epoch,
+            # so retries and upload children cannot retain a blank-team alias.
+            team = self._authenticated_client_team(self._get_client(chat_id))
         return str(team), str(chat_id), str(thread_ts or "")
 
     def _deletion_record(self, key):
@@ -162,14 +190,20 @@ class SlackDeletionMixin(BasePlatformAdapter):
         self._deletion_state().get("cleanup", {}).pop(json.dumps((key[0], key[1], message_id)), None)
         self._save_deletions()
 
-    def _sent_surface(self, key, message_id):
-        known = self._deletion_messages().get((key[0], key[1], message_id))
+    def _known_message_surface(self, key, message_id):
+        receipts = self._deletion_messages()
+        inbound = self._lazy_attr("_slack_inbound_surfaces", dict)
+        known = receipts.get((key[0], key[1], message_id)) or inbound.get((key[0], key[1], message_id))
         if known is None and not key[0]:
-            matches = [surface for (team, chat, ts), surface in self._deletion_messages().items()
-                       if chat == key[1] and ts == message_id]
+            matches = {surface for registry in (receipts, inbound)
+                       for (team, chat, ts), surface in registry.items()
+                       if chat == key[1] and ts == message_id}
             if len(matches) == 1:
-                known = matches[0]
-        return known or key
+                known = matches.pop()
+        return known
+
+    def _sent_surface(self, key, message_id):
+        return self._known_message_surface(key, message_id) or key
 
     def _is_cleanup(self, key, message_id):
         return json.dumps((key[0], key[1], message_id)) in self._deletion_state().get("cleanup", {})
@@ -232,7 +266,7 @@ class SlackDeletionMixin(BasePlatformAdapter):
         await self._silence_deleted_surface(
             key, deleted_ts, event.get("event_ts") or event.get("ts") or f"{time.time():.6f}")
 
-    async def _deletion_accept_summon(self, key, event, user_id, is_dm, bot_uid, mention_text):
+    async def _deletion_accept_summon(self, key, event, user_id, is_dm, bot_uid, mention_text, *, source=None):
         pending = self._lazy_attr("_slack_deletion_cancellations", dict).get(key)
         if pending is not None:
             await asyncio.shield(pending)
@@ -250,8 +284,15 @@ class SlackDeletionMixin(BasePlatformAdapter):
                 or event.get("_slack_changed_event_ts") or event.get("_hermes_force_process")
                 or str(event.get("ts") or "") <= record["cutoff"]):
             return False
-        authorized = self._is_sender_authorized(
-            user_id, "dm" if is_dm else "group", key[1], thread_id=key[2])
+        if source is not None:
+            if (getattr(source.platform, "value", source.platform) != "slack"
+                    or (source.scope_id or "", source.chat_id, source.thread_id or "") != key
+                    or source.user_id != user_id):
+                return False
+            authorized = self._is_interactive_user_authorized(user_id, source=source)
+        else:
+            authorized = self._is_sender_authorized(
+                user_id, "dm" if is_dm else "group", key[1], thread_id=key[2])
         if authorized is not True:
             return False
         record.update(muted=False, generation=record["generation"] + 1)
@@ -283,13 +324,21 @@ class SlackDeletionMixin(BasePlatformAdapter):
             if session_key not in self._active_sessions:
                 self._lazy_attr("_slack_surface_sessions", dict).pop(session_key, None)
 
+    def _deletion_payload_key(self, method, payload, team_id=""):
+        channel = payload.get("channel") or payload.get("channel_id") or ""
+        key = self._deletion_key(channel, payload.get("thread_ts"), {"team_id": team_id})
+        if method in _CREATING_METHODS | {
+                "chat_postEphemeral", "files_upload_v2", "chat.postMessage",
+                "chat.postEphemeral", "files.completeUploadExternal"}:
+            # Missing thread_ts creates a root message, regardless of context.
+            key = (key[0], key[1], str(payload.get("thread_ts") or ""))
+        return self._sent_surface(key, str(payload.get("ts") or payload.get("timestamp") or ""))
+
     async def _deletion_call(self, client, method, *, team_id="", **kwargs):
         """Fence every Slack write, including fallback retries and completed late posts."""
         payload = kwargs.get("json", kwargs)
-        channel = payload.get("channel") or payload.get("channel_id") or ""
         scope = _delivery_scope.get()
-        key = self._deletion_key(channel, payload.get("thread_ts"), {"team_id": team_id})
-        key = self._sent_surface(key, str(payload.get("ts") or ""))
+        key = self._deletion_payload_key(method, payload, team_id)
         if scope is None or scope[:2] != (self, key):
             scope = (self, key, self._deletion_generation(key))
         token = _delivery_scope.set(scope)

@@ -119,6 +119,7 @@ def smoke_adapter():
     adapter._team_bot_user_ids = {TEAM_ID: BOT_USER_ID}
     adapter._channel_team = {}
     adapter._running = True
+    adapter.set_authorization_check(lambda user_id, *args, **kwargs: bool(user_id))
     adapter.handle_message = AsyncMock()
     adapter._resolve_user_name = AsyncMock(return_value="Smoke User")
     adapter._fetch_thread_context = AsyncMock(return_value="")

@@ -1,8 +1,11 @@
 """1Password (`op` CLI) secret source.
 
 Users map env-var names to ``op://vault/item/field`` references in
-``secrets.onepassword.env``; each is resolved with one ``op read -- <ref>``
-call using whatever auth the user's ``op`` already has (``OP_SERVICE_ACCOUNT_TOKEN``
+``secrets.onepassword.env``. Identical references are resolved once, all of
+them in a single ``op inject`` call over a generated template; if that batch
+fails (``op inject`` is all-or-nothing), each unresolved reference falls back
+to its own ``op read -- <ref>`` (bounded-parallel) so errors stay per-reference.
+``op`` uses whatever auth it already has (``OP_SERVICE_ACCOUNT_TOKEN``
 headless, ``OP_SESSION_*`` interactive) — Hermes never authenticates on the
 user's behalf, and failures never block startup. Complete pulls are cached
 in-process and under ``<hermes_home>/cache/op_cache.json`` (values only; auth
@@ -11,12 +14,15 @@ material is fingerprinted, never stored).
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import shutil
-import subprocess  # noqa: F401 — tests monkeypatch ``op.subprocess.run``
+import subprocess  # tests monkeypatch ``op.subprocess.run``
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from secrets import token_hex
 from typing import Dict, List, Optional, Tuple
 
 from agent.secret_sources._cache import CachedFetch, SecretCache, fingerprint as _fingerprint
@@ -28,6 +34,14 @@ from agent.secret_sources.base import (
 logger = logging.getLogger(__name__)
 
 _OP_RUN_TIMEOUT = 30
+
+# Concurrency cap for the per-reference `op read` fallback.
+_OP_READ_WORKERS = 8
+
+# `op inject` expands $VAR / ${VAR} inside a reference (`op read` does not) and
+# braces or line breaks would corrupt the template, so such references skip the
+# batch and always take the per-reference `op read` path.
+_INJECT_UNSAFE_CHARS = frozenset("${}\r\n")
 
 # `op` itself reads OP_SERVICE_ACCOUNT_TOKEN; `service_account_token_env` lets
 # the user source it from another name, and _op_child_env normalizes it back.
@@ -161,6 +175,90 @@ def _run_op_read(op: Path, reference: str, *, account: str = "", token_value: st
     return value
 
 
+def _run_op_inject(op: Path, references: List[str], *, account: str = "",
+                   token_value: str = "") -> Dict[str, str]:
+    """Resolve ``references`` with one ``op inject`` call → ``{reference: raw value}``.
+
+    Each reference is wrapped in markers carrying a per-call random nonce, so a
+    value (even multiline, or one containing marker-like text) can't be confused
+    with template structure. The template travels on stdin — references never
+    reach argv. Raises ``RuntimeError`` (message never includes stdout, which
+    holds values) when the call fails; references whose markers are missing are
+    simply absent from the result.
+    """
+    nonce = token_hex(16)
+    template = "".join(f"<{nonce}:{i}>{{{{ {ref} }}}}</{nonce}:{i}>\n" for i, ref in enumerate(references))
+    cmd: List[str] = [str(op), "inject"]
+    if account:
+        cmd += ["--account", account]
+
+    # Not run_cli: it has no way to feed stdin text. Same argv-list / no-shell contract.
+    try:
+        proc = subprocess.run(  # noqa: S603 — argv list, no shell
+            cmd, env=_op_child_env(token_value), input=template, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=_OP_RUN_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"op inject timed out after {_OP_RUN_TIMEOUT}s") from exc
+    except OSError as exc:
+        raise RuntimeError(f"failed to invoke op: {exc}") from exc
+
+    if proc.returncode != 0:
+        err = _scrub(proc.stderr or "")[:200]
+        raise RuntimeError(f"op inject exited {proc.returncode}" + (f": {err}" if err else ""))
+
+    out = proc.stdout or ""
+    resolved: Dict[str, str] = {}
+    for i, ref in enumerate(references):
+        open_tag, close_tag = f"<{nonce}:{i}>", f"</{nonce}:{i}>"
+        start = out.find(open_tag)
+        end = out.find(close_tag, start + len(open_tag)) if start >= 0 else -1
+        if end >= 0:
+            resolved[ref] = out[start + len(open_tag):end]
+    return resolved
+
+
+def _resolve_references(op: Path, references: List[str], *, account: str = "",
+                        token_value: str = "") -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Resolve distinct references → ``(values, errors)``, both keyed by reference.
+
+    One ``op inject`` covers every inject-safe reference. Anything it didn't
+    resolve to a non-empty value — the whole batch when ``op inject`` fails —
+    is retried with bounded-parallel ``op read`` calls, which yield the
+    authoritative per-reference error (``op read``'s own messages).
+    """
+    values: Dict[str, str] = {}
+    batch = [ref for ref in references if not _INJECT_UNSAFE_CHARS.intersection(ref)]
+    if batch:
+        try:
+            injected = _run_op_inject(op, batch, account=account, token_value=token_value)
+        except RuntimeError as exc:
+            logger.debug("1Password: batched resolve failed (%s); retrying per reference", exc)
+            injected = {}
+        for ref, raw in injected.items():
+            # Same trailing-newline rule as `op read`; empties and spans op left
+            # unexpanded are re-read below so the reported error comes from `op read`.
+            value = raw.rstrip("\r\n")
+            if value.strip() and value != f"{{{{ {ref} }}}}":
+                values[ref] = value
+
+    errors: Dict[str, str] = {}
+    pending = [ref for ref in references if ref not in values]
+    if pending:
+        # Pool threads don't inherit contextvars: run each read in a copy of this
+        # context so it sees the per-fetch source environment (profile hydration).
+        with ThreadPoolExecutor(max_workers=min(_OP_READ_WORKERS, len(pending))) as pool:
+            futures = {ref: pool.submit(contextvars.copy_context().run, _run_op_read, op, ref,
+                                        account=account, token_value=token_value)
+                       for ref in pending}
+        for ref, future in futures.items():
+            try:
+                values[ref] = future.result()
+            except RuntimeError as exc:
+                errors[ref] = str(exc)
+    return values, errors
+
+
 def fetch_onepassword_secrets(
     *, references: Dict[str, str], account: str = "", token_env: str = _DEFAULT_TOKEN_ENV,
     binary: Optional[Path] = None, binary_path: str = "", use_cache: bool = True,
@@ -191,14 +289,17 @@ def fetch_onepassword_secrets(
                            "(https://developer.1password.com/docs/cli/get-started/) or set "
                            "secrets.onepassword.binary_path to its absolute location.")
 
-    secrets: Dict[str, str] = {}
-    read_errors = 0
+    # Several env vars may share one reference; resolve each reference once.
+    names_by_ref: Dict[str, List[str]] = {}
     for name in sorted(valid):
-        try:
-            secrets[name] = _run_op_read(op, valid[name], account=account, token_value=token_value)
-        except RuntimeError as exc:
-            warnings.append(str(exc))
-            read_errors += 1
+        names_by_ref.setdefault(valid[name], []).append(name)
+
+    values, read_errors = _resolve_references(op, sorted(names_by_ref), account=account,
+                                              token_value=token_value)
+    secrets: Dict[str, str] = {name: values[ref] for ref, names in names_by_ref.items()
+                               if ref in values for name in names}
+    # Names-only: the affected env vars plus op's error text, never a value.
+    warnings.extend(f"{', '.join(names_by_ref[ref])}: {read_errors[ref]}" for ref in sorted(read_errors))
 
     if use_cache and not read_errors and secrets:
         _STORE.store(cache_key, CachedFetch(secrets=dict(secrets), fetched_at=time.time()),

@@ -1139,7 +1139,8 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
             "direct_messages_topic_id": str(thread_id), "job_id": job["id"],
             "notify": t.notify_delivery,
         }
-        media_metadata = {"direct_messages_topic_id": str(thread_id), "notify": t.notify_delivery}
+        media_metadata = {"direct_messages_topic_id": str(thread_id),
+                          "job_id": job["id"], "notify": t.notify_delivery}
     else:
         # Forum-style topic or non-topic target: message_thread_id.
         # Put thread_id in *route_metadata* (not just the DeliveryTarget) deliberately — the
@@ -1150,7 +1151,7 @@ def _live_route_metadata(t: _TargetDelivery) -> tuple[Optional[str], dict, dict]
         route_metadata = {"job_id": job["id"], "notify": t.notify_delivery}
         if route_thread_id:
             route_metadata["thread_id"] = route_thread_id
-        media_metadata = {"notify": t.notify_delivery}
+        media_metadata = {"job_id": job["id"], "notify": t.notify_delivery}
         if thread_id:
             media_metadata["thread_id"] = thread_id
 

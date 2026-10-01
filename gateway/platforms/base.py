@@ -2383,10 +2383,13 @@ class BasePlatformAdapter(ABC):
     def _event_session_key(self, event: "MessageEvent") -> str:
         """Adapter-level session key for ``event``, profile-namespaced like the agent run."""
         extra = self.config.extra
-        return build_session_key(
+        key = build_session_key(
             event.source, group_sessions_per_user=extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source))
+        from gateway.client_context_restricted import session_key
+        # Codewords keeps its existing channel isolation/session behavior.
+        return session_key(key, event.source)
 
     def _text_batch_key(self, event: "MessageEvent") -> str:
         """Session-scoped key for text batching (subclasses may override)."""
@@ -3246,6 +3249,9 @@ class BasePlatformAdapter(ABC):
         async def _send(text: str) -> "SendResult":
             return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
         result = await _send(content)
+        if hasattr(content, "_restricted_validate"):
+            # Never turn a revoked sealed reply into an unsealed formatting retry.
+            return result
         if result.success:
             return result
         error_str = result.error or ""
@@ -3530,7 +3536,37 @@ class BasePlatformAdapter(ABC):
         task so new messages (and interrupts) can arrive while an agent runs."""
         if not self._message_handler:
             return
-        if event.allow_gateway_control:
+        if (hasattr(event, "_text_only_request")
+                or hasattr(event.source, "_text_only_native_identity")
+                or hasattr(event.source, "_text_only_policy")):
+            return  # Retired receipts cannot regain command or ordinary-agent authority.
+        codewords = False
+        sealed_request = getattr(event, "_codewords_request", None)
+        selector = getattr(self, "_client_context_codewords", None)
+        if selector is not None:
+            try:
+                codewords = selector(event.source)
+                if codewords:
+                    from gateway.client_context_codewords import seal_event
+
+                    if sealed_request != seal_event(event):
+                        return
+            except Exception:
+                return
+        if not codewords and (sealed_request is not None
+                or hasattr(event.source, "_codewords_native_identity")
+                or hasattr(event.source, "_codewords_policy")):
+            return
+        from gateway import client_context_restricted as restricted
+        restricted_turn = not codewords and (restricted.selected(event.source) or hasattr(event, "_restricted_request"))
+        if restricted_turn:
+            try:
+                restricted.native(event.source, self)
+                if getattr(event, "_restricted_request", None) != restricted.seal_event(event):
+                    return
+            except Exception:
+                return
+        if event.allow_gateway_control and not codewords and not restricted_turn:
             coerce_plaintext_gateway_command(event)
         # Topic recovery is Telegram-DM-only; skip the executor hop for group traffic.
         if (getattr(self, "_topic_recovery_fn", None) is not None
@@ -3541,6 +3577,10 @@ class BasePlatformAdapter(ABC):
         if expected_session_key and session_key != expected_session_key:
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
+            return
+        # Isolated questions cannot steer/cancel an old agent or combine with
+        # queued text. Busy requests are dropped without changing session state.
+        if (codewords or restricted_turn) and session_key in self._active_sessions:
             return
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
@@ -3684,6 +3724,8 @@ class BasePlatformAdapter(ABC):
         """Ledger the final response BEFORE the send so a crash before platform ACK redelivers on
         next boot; best-effort, skips slash-command and ephemeral replies. Returns the obligation id
         or None."""
+        if hasattr(text_content, "_restricted_validate"):
+            return None  # This authorization receipt cannot survive serialization/restart.
         if is_ephemeral_response or str(event.text or "").lstrip().startswith(
             ("/", self.typed_command_prefix or "!")):
             return None
@@ -3811,6 +3853,9 @@ class BasePlatformAdapter(ABC):
     async def _notify_turn_error(self, event: MessageEvent, e: BaseException) -> Optional[dict]:
         """Tell the user a turn failed rather than leaving radio silence (last resort:
         a failing notice is logged, never raised). Returns the thread metadata used."""
+        from gateway.client_context_restricted import selected as restricted
+        if not hasattr(event, "_codewords_request") and (restricted(event.source) or hasattr(event, "_restricted_request")):
+            return None  # No unsealed raw exception text in an isolated lane.
         _thread_metadata = None
         try:
             error_detail = str(e)[:300] if str(e) else "no details available"

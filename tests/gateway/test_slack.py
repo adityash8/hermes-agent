@@ -98,6 +98,7 @@ import plugins.platforms.slack.adapter as _slack_mod
 _slack_mod.SLACK_AVAILABLE = True
 
 from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from tests.gateway.slack_admission_helpers import slack_task  # noqa: E402
 
 
 def _rich_text_blocks(*elements):
@@ -141,7 +142,7 @@ class TestIgnoredChannelOutboundSuppression:
     async def test_send_suppressed_for_ignored_channel(self):
         adapter = self._ignored_adapter()
 
-        result = await adapter.send("C_PRD", "Acknowledged", reply_to="123.456")
+        result = await adapter.send("C_PRD", "Acknowledged", reply_to="123.456", metadata={"job_id": "test-approved-delivery"})
 
         assert result.success is False
         assert result.error == "ignored_channel"
@@ -197,6 +198,7 @@ def adapter():
     a._bot_user_id = "U_BOT"
     a._running = True
     # Capture events instead of processing them
+    a.set_authorization_check(lambda user_id, *args, **kwargs: bool(user_id))
     a.handle_message = AsyncMock()
     return a
 
@@ -1258,7 +1260,7 @@ class TestSendDocument:
         result = await adapter.send_document(
             chat_id="C123",
             file_path=str(test_file),
-            caption="Here's the report",
+            caption="Here's the report", metadata={"job_id": "test-approved-delivery"}
         )
 
         assert result.success
@@ -1281,7 +1283,7 @@ class TestSendDocument:
         result = await adapter.send_document(
             chat_id="C123",
             file_path=str(test_file),
-            metadata={"slack_team_id": "T_SECONDARY"},
+            metadata={"slack_team_id": "T_SECONDARY", "job_id": "test-approved-delivery"},
         )
 
         assert result.success
@@ -1303,7 +1305,7 @@ class TestSendDocument:
         with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
             result = await adapter.send_document(
                 chat_id="C123",
-                file_path=str(test_file),
+                file_path=str(test_file), metadata={"job_id": "test-approved-delivery"}
             )
 
         assert result.success
@@ -1322,7 +1324,7 @@ class TestSendPrivateNotice:
             chat_id="C123",
             user_id="U123",
             content="private hello",
-            metadata={"thread_id": "1234567890.123456"},
+            metadata={"thread_id": "1234567890.123456", "job_id": "test-approved-delivery"},
         )
 
         assert result.success
@@ -1351,7 +1353,7 @@ class TestSendVideo:
         result = await adapter.send_video(
             chat_id="C123",
             video_path=str(video),
-            caption="Check this out",
+            caption="Check this out", metadata={"job_id": "test-approved-delivery"}
         )
 
         assert result.success
@@ -1779,6 +1781,7 @@ class TestIncomingDocumentHandling:
             async def handle(self, _event):
                 raise AssertionError("gateway handler should not run")
 
+        adapter.set_authorization_check(None)
         adapter._message_handler = Runner().handle
         adapter._app.client.files_info = AsyncMock()
 
@@ -2308,7 +2311,7 @@ class TestSendTyping:
         a._app = MagicMock()
         a._app.client = AsyncMock()
         a._app.client.assistant_threads_setStatus = AsyncMock()
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await a.send_typing("C123", metadata={"thread_id": "parent_ts", "job_id": "test-approved-delivery"})
         a._app.client.assistant_threads_setStatus.assert_called_once_with(
             channel_id="C123",
             thread_ts="parent_ts",
@@ -2329,13 +2332,13 @@ class TestSendTyping:
         a._app.client = AsyncMock()
         a._app.client.assistant_threads_setStatus = AsyncMock()
         a.set_status_text("C123", "is reading docs/api.md…")
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await a.send_typing("C123", metadata={"thread_id": "parent_ts", "job_id": "test-approved-delivery"})
         assert (
             a._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
             == "is reading docs/api.md…"
         )
         a.set_status_text("C123", None)
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await a.send_typing("C123", metadata={"thread_id": "parent_ts", "job_id": "test-approved-delivery"})
         assert (
             a._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
             == "is pouncing… 🐾"
@@ -2352,7 +2355,7 @@ class TestSendTyping:
         clock = [1000.0]
         monkeypatch.setattr(_time, "monotonic", lambda: clock[0])
 
-        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts", "job_id": "test-approved-delivery"})
         assert (
             adapter._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
             == "is thinking..."
@@ -2360,7 +2363,7 @@ class TestSendTyping:
 
         # 2m03s later, the refresh loop calls send_typing again.
         clock[0] += 123
-        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts", "job_id": "test-approved-delivery"})
         assert (
             adapter._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
             == "still working… (2m03s)"
@@ -2375,12 +2378,12 @@ class TestSendTyping:
         clock = [2000.0]
         monkeypatch.setattr(_time, "monotonic", lambda: clock[0])
 
-        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts", "job_id": "test-approved-delivery"})
         clock[0] += 90
-        await adapter.stop_typing("C123", metadata={"thread_id": "parent_ts"})
+        await adapter.stop_typing("C123", metadata={"thread_id": "parent_ts", "job_id": "test-approved-delivery"})
 
         clock[0] += 5
-        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await adapter.send_typing("C123", metadata={"thread_id": "parent_ts", "job_id": "test-approved-delivery"})
         assert (
             adapter._app.client.assistant_threads_setStatus.call_args.kwargs["status"]
             == "is thinking..."
@@ -2394,7 +2397,7 @@ class TestSendTyping:
 
         await adapter.send_typing(
             "C123",
-            metadata={"thread_id": "171.000", "message_id": "171.500"},
+            metadata={"thread_id": "171.000", "message_id": "171.500", "job_id": "test-approved-delivery"},
         )
 
         adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
@@ -2415,7 +2418,8 @@ class TestSendTyping:
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
         assert adapter._active_status_threads == {}
 
-        await adapter.stop_typing("C123", metadata={"thread_id": "stuck_ts"})
+        with slack_task(adapter, "C123", "U_USER", "typing-task", thread_id="stuck_ts"):
+            await adapter.stop_typing("C123", metadata={"thread_id": "stuck_ts"})
 
         adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
             channel_id="C123",
@@ -2455,7 +2459,7 @@ class TestSendTyping:
             "team_id": "",
         }
 
-        result = await adapter.send("C123", "done", metadata={"thread_id": "parent_ts"})
+        result = await adapter.send("C123", "done", metadata={"thread_id": "parent_ts", "job_id": "test-approved-delivery"})
 
         assert result.success
         adapter._app.client.chat_postMessage.assert_called_once()
@@ -2563,7 +2567,7 @@ class TestSendTyping:
         }
         adapter.format_message = MagicMock(side_effect=RuntimeError("format boom"))
 
-        result = await adapter.send("C123", "done", metadata={"thread_id": "parent_ts"})
+        result = await adapter.send("C123", "done", metadata={"thread_id": "parent_ts", "job_id": "test-approved-delivery"})
 
         assert not result.success
         adapter._app.client.assistant_threads_setStatus.assert_called_once_with(
@@ -2733,7 +2737,7 @@ class TestEditMessage:
     async def test_edit_message_escapes_control_chars(self, adapter):
         """edit_message escapes & < > in plain text."""
         adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
-        await adapter.edit_message("C123", "1234.5678", "AT&T < 5 > 3")
+        await adapter.edit_message("C123", "1234.5678", "AT&T < 5 > 3", metadata={"job_id": "test-approved-delivery"})
         kwargs = adapter._app.client.chat_update.call_args.kwargs
         assert kwargs["text"] == "AT&amp;T &lt; 5 &gt; 3"
 
@@ -2741,7 +2745,7 @@ class TestEditMessage:
     async def test_edit_message_truncates_oversized_content(self, adapter):
         """Oversized edits are truncated instead of failing with msg_too_long."""
         adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
-        result = await adapter.edit_message("C123", "1234.5678", "x" * 45000)
+        result = await adapter.edit_message("C123", "1234.5678", "x" * 45000, metadata={"job_id": "test-approved-delivery"})
         assert result.success
         kwargs = adapter._app.client.chat_update.call_args.kwargs
         assert len(kwargs["text"]) <= adapter.MAX_MESSAGE_LENGTH
@@ -2807,14 +2811,14 @@ class TestEditMessageStreamingPipeline:
         adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
 
         # First streaming update — bold
-        result1 = await adapter.edit_message("C123", "ts1", "**Processing**...")
+        result1 = await adapter.edit_message("C123", "ts1", "**Processing**...", metadata={"job_id": "test-approved-delivery"})
         assert result1.success is True
         kwargs1 = adapter._app.client.chat_update.call_args.kwargs
         assert kwargs1["text"] == "*Processing*..."
 
         # Second streaming update — bold + link
         result2 = await adapter.edit_message(
-            "C123", "ts1", "**Done!** See [results](https://example.com)"
+            "C123", "ts1", "**Done!** See [results](https://example.com)", metadata={"job_id": "test-approved-delivery"}
         )
         assert result2.success is True
         kwargs2 = adapter._app.client.chat_update.call_args.kwargs
@@ -2827,7 +2831,7 @@ class TestEditMessageStreamingPipeline:
         adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
 
         content = "**Result:**\n```python\nprint('hello')\n```"
-        result = await adapter.edit_message("C123", "ts1", content)
+        result = await adapter.edit_message("C123", "ts1", content, metadata={"job_id": "test-approved-delivery"})
         assert result.success is True
         kwargs = adapter._app.client.chat_update.call_args.kwargs
         # ZWSP guard (#35144): trailing ":" inside bold gets U+200B before closing *
@@ -2841,7 +2845,7 @@ class TestEditMessageStreamingPipeline:
         adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
 
         content = "> **Important:** do this\nnormal line"
-        result = await adapter.edit_message("C123", "ts1", content)
+        result = await adapter.edit_message("C123", "ts1", content, metadata={"job_id": "test-approved-delivery"})
         assert result.success is True
         kwargs = adapter._app.client.chat_update.call_args.kwargs
         # ZWSP guard (#35144): trailing ":" inside bold gets U+200B before closing *
@@ -2853,7 +2857,7 @@ class TestEditMessageStreamingPipeline:
     async def test_edit_message_does_not_double_escape(self, adapter):
         """Pre-escaped entities in edited messages must not get double-escaped."""
         adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
-        await adapter.edit_message("C123", "ts1", "5 &gt; 3 and &amp; entity")
+        await adapter.edit_message("C123", "ts1", "5 &gt; 3 and &amp; entity", metadata={"job_id": "test-approved-delivery"})
         kwargs = adapter._app.client.chat_update.call_args.kwargs
         assert "&amp;gt;" not in kwargs["text"]
         assert "&amp;amp;" not in kwargs["text"]
@@ -2872,7 +2876,12 @@ class TestReactions:
     @pytest.mark.asyncio
     async def test_add_reaction_calls_api(self, adapter):
         adapter._app.client.reactions_add = AsyncMock()
-        result = await adapter._add_reaction("C123", "ts1", "eyes")
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "ts1"})
+        with slack_task(adapter, "C123", "U_USER", "reaction-task", thread_id="thread-1"):
+            posted = await adapter.send("C123", "Work started", metadata={"thread_id": "thread-1"})
+            assert posted.success and posted.message_id == "ts1"
+            adapter._app.client.reactions_add.reset_mock()
+            result = await adapter._add_reaction("C123", posted.message_id, "eyes")
         assert result is True
         adapter._app.client.reactions_add.assert_called_once_with(
             channel="C123", timestamp="ts1", name="eyes"
@@ -2882,8 +2891,16 @@ class TestReactions:
     @pytest.mark.asyncio
     async def test_remove_reaction_calls_api(self, adapter):
         adapter._app.client.reactions_remove = AsyncMock()
-        result = await adapter._remove_reaction("C123", "ts1", "eyes")
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ok": True, "ts": "ts1"})
+        with slack_task(adapter, "C123", "U_USER", "reaction-task", thread_id="thread-1"):
+            posted = await adapter.send("C123", "Work started", metadata={"thread_id": "thread-1"})
+            assert posted.success and posted.message_id == "ts1"
+            adapter._app.client.reactions_remove.reset_mock()
+            result = await adapter._remove_reaction("C123", posted.message_id, "eyes")
         assert result is True
+        adapter._app.client.reactions_remove.assert_called_once_with(
+            channel="C123", timestamp="ts1", name="eyes"
+        )
 
     @pytest.mark.asyncio
     async def test_reactions_in_message_flow(self, adapter):
@@ -2897,7 +2914,7 @@ class TestReactions:
         event = {
             "text": "hello",
             "user": "U_USER",
-            "channel": "C123",
+            "channel": "D123",
             "channel_type": "im",
             "ts": "1234567890.000001",
         }
@@ -2912,7 +2929,7 @@ class TestReactions:
 
         source = SessionSource(
             platform=Platform.SLACK,
-            chat_id="C123",
+            chat_id="D123",
             chat_type="dm",
             user_id="U_USER",
         )
@@ -2981,17 +2998,18 @@ class TestThreadReplyHandling:
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True
+        a.set_authorization_check(lambda user_id, *args, **kwargs: bool(user_id))
         a.handle_message = AsyncMock()
         a.set_session_store(mock_session_store)
         return a
 
 
     @pytest.mark.asyncio
-    async def test_thread_reply_without_mention_with_session_processed(
+    async def test_thread_reply_without_mention_with_historical_session_rejected(
         self, adapter_with_session_store, mock_session_store
     ):
-        """Thread replies without mention should be processed if there's an active session."""
-        # Simulate an active session for this thread
+        """A stored session is historical context, not a live requester task."""
+        # Simulate a persisted session without an executing requester task
         session_key = "agent:main:slack:group:T_TEAM:C123:123.000:U_USER"
         mock_session_store._entries = {session_key: MagicMock()}
 
@@ -3005,20 +3023,13 @@ class TestThreadReplyHandling:
             "team": "T_TEAM",
         }
         await adapter_with_session_store._handle_slack_message(event)
-        adapter_with_session_store.handle_message.assert_called_once()
-
-        # Verify the text is passed through unchanged (no mention stripping needed)
-        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
-        assert msg_event.text == "Follow-up question"
+        adapter_with_session_store.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_thread_reply_routes_when_parent_mentioned_bot(
+    async def test_thread_reply_rejected_when_only_parent_mentioned_bot(
         self, adapter_with_session_store, mock_session_store
     ):
-        """A plain thread reply should route when the thread parent mentioned
-        the bot (#24848) — e.g. parent says '<@bot> check this and ask me
-        before running', a later bare 'run' reply must wake the bot even
-        with no session and no in-memory mention tracking (restart-safe)."""
+        """A parent asking for a reply is not an actual pending clarify prompt."""
         mock_session_store._entries = {}
         adapter_with_session_store._has_active_session_for_thread = MagicMock(
             return_value=False
@@ -3063,21 +3074,14 @@ class TestThreadReplyHandling:
         }
         await adapter_with_session_store._handle_slack_message(event)
 
-        adapter_with_session_store.handle_message.assert_called_once()
-        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
-        assert msg_event.text == "run"
-        # Cold-start context carries the parent so the agent sees the ask.
-        assert "check this and ask me for run" in msg_event.channel_context
-        # Thread remembered so later replies skip the parent fetch.
-        assert "123.000" in adapter_with_session_store._mentioned_threads
+        adapter_with_session_store.handle_message.assert_not_called()
+        adapter_with_session_store._app.client.conversations_replies.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_top_level_mention_registers_thread_for_replies(
         self, adapter_with_session_store, mock_session_store
     ):
-        """A TOP-LEVEL @mention starts a thread (session-scoped thread_ts
-        falls back to the message ts); replies to it must auto-trigger, so
-        the synthetic root is registered in _mentioned_threads (#24848)."""
+        """A top-level request records context membership for its new thread."""
         mock_session_store._entries = {}
         adapter_with_session_store._has_active_session_for_thread = MagicMock(
             return_value=False
@@ -3194,6 +3198,7 @@ class TestAssistantThreadLifecycle:
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True
+        a.set_authorization_check(lambda user_id, *args, **kwargs: bool(user_id))
         a.handle_message = AsyncMock()
         a.set_session_store(mock_session_store)
         return a
@@ -3494,7 +3499,7 @@ class TestMessageSplitting:
     async def test_send_preserves_blockquote_formatting(self, adapter):
         """Blockquote '>' markers must survive format → chunk → send pipeline."""
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
-        await adapter.send("C123", "> quoted text\nnormal text")
+        await adapter.send("C123", "> quoted text\nnormal text", metadata={"job_id": "test-approved-delivery"})
         kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
         sent_text = kwargs["text"]
         assert sent_text.startswith("> quoted text")
@@ -3507,7 +3512,7 @@ class TestMessageSplitting:
         adapter.config.extra["unfurl_media"] = False
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
 
-        await adapter.send("C123", "https://example.com")
+        await adapter.send("C123", "https://example.com", metadata={"job_id": "test-approved-delivery"})
 
         kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
         assert kwargs["unfurl_links"] is False
@@ -3517,7 +3522,7 @@ class TestMessageSplitting:
     async def test_send_preserves_default_unfurl_behavior(self, adapter):
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
 
-        await adapter.send("C123", "https://example.com")
+        await adapter.send("C123", "https://example.com", metadata={"job_id": "test-approved-delivery"})
 
         kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
         assert "unfurl_links" not in kwargs
@@ -3534,7 +3539,7 @@ class TestMessageSplitting:
         adapter.config.extra["unfurl_media"] = "true"
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
 
-        await adapter.send("C123", "https://example.com")
+        await adapter.send("C123", "https://example.com", metadata={"job_id": "test-approved-delivery"})
 
         kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
         assert kwargs["unfurl_links"] is False
@@ -3547,7 +3552,7 @@ class TestMessageSplitting:
         adapter.config.extra["unfurl_media"] = 0
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
 
-        await adapter.send("C123", "https://example.com")
+        await adapter.send("C123", "https://example.com", metadata={"job_id": "test-approved-delivery"})
 
         kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
         assert "unfurl_links" not in kwargs
@@ -3559,7 +3564,7 @@ class TestMessageSplitting:
         adapter.config.extra["unfurl_media"] = False
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
 
-        await adapter.send("C123", "https://example.com/" + "x" * 45000)
+        await adapter.send("C123", "https://example.com/" + "x" * 45000, metadata={"job_id": "test-approved-delivery"})
 
         assert adapter._app.client.chat_postMessage.call_count >= 2
         for call in adapter._app.client.chat_postMessage.call_args_list:
@@ -3570,7 +3575,7 @@ class TestMessageSplitting:
     async def test_send_does_not_double_escape_entities(self, adapter):
         """Pre-escaped &amp; in sent messages must not become &amp;amp;."""
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
-        await adapter.send("C123", "Use &amp; for ampersand")
+        await adapter.send("C123", "Use &amp; for ampersand", metadata={"job_id": "test-approved-delivery"})
         kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
         assert "&amp;amp;" not in kwargs["text"]
         assert "&amp;" in kwargs["text"]
@@ -3583,7 +3588,7 @@ class TestEmptyTextGuard:
     async def test_send_skips_empty_string(self, adapter):
         """Empty content must not call chat_postMessage."""
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
-        result = await adapter.send("C123", "")
+        result = await adapter.send("C123", "", metadata={"job_id": "test-approved-delivery"})
         assert result.success is True
         adapter._app.client.chat_postMessage.assert_not_called()
 
@@ -3601,7 +3606,7 @@ class TestReplyBroadcast:
     async def test_broadcast_enabled_via_config(self, adapter):
         adapter.config.extra["reply_broadcast"] = True
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
-        await adapter.send("C123", "hi", metadata={"thread_id": "parent_ts"})
+        await adapter.send("C123", "hi", metadata={"thread_id": "parent_ts", "job_id": "test-approved-delivery"})
         kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
         assert kwargs.get("reply_broadcast") is True
 
@@ -3631,7 +3636,7 @@ class TestFallbackPreservesThreadContext:
             chat_id="C123",
             image_path=str(test_file),
             caption="test image",
-            metadata=metadata,
+            metadata={**metadata, "job_id": "test-approved-delivery"},
         )
 
         call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
@@ -3683,7 +3688,7 @@ class TestSendImageSSRFGuards:
             result = await adapter.send_image(
                 chat_id="C123",
                 image_url="https://public.example/image.png",
-                caption="see this",
+                caption="see this", metadata={"job_id": "test-approved-delivery"}
             )
 
         assert result.success
@@ -3717,9 +3722,11 @@ class TestSendMultipleImagesSSRFGuards:
             monkeypatch.delenv(proxy_var, raising=False)
 
         answers = iter(("93.184.216.34", "169.254.169.254"))
+        resolved_addresses = []
 
         def fake_getaddrinfo(_host, port, *_args, **_kwargs):
             ip = next(answers)
+            resolved_addresses.append(ip)
             return [
                 (socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 0))
             ]
@@ -3742,9 +3749,10 @@ class TestSendMultipleImagesSSRFGuards:
         adapter._app.client.files_upload_v2 = AsyncMock(return_value={"ok": True})
 
         await adapter.send_multiple_images(
-            "C123", [("http://rebind.example/image.png", "image")]
+            "C123", [("http://rebind.example/image.png", "image")], metadata={"job_id": "test-approved-delivery"}
         )
 
+        assert resolved_addresses == ["93.184.216.34", "169.254.169.254"]
         assert connect_attempts == []
         adapter._app.client.files_upload_v2.assert_not_awaited()
 
@@ -3997,7 +4005,7 @@ class TestSlashEphemeralAck:
             with patch(
                 "plugins.platforms.slack.adapter.aiohttp.ClientSession", return_value=mock_session
             ):
-                result = await adapter.send("C1", "Some response")
+                result = await adapter.send("C1", "Some response", metadata={"job_id": "test-approved-delivery"})
         finally:
             _slash_user_id.reset(token)
 
@@ -4046,7 +4054,7 @@ class TestSlashEphemeralAck:
             with patch(
                 "plugins.platforms.slack.adapter.aiohttp.ClientSession", return_value=mock_session
             ):
-                result = await adapter.send("C1", "Some response")
+                result = await adapter.send("C1", "Some response", metadata={"job_id": "test-approved-delivery"})
         finally:
             _slash_user_id.reset(token)
 
@@ -4084,7 +4092,7 @@ class TestSlashEphemeralAck:
             with patch(
                 "plugins.platforms.slack.adapter.aiohttp.ClientSession", return_value=mock_session
             ):
-                result = await adapter.send("C1", "Some response")
+                result = await adapter.send("C1", "Some response", metadata={"job_id": "test-approved-delivery"})
         finally:
             _slash_user_id.reset(token)
 
@@ -4205,7 +4213,7 @@ class TestSlashEphemeralAck:
                 "plugins.platforms.slack.adapter.aiohttp.ClientSession",
                 return_value=mock_session,
             ):
-                result = await adapter.send("C1", "Some response")
+                result = await adapter.send("C1", "Some response", metadata={"job_id": "test-approved-delivery"})
         finally:
             _slash_user_id.reset(token)
 
@@ -4824,6 +4832,7 @@ class TestThreadImageContext:
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
         a._running = True
+        a.set_authorization_check(lambda user_id, *args, **kwargs: bool(user_id))
         a.handle_message = AsyncMock()
         a.set_session_store(mock_session_store)
         return a
@@ -5063,8 +5072,8 @@ class TestNativeTaskCardProgress:
         second = [{"id": "call-1", "title": "terminal", "status": "complete"}]
 
         results = await asyncio.gather(
-            adapter.send_native_task_card_progress("C1", first, metadata=metadata),
-            adapter.send_native_task_card_progress("C1", second, metadata=metadata),
+            adapter.send_native_task_card_progress("C1", first, metadata={**metadata, "job_id": "test-approved-delivery"}),
+            adapter.send_native_task_card_progress("C1", second, metadata={**metadata, "job_id": "test-approved-delivery"}),
         )
 
         assert all(result.success for result in results)
@@ -5084,7 +5093,8 @@ class TestNativeTaskCardProgress:
         }
         adapter._app.client.api_call.assert_not_awaited()
 
-        await adapter.stop_native_task_card_progress("C1", metadata=metadata)
+        with slack_task(adapter, "C1", "U1", "progress-task", team_id="T1", thread_id="thread-1"):
+            await adapter.stop_native_task_card_progress("C1", metadata=metadata)
 
         assert team_client.api_call.await_args.args[0] == "chat.stopStream"
         assert adapter._native_task_card_streams == {}
@@ -5111,7 +5121,7 @@ class TestNativeTaskCardProgress:
                 adapter.send_native_task_card_progress(
                     "C-shared",
                     tasks,
-                    metadata={"thread_id": "thread-shared", "slack_team_id": team_id},
+                    metadata={"thread_id": "thread-shared", "slack_team_id": team_id, "job_id": "test-approved-delivery"},
                 )
                 for team_id in clients
             )
@@ -5132,11 +5142,12 @@ class TestNativeTaskCardProgress:
             {"ok": True},
             {"ok": True},
         ]
-        await adapter.send_native_task_card_progress(
-            "C1",
-            [{"id": "call-1", "title": "terminal", "status": "in_progress"}],
-            metadata={"thread_id": "thread-1"},
-        )
+        with slack_task(adapter, "C1", "U_USER", "disconnect-task", thread_id="thread-1"):
+            await adapter.send_native_task_card_progress(
+                "C1",
+                [{"id": "call-1", "title": "terminal", "status": "in_progress"}],
+                metadata={"thread_id": "thread-1"},
+            )
 
         await adapter.disconnect()
 

@@ -67,7 +67,7 @@ def adapter():
     return a
 
 
-METADATA = {"thread_id": "1784585355.415219"}
+METADATA = {"job_id": "status-test", "thread_id": "1784585355.415219"}
 
 
 @pytest.mark.asyncio

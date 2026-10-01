@@ -193,40 +193,38 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
 
 
 def _iter_skill_dirs(root: Path):
-    from agent.skill_utils import is_excluded_skill_path
-    for skill_md in root.rglob("SKILL.md"):
-        if not is_excluded_skill_path(skill_md):
-            yield skill_md.parent
+    from agent.skill_utils import iter_skill_index_files
+    for skill_md in iter_skill_index_files(root, "SKILL.md"):
+        yield skill_md.parent
 
 
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
-    """Find a skill (local skills dir, then skills.external_dirs) -> ``{"path": Path}`` | None.
+    """Resolve the reader's package identity, retaining its lexical projection path.
 
-    Accepts the bare dir name (``axolotl``; matches category-nested skills too) and the
-    categorized relative path (``mlops/axolotl``) — the two forms skill_view resolves. The
-    categorized form matches RELATIVE to the local root only (relative_to raises for external dirs)."""
-    from agent.skill_utils import get_all_skills_dirs
-    local_root = None
-    if "/" in name or "\\" in name:
-        try:
-            local_root = _skills_dir().resolve()
-        except OSError:
-            logger.debug(
-                "skills dir resolve failed; categorized lookups fall back to the unresolved path",
-                exc_info=True)
-            local_root = _skills_dir()
-    for skills_dir in get_all_skills_dirs():
-        if not skills_dir.exists():
-            continue
-        for skill_dir in _iter_skill_dirs(skills_dir):
-            if skill_dir.name == name:
-                return {"path": skill_dir}
-            if local_root is not None:
-                resolved = skill_dir.resolve()
-                if (resolved.is_relative_to(local_root)
-                        and resolved.relative_to(local_root).as_posix() == name):  # POSIX form
-                    return {"path": skill_dir}
-    return None
+    Ambiguous names raise ValueError instead of silently editing a different package.
+    Project skills and legacy flat files remain outside the manager's write ownership.
+    """
+    from agent.skill_utils import get_all_skills_dirs, get_project_skills_dirs, is_excluded_skill_path
+    from tools.skills_tool import _collect_skill_candidates, _skill_lookup_path_error
+    if error := _skill_lookup_path_error(name):
+        raise ValueError(error)
+    project_dirs = get_project_skills_dirs()
+    if _collect_skill_candidates(name, None, project_dirs):
+        raise ValueError(f"Skill '{name}' resolves in a project directory; use the project's file tools to edit it.")
+    candidates = [
+        (directory, skill_md)
+        for directory, skill_md in _collect_skill_candidates(name, None, get_all_skills_dirs())
+        if not is_excluded_skill_path(skill_md) and not is_excluded_skill_path(skill_md.resolve())
+    ]
+    if len(candidates) > 1:
+        raise ValueError(f"Ambiguous skill name '{name}': use a categorized path. Matches: "
+                         + ", ".join(str(md) for _, md in candidates))
+    if not candidates:
+        return None
+    directory, _ = candidates[0]
+    if directory is None:
+        raise ValueError(f"Skill '{name}' is a legacy flat file, not a managed skill package.")
+    return {"path": directory}
 
 
 def _find_skill_in_other_profiles(name: str) -> List[Tuple[str, Path]]:
@@ -325,6 +323,9 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = "", *,
     if not existing:
         return None, _err(_skill_not_found_error(name, not_found_suffix))
     skill_dir = existing["path"]
+    from tools.path_security import validate_within_dir
+    if error := validate_within_dir(skill_dir / "SKILL.md", skill_dir):
+        return None, _err(error)
     guard = ((org_guard and _org_mirror_write_guard(name, skill_dir, action))
              or _background_review_write_guard(name, skill_dir, action))
     return (None, guard) if guard else (skill_dir, None)
@@ -396,6 +397,9 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if existing := _find_skill(name):
         return _err(f"A skill named '{name}' already exists at {existing['path']}.")
     skill_dir = _resolve_skill_dir(name, category)
+    from tools.path_security import validate_within_dir
+    if err := validate_within_dir(skill_dir, _resolve_skill_dir(name).parent):
+        return _err(err)
     skill_dir.mkdir(parents=True, exist_ok=True)
     skill_md = skill_dir / "SKILL.md"
     atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
@@ -488,8 +492,12 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     skill_dir, guard = _locate_for_write(name, "delete")
     if guard := guard or _curator_consolidation_delete_guard(name, absorbed_into):
         return guard
-    if pinned_err := _pinned_guard(name):
-        return _err(pinned_err)
+    if unsafe := _validate_delete_target(skill_dir):
+        return _err(unsafe)
+    frontmatter, _ = _parse_frontmatter((skill_dir / "SKILL.md").read_text(encoding="utf-8"))
+    for identity in {name, skill_dir.name, str(frontmatter.get("name", skill_dir.name))}:
+        if pinned_err := _pinned_guard(identity):
+            return _err(pinned_err)
     absorbed_target = absorbed_into.strip() if isinstance(absorbed_into, str) else ""
     if absorbed_target:
         if absorbed_target == name:
@@ -498,8 +506,6 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
             return _err(f"absorbed_into='{absorbed_target}' does not exist. "
                         f"Create or patch the umbrella skill first, then retry the delete.")
     skills_root = _containing_skills_root(skill_dir)
-    if unsafe := _validate_delete_target(skill_dir):  # defense-in-depth before rmtree
-        return _err(unsafe)
     # Curator consolidations must be RECOVERABLE (`hermes curator restore`): archive instead
     # of rmtree. Foreground deletes keep hard-delete semantics.
     absorbed_note = f" Content absorbed into '{absorbed_target}'." if absorbed_target else ""
@@ -767,7 +773,10 @@ def skill_manage(
             return tool_error(message, success=False)
     handler = _ACTION_HANDLERS.get(action, lambda a: _err(
         f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"))
-    result = handler({"name": name, **args})
+    try:
+        result = handler({"name": name, **args})
+    except ValueError as exc:
+        return json.dumps(_err(str(exc)), ensure_ascii=False)
     if isinstance(result, str):
         return result  # tool_error JSON for argument-shape problems (patch)
     if result.get("success"):

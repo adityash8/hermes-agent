@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 from collections.abc import Callable
+from contextvars import ContextVar, Token
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,31 @@ if _DEBUG_INTERRUPT:
 _interrupted_threads: set[int] = set()
 _interrupt_reasons: dict[int, str] = {}
 _lock = threading.Lock()
+
+# Request lifetime follows copied contexts, unlike a worker's reusable thread id.
+_tool_execution_check: ContextVar[Callable[[], bool] | None] = ContextVar(
+    "tool_execution_check", default=None)
+
+
+def set_tool_execution_check(check: Callable[[], bool]) -> Token:
+    """Bind a host-owned request lifetime check; this does not grant tool access."""
+    return _tool_execution_check.set(check)
+
+
+def reset_tool_execution_check(token: Token) -> None:
+    _tool_execution_check.reset(token)
+
+
+def tool_execution_allowed() -> bool:
+    """Unscoped callers retain normal behavior; a failed bound check denies dispatch."""
+    check = _tool_execution_check.get()
+    if check is None:
+        return True
+    try:
+        return check() is True
+    except Exception:
+        # Neither request content nor an authorization exception belongs in tool output.
+        return False
 
 
 def set_interrupt(active: bool, thread_id: int | None = None, *, reason: str | None = None) -> None:

@@ -141,10 +141,13 @@ class TestCodexVocabulary:
         assert clamp_effort("ultra", CODEX_GPT56_EFFORTS) == "max"
 
     def test_per_model_max_support(self):
-        """Live-verified (Aug 2026, #68365): 'max' is gpt-5.6-only — gpt-5.5
-        rejects it ("Supported values are: 'none','low','medium','high',
-        'xhigh'"); 'minimal' is rejected by both generations."""
+        """Only catalog/live-proven Codex models may use ``max``.
+
+        gpt-5.6 and the live-proven GPT-6 Astra/Sol/Luna variants have a max
+        tier. Unknown GPT-6 variants retain the legacy ceiling.
+        """
         from agent.reasoning_effort import (
+            CODEX_GPT6_EFFORTS,
             CODEX_GPT56_EFFORTS,
             CODEX_LEGACY_EFFORTS,
             codex_supported_efforts,
@@ -152,10 +155,16 @@ class TestCodexVocabulary:
 
         assert codex_supported_efforts("gpt-5.6") is CODEX_GPT56_EFFORTS
         assert codex_supported_efforts("gpt-5.6-codex") is CODEX_GPT56_EFFORTS
+        assert codex_supported_efforts("gpt-6-luna") is CODEX_GPT6_EFFORTS
+        assert codex_supported_efforts("openai/gpt-6-luna") is CODEX_GPT6_EFFORTS
+        assert codex_supported_efforts("gpt-6-astra") is CODEX_GPT6_EFFORTS
+        assert codex_supported_efforts("gpt-6-sol") is CODEX_GPT6_EFFORTS
+        assert codex_supported_efforts("gpt-6-unverified") is CODEX_LEGACY_EFFORTS
         assert codex_supported_efforts("gpt-5.5") is CODEX_LEGACY_EFFORTS
         assert codex_supported_efforts("o5-pro") is CODEX_LEGACY_EFFORTS
         # The consequential clamps:
         assert clamp_effort("max", CODEX_GPT56_EFFORTS) == "max"
+        assert clamp_effort("max", CODEX_GPT6_EFFORTS) == "max"
         assert clamp_effort("max", CODEX_LEGACY_EFFORTS) == "xhigh"
         assert clamp_effort("ultra", CODEX_LEGACY_EFFORTS) == "xhigh"
         assert clamp_effort("minimal", CODEX_LEGACY_EFFORTS) == "low"

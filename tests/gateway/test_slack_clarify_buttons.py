@@ -48,6 +48,7 @@ def _ensure_slack_mock():
 _ensure_slack_mock()
 
 from plugins.platforms.slack.adapter import SlackAdapter
+from tests.gateway.slack_admission_helpers import slack_task
 from gateway.config import PlatformConfig
 
 
@@ -98,14 +99,16 @@ class TestSlackSendClarify:
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+        adapter.set_authorization_check(lambda user_id, *_, **kwargs: user_id == "U_REQUESTER")
 
-        result = await adapter.send_clarify(
-            chat_id="C1",
-            question="Which environment?",
-            choices=["staging", "production"],
-            clarify_id="cid1",
-            session_key="sk1",
-        )
+        with slack_task(adapter, "C1", "U_REQUESTER", "sk1", team_id="T1", thread_id="100.1"):
+            result = await adapter.send_clarify(
+                chat_id="C1",
+                question="Which environment?",
+                choices=["staging", "production"],
+                clarify_id="cid1",
+                session_key="sk1", metadata={"thread_id": "100.1"},
+            )
 
         assert result.success is True
         assert result.message_id == "1234.5678"
@@ -139,14 +142,16 @@ class TestSlackSendClarify:
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1.1"})
+        adapter.set_authorization_check(lambda user_id, *_, **kwargs: user_id == "U_REQUESTER")
 
-        await adapter.send_clarify(
-            chat_id="C1",
-            question="Use <A> & <B>?",
-            choices=["yes"],
-            clarify_id="cid2",
-            session_key="sk2",
-        )
+        with slack_task(adapter, "C1", "U_REQUESTER", "sk2", team_id="T1", thread_id="100.1"):
+            await adapter.send_clarify(
+                chat_id="C1",
+                question="Use <A> & <B>?",
+                choices=["yes"],
+                clarify_id="cid2",
+                session_key="sk2", metadata={"thread_id": "100.1"},
+            )
         section_text = mock_client.chat_postMessage.call_args[1]["blocks"][0]["text"]["text"]
         assert "<A>" not in section_text
         assert "&lt;A&gt;" in section_text
@@ -167,7 +172,7 @@ class TestSlackClarifyChoiceAction:
         from tools import clarify_gateway as cm
 
         adapter = _make_adapter()
-        _attach_auth_runner(adapter, auth_fn=lambda _s: False)
+        _attach_auth_runner(adapter, auth_fn=lambda source: source.user_id == "U_BAD")
         cm.register("cidAuth", "sk-auth", "Pick", ["a", "b"])
         adapter._clarify_resolved["2.2"] = False
 
@@ -179,7 +184,16 @@ class TestSlackClarifyChoiceAction:
         }
         action = {"action_id": "hermes_clarify_choice", "value": "cidAuth|0"}
 
+        client = adapter._team_clients["T1"]
+        client.chat_postMessage = AsyncMock(return_value={"ts": "2.2"})
+        # Admission existed when sent; current authorization must still gate clicks.
+        with slack_task(adapter, "C1", "U_BAD", "sk-auth", team_id="T1", thread_id="100.1"):
+            assert (await adapter.send_clarify(
+                "C1", "Pick", ["a", "b"], "cidAuth", "sk-auth", metadata={"thread_id": "100.1"})).success
+        _attach_auth_runner(adapter, auth_fn=lambda _s: False)
+        body["team"] = {"id": "T1"}
         await adapter._handle_clarify_action(ack, body, action)
+        client.chat_update.assert_not_awaited()
 
         with cm._lock:
             entry = cm._entries.get("cidAuth")
@@ -218,6 +232,11 @@ class TestSlackClarifyOtherFlow:
         }
         action = {"action_id": "hermes_clarify_other", "value": "cidO|other"}
 
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "4.4"})
+        with slack_task(adapter, "C1", "U_N", "sk-other", team_id="T1", thread_id="100.1"):
+            assert (await adapter.send_clarify(
+                "C1", "Pick", ["x", "y"], "cidO", "sk-other", metadata={"thread_id": "100.1"})).success
+        body["team"] = {"id": "T1"}
         await adapter._handle_clarify_action(ack, body, action)
 
         # Entry flipped to text-capture; NOT yet resolved.
