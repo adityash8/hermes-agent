@@ -1800,18 +1800,17 @@ class SlackAdapter(SlackParticipationMixin):
         return (str(team_id), str(message_id)) if team_id else str(message_id)
 
     def scope_id_for_chat(self, chat_id: str) -> Optional[str]:
+        """Return the workspace id owning ``chat_id``.
+        ``None`` for unknown channels and for channels claimed by several workspaces (dropped from
+        the map) — no scope beats a wrong one."""
+        team_id = chat_id and (getattr(self, "_channel_team", None) or {}).get(str(chat_id))
+        return str(team_id) if team_id else None
+
+    def toolsets_for_source(self, source):
         """Grant from gateway.restricted_users, else the platform default.
 
         An empty grant means this sender gets no tools. None means unrestricted.
         """
-        from gateway.run import _load_gateway_config
-        from plugins.platforms.slack.restricted_grant import grant_toolsets
-
-        source_user = getattr(getattr(self, "_toolset_source", None), "user_id", None)
-        # toolsets_for_source is the real seam; this helper is not used.
-        return None
-
-    def toolsets_for_source(self, source):
         from gateway.run import _load_gateway_config
         from plugins.platforms.slack.restricted_grant import grant_toolsets
 
@@ -1823,12 +1822,6 @@ class SlackAdapter(SlackParticipationMixin):
             return None
         granted = grant_toolsets(config, user_id, chat_id)
         return granted
-
-        """Return the workspace id owning ``chat_id``.
-        ``None`` for unknown channels and for channels claimed by several workspaces (dropped from
-        the map) — no scope beats a wrong one."""
-        team_id = chat_id and (getattr(self, "_channel_team", None) or {}).get(str(chat_id))
-        return str(team_id) if team_id else None
 
     def _get_client(self, chat_id: str, team_id: Optional[str] = None) -> Any:
         """Return the workspace-specific WebClient for a channel."""
