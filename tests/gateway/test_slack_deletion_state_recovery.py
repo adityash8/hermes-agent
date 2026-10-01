@@ -216,9 +216,10 @@ async def test_unencodable_state_is_healed_so_a_new_mute_survives_restart(caplog
 
 
 @pytest.mark.asyncio
-async def test_failed_save_is_logged_and_an_already_posted_send_still_succeeds(caplog, monkeypatch):
+@pytest.mark.parametrize("error", [ValueError, RecursionError])  # RecursionError: indent=2 uses the pure-Python encoder
+async def test_failed_save_is_logged_and_an_already_posted_send_still_succeeds(caplog, monkeypatch, error):
     def refuse(*args, **kwargs):
-        raise ValueError("unencodable")
+        raise error("cannot encode")
 
     monkeypatch.setattr(deletion_state, "atomic_json_write", refuse)
     adapter, client = make_adapter()

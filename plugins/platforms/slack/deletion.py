@@ -217,7 +217,8 @@ class SlackDeletionMixin(BasePlatformAdapter):
                 json.dumps(key): surface for key, surface in self._slack_sent_surfaces.items()}
         try:
             atomic_json_write(self._slack_deletion_path, self._slack_deletions, mode=0o600)
-        except (OSError, ValueError):  # ValueError: e.g. a lone surrogate read back from a hand-edited file
+        except (OSError, ValueError, RecursionError):
+            # ValueError: an unencodable string; RecursionError: indent=2 uses the shallower pure-Python encoder.
             logger.exception("[Slack] Cannot persist deletion state; mute is memory-only until restart")
 
     def _deletion_messages(self):
