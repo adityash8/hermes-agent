@@ -3,6 +3,7 @@
 Client context stays fail-closed for every channel, but the failure is logged as an
 ERROR once, shown in /status, and the operator's own Slack home DM keeps working.
 """
+import json
 import logging
 from datetime import datetime
 from types import SimpleNamespace
@@ -78,6 +79,17 @@ def test_home_channel_that_is_not_a_dm_gets_no_exemption(home, monkeypatch):
 def test_no_home_channel_means_no_exemption(home, monkeypatch):
     monkeypatch.delenv("SLACK_HOME_CHANNEL")
     assert cc.applies(broken(home), slack(HOME_DM))
+
+
+@pytest.mark.parametrize("legacy", [{"enabled": False}, {"enabled": True, "manifest": "clients.yaml"}],
+                         ids=["legacy-off", "legacy-on"])
+def test_load_failure_overrides_legacy_gateway_json_client_context(home, legacy):
+    """A legacy gateway.json value cannot prove what the unreadable config.yaml said."""
+    (home / "gateway.json").write_text(json.dumps({"client_context": legacy}), encoding="utf-8")
+    config = broken(home)
+    assert config.client_context == {}
+    assert cc.applies(config, slack("C0CLIENT"))
+    assert not cc.applies(config, slack(HOME_DM))
 
 
 def test_healthy_config_with_malformed_client_context_still_denies_home_dm(home):

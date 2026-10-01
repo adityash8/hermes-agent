@@ -259,6 +259,25 @@ class TestBuildSessionContextPrompt:
         assert (session._SLACK_HOME_DM_NO_TOOLS_NOTE in prompt) is expect_home
         assert (session._SLACK_NO_TOOLS_NOTE in prompt) is not expect_home
 
+    @pytest.mark.parametrize(
+        ("home_chat_id", "source_chat_id"),
+        [("C_HOME", "G_GROUPDM"), ("C_HOME", "C_GROUPDM"), ("G_GROUPDM", "G_GROUPDM")],
+        ids=["owner-in-group-dm", "owner-in-new-style-group-dm", "home-is-a-group-dm"],
+    )
+    def test_slack_group_dm_never_gets_home_dm_guidance(self, monkeypatch, home_chat_id, source_chat_id):
+        """Slack reports group DMs (mpim) as chat_type "dm"; other people there must not get the internal note."""
+        from gateway import session
+
+        monkeypatch.setattr(session, "_slack_tools_loaded", lambda: False)
+        home = HomeChannel(platform=Platform.SLACK, chat_id=home_chat_id, name="home", user_id="U_OWNER")
+        ctx = build_session_context(
+            SessionSource(platform=Platform.SLACK, chat_id=source_chat_id, chat_type="dm", user_id="U_OWNER"),
+            GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="fake", home_channel=home)}),
+        )
+        prompt = build_session_context_prompt(ctx)
+        assert session._SLACK_HOME_DM_NO_TOOLS_NOTE not in prompt
+        assert session._SLACK_NO_TOOLS_NOTE in prompt
+
     def test_slack_tools_loaded_detects_real_mcp_registration(self):
         """Regression (review of #63234): a connected MCP server whose tools
         are ACTUALLY registered in the live registry must be detected as

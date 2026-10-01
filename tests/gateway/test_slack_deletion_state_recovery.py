@@ -87,3 +87,35 @@ async def test_muted_record_missing_fields_neither_crashes_nor_skips_authorizati
     await adapter._handle_slack_message(mention("<@UBOT> resume", ts="140.000002"))
     adapter.handle_message.assert_awaited_once()
     assert (await adapter.send("C1", "reopened", metadata=META)).success
+
+
+@pytest.mark.asyncio
+async def test_one_bad_record_keeps_every_valid_fence_across_restart(caplog):
+    path = _state_path()
+    fence = {"muted": True, "cutoff": "1.0", "generation": 1}
+    payload = json.dumps({"threads": {KEY: fence, "bad": "x"}, "cleanup": {}}).encode()
+    path.write_bytes(payload)
+    adapter, client = make_adapter()
+    caplog.set_level(logging.ERROR, logger="plugins.platforms.slack.deletion")
+
+    assert not (await adapter.send("C1", "must stay muted", metadata=META)).success
+    assert not client.mock_calls
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and str(path) in errors[0].getMessage() and "dropped 1" in errors[0].getMessage()
+    quarantined = list(path.parent.glob("slack-deletions.json.corrupt-*"))
+    assert len(quarantined) == 1 and quarantined[0].read_bytes() == payload
+    assert json.loads(path.read_text(encoding="utf-8"))["threads"] == {KEY: fence}
+
+    restarted, client = make_adapter()
+    assert not (await restarted.send("C1", "still muted after restart", metadata=META)).success
+    assert not client.mock_calls
+    assert len([r for r in caplog.records if r.levelno == logging.ERROR]) == 1
+
+
+def test_malformed_sent_receipts_are_dropped_not_raised():
+    good = [json.dumps(["T1", "C1", "9.000001"]), ["T1", "C1", META["thread_id"]]]
+    _state_path().write_text(json.dumps({"threads": {}, "cleanup": {}, "sent": {
+        "not-json": ["T1", "C1", "1.0"], json.dumps(["T1", "C1"]): ["T1", "C1", "1.0"],
+        json.dumps(["T1", "C1", "2.0"]): "not-a-surface", good[0]: good[1]}}), encoding="utf-8")
+    adapter, _ = make_adapter()
+    assert adapter._deletion_messages() == {("T1", "C1", "9.000001"): ("T1", "C1", META["thread_id"])}

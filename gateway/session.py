@@ -300,9 +300,12 @@ _SLACK_HOME_DM_NO_TOOLS_NOTE = (
 
 
 def _is_slack_home_dm(context: SessionContext) -> bool:
-    """True only for a DM in the configured Slack home lane; no home configured fails closed."""
+    """True only for a 1:1 DM in the configured Slack home lane; no home configured fails closed.
+
+    Slack reports group DMs as chat_type "dm" too; only 1:1 DM ids start with "D".
+    """
     source, home = context.source, context.home_channels.get(Platform.SLACK)
-    if home is None or source.chat_type != "dm":
+    if home is None or source.chat_type != "dm" or not str(source.chat_id or "").startswith("D"):
         return False
     return source.chat_id == home.chat_id or bool(home.user_id and source.user_id == home.user_id)
 

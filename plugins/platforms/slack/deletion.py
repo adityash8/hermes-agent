@@ -14,6 +14,7 @@ import inspect
 import json
 import logging
 import re
+import shutil
 import time
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -30,10 +31,32 @@ _delivery_scope: contextvars.ContextVar[tuple[Any, tuple[str, str, str], int] | 
 _scheduled_delivery: contextvars.ContextVar[bool] = contextvars.ContextVar("slack_scheduled_delivery", default=False)
 
 
-def _valid_deletion_state(state) -> bool:
-    return (isinstance(state, dict) and isinstance(state.get("threads"), dict)
-            and all(isinstance(record, dict) for record in state["threads"].values())
-            and all(isinstance(state.get(part, {}), dict) for part in ("cleanup", "sent")))
+def _sent_receipt_ok(key, surface) -> bool:
+    try:
+        sent = json.loads(key)
+    except ValueError:
+        return False
+    return all(isinstance(part, list) and len(part) == 3 for part in (sent, surface))
+
+
+def _salvage_deletion_state(state) -> tuple[dict, int]:
+    """Drop malformed entries but keep every valid fence; ValueError when there is no thread map at all."""
+    if not isinstance(state, dict) or not isinstance(state.get("threads"), dict):
+        raise ValueError("Invalid Slack deletion state")
+    clean = {**state, "threads": {key: record for key, record in state["threads"].items() if isinstance(record, dict)}}
+    dropped = len(state["threads"]) - len(clean["threads"])
+    for part in ("cleanup", "sent"):
+        if not isinstance(state.get(part, {}), dict):
+            clean[part], dropped = {}, dropped + 1
+    if "sent" in clean:
+        receipts = {key: surface for key, surface in clean["sent"].items() if _sent_receipt_ok(key, surface)}
+        dropped += len(clean["sent"]) - len(receipts)
+        clean["sent"] = receipts
+    return clean, dropped
+
+
+def _corrupt_copy_path(path):
+    return path.with_name(f"{path.name}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}")
 
 
 class DeletedSurfaceError(RuntimeError):
@@ -127,17 +150,16 @@ class SlackDeletionMixin(BasePlatformAdapter):
     def _deletion_state(self):
         if not hasattr(self, "_slack_deletions"):
             self._slack_deletion_path = path = get_hermes_home() / "slack-deletions.json"
+            dropped = 0
             try:
-                state = json.loads(path.read_text(encoding="utf-8"))
-                if not _valid_deletion_state(state):
-                    raise ValueError("Invalid Slack deletion state")
+                state, dropped = _salvage_deletion_state(json.loads(path.read_text(encoding="utf-8")))
             except FileNotFoundError:
                 state = {"threads": {}, "cleanup": {}}
             except (OSError, ValueError) as exc:
                 # EZ-853: a bad file must not crash every Slack event. Reopen loudly, once,
                 # and keep the file; the next observed deletion re-fences its surface.
                 state = {"threads": {}, "cleanup": {}}
-                quarantine = path.with_name(f"{path.name}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}")
+                quarantine = _corrupt_copy_path(path)
                 try:
                     path.rename(quarantine)
                     kept = f"moved to {quarantine.name}"
@@ -147,6 +169,17 @@ class SlackDeletionMixin(BasePlatformAdapter):
                     "[Slack] Unreadable deletion state %s (%s); %s. Starting empty: threads deleted "
                     "before now are not fenced until deleted again.", path, type(exc).__name__, kept)
             self._slack_deletions = state
+            if dropped:
+                # Copy the original aside, then persist the salvaged state so a restart keeps the fences.
+                quarantine = _corrupt_copy_path(path)
+                try:
+                    shutil.copy2(path, quarantine)
+                    kept = f"copied to {quarantine.name}"
+                except OSError:
+                    kept = "could not copy it aside"
+                logger.error("[Slack] Malformed entries in deletion state %s; dropped %d (%s). "
+                             "Every well-formed fence is kept.", path, dropped, kept)
+                self._save_deletions()
         return self._slack_deletions
 
     def _save_deletions(self):

@@ -828,8 +828,9 @@ def load_gateway_config() -> GatewayConfig:
     try:
         config_loader.load_yaml_layer(_home, gw_data)
     except Exception as e:
-        # A failed config read cannot prove the isolation feature was absent/off.
-        gw_data.setdefault("client_context", {})
+        # A failed config read cannot prove the isolation feature was absent/off, and neither can a
+        # legacy gateway.json value: always close it (EZ-852).
+        gw_data["client_context"] = {}
         load_error = _config_load_error(e)
         # DingTalk settings → env vars: migrated to the dingtalk plugin's apply_yaml_config_fn hook
         # (plugins/platforms/dingtalk/adapter.py). #41112 / #3823.
