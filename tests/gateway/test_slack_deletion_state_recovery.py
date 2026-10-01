@@ -1,9 +1,11 @@
 """EZ-853: a bad slack-deletions.json must not take every Slack message offline."""
 import json
 import logging
+import time
 
 import pytest
 
+import plugins.platforms.slack.deletion as deletion_state
 from hermes_constants import get_hermes_home
 from tests.gateway.test_slack_message_deletion import META, deletion, make_adapter, mention
 
@@ -20,8 +22,8 @@ def _state_path():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("payload", [
     b'{"threads": {"[\\"T1\\"', b"\xff\xfe not utf-8", b"[]", b'{"threads": []}',
-    b'{"threads": {"k": "not-a-record"}}', b'{"threads": {}, "sent": []}',
-], ids=["truncated", "not-utf8", "list", "threads-list", "record-not-dict", "sent-list"])
+    b'{"threads": {"k": "not-a-record"}}', b'{"threads": {}, "sent": []}', b"[" * 100000 + b"]" * 100000,
+], ids=["truncated", "not-utf8", "list", "threads-list", "record-not-dict", "sent-list", "deep-nesting"])
 async def test_corrupt_state_is_quarantined_logged_once_and_slack_keeps_working(caplog, payload):
     path = _state_path()
     path.write_bytes(payload)
@@ -158,7 +160,7 @@ async def test_wrong_typed_thread_field_is_reset_so_a_delete_still_mutes(caplog,
     assert len(errors) == 1 and "dropped or reset 1" in errors[0].getMessage()
 
 
-SUMMON_BREAKERS = DELETE_BREAKERS[:6]
+SUMMON_BREAKERS = DELETE_BREAKERS[:3]  # cutoff resets are covered by the replay test below
 
 
 @pytest.mark.asyncio
@@ -181,9 +183,44 @@ async def test_wrong_typed_thread_field_is_reset_and_kept_muted_until_summoned(f
 
 
 @pytest.mark.asyncio
-async def test_unencodable_state_is_logged_and_the_send_still_succeeds(caplog):
-    # A lone surrogate is valid JSON but cannot be written back as UTF-8.
-    _state_path().write_text('{"threads": {}, "cleanup": {"\\ud800": 1}}', encoding="utf-8")
+@pytest.mark.parametrize("cutoff", [123, None, ["x"]], ids=["int", "NoneType", "list"])
+async def test_muted_record_with_wrong_typed_cutoff_still_refuses_replayed_mentions(cutoff):
+    record = {"muted": True, "generation": 1, "cutoff": cutoff, "deleted": ["101.000001"]}
+    _state_path().write_text(json.dumps({"threads": {KEY: record}, "cleanup": {}}), encoding="utf-8")
+    adapter, _ = make_adapter()
+    adapter._authorization_check = lambda *args, **kwargs: True
+
+    await adapter._handle_slack_message(mention("<@UBOT> replayed from before the reload", ts="140.000002"))
+    adapter.handle_message.assert_not_awaited()
+    await adapter._handle_slack_message(mention("<@UBOT> fresh", ts=f"{time.time() + 60:.6f}"))
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_unencodable_state_is_healed_so_a_new_mute_survives_restart(caplog):
+    # A lone surrogate is valid JSON but cannot be written back as UTF-8, so every later save would fail.
+    path = _state_path()
+    path.write_text('{"threads": {}, "cleanup": {"\\ud800": 1}}', encoding="utf-8")
+    adapter, _ = make_adapter()
+    caplog.set_level(logging.ERROR, logger="plugins.platforms.slack.deletion")
+
+    assert (await adapter.send("C1", "open thread", metadata=META)).success
+    await adapter._handle_slack_message(deletion())
+    restarted, client = make_adapter()
+    assert not (await restarted.send("C1", "still muted after restart", metadata=META)).success
+    assert not client.mock_calls
+    assert "ud800" not in path.read_text(encoding="utf-8")
+    assert len(list(path.parent.glob(path.name + ".corrupt-*"))) == 1
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "dropped or reset 1" in errors[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_failed_save_is_logged_and_an_already_posted_send_still_succeeds(caplog, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise ValueError("unencodable")
+
+    monkeypatch.setattr(deletion_state, "atomic_json_write", refuse)
     adapter, client = make_adapter()
     caplog.set_level(logging.ERROR, logger="plugins.platforms.slack.deletion")
 

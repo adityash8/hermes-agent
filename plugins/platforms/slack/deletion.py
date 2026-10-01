@@ -50,6 +50,9 @@ def _salvage_record(record) -> tuple[dict, int]:
     wrong = [field for field, kind in _RECORD_FIELDS.items() if field in clean and type(clean[field]) is not kind]
     for field in wrong:
         clean[field] = _RECORD_FIELDS[field]()
+    if "cutoff" in wrong and clean.get("muted"):
+        # An empty cutoff would let a replayed pre-deletion mention reopen the thread; only newer ones may.
+        clean["cutoff"] = f"{time.time():.6f}"
     return clean, len(wrong)
 
 
@@ -57,8 +60,14 @@ def _salvage_deletion_state(state) -> tuple[dict, int]:
     """Drop malformed entries but keep every valid fence; ValueError when there is no thread map at all."""
     if not isinstance(state, dict) or not isinstance(state.get("threads"), dict):
         raise ValueError("Invalid Slack deletion state")
-    clean = {**state, "threads": {}}
     dropped = 0
+    text = json.dumps(state, ensure_ascii=False)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # A lone surrogate escape parses but can never be saved again, so every later fence would be memory-only.
+        state, dropped = json.loads(text.encode("utf-8", "replace")), 1
+    clean = {**state, "threads": {}}
     for key, record in state["threads"].items():
         if not isinstance(record, dict):
             dropped += 1
@@ -175,7 +184,7 @@ class SlackDeletionMixin(BasePlatformAdapter):
                 state, dropped = _salvage_deletion_state(json.loads(path.read_text(encoding="utf-8")))
             except FileNotFoundError:
                 state = {"threads": {}, "cleanup": {}}
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, RecursionError) as exc:  # RecursionError: absurdly nested JSON
                 # EZ-853: a bad file must not crash every Slack event. Reopen loudly, once,
                 # and keep the file; the next observed deletion re-fences its surface.
                 state = {"threads": {}, "cleanup": {}}
