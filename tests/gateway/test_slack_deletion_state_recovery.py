@@ -101,7 +101,7 @@ async def test_one_bad_record_keeps_every_valid_fence_across_restart(caplog):
     assert not (await adapter.send("C1", "must stay muted", metadata=META)).success
     assert not client.mock_calls
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(errors) == 1 and str(path) in errors[0].getMessage() and "dropped 1" in errors[0].getMessage()
+    assert len(errors) == 1 and str(path) in errors[0].getMessage() and "dropped or reset 1" in errors[0].getMessage()
     quarantined = list(path.parent.glob("slack-deletions.json.corrupt-*"))
     assert len(quarantined) == 1 and quarantined[0].read_bytes() == payload
     assert json.loads(path.read_text(encoding="utf-8"))["threads"] == {KEY: fence}
@@ -130,3 +130,63 @@ def test_deeply_nested_sent_receipt_key_is_dropped_not_raised():
         deep: ["T1", "C1", "1.0"], good[0]: good[1]}}), encoding="utf-8")
     adapter, _ = make_adapter()
     assert adapter._deletion_messages() == {("T1", "C1", "9.000001"): ("T1", "C1", META["thread_id"])}
+
+
+DELETE_BREAKERS = [("generation", "2"), ("generation", None), ("generation", [1]),
+                   ("cutoff", 5), ("cutoff", None), ("cutoff", ["1.0"]), ("deleted", None), ("deleted", 3)]
+FIELD_DEFAULTS = {"generation": 0, "cutoff": "", "deleted": []}
+
+
+def _ids(cases):
+    return [f"{field}-{type(value).__name__}" for field, value in cases]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), DELETE_BREAKERS, ids=_ids(DELETE_BREAKERS))
+async def test_wrong_typed_thread_field_is_reset_so_a_delete_still_mutes(caplog, field, value):
+    record = {"muted": False, "generation": 1, "cutoff": "1.0", "deleted": [], field: value}
+    _state_path().write_text(json.dumps({"threads": {KEY: record}, "cleanup": {}}), encoding="utf-8")
+    adapter, client = make_adapter()
+    caplog.set_level(logging.ERROR, logger="plugins.platforms.slack.deletion")
+
+    assert (await adapter.send("C1", "open thread", metadata=META)).success
+    await adapter._handle_slack_message(deletion())
+    client.reset_mock()
+    assert not (await adapter.send("C1", "must be muted now", metadata=META)).success
+    assert not client.mock_calls
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "dropped or reset 1" in errors[0].getMessage()
+
+
+SUMMON_BREAKERS = DELETE_BREAKERS[:6]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), SUMMON_BREAKERS, ids=_ids(SUMMON_BREAKERS))
+async def test_wrong_typed_thread_field_is_reset_and_kept_muted_until_summoned(field, value):
+    record = {"muted": True, "generation": 1, "cutoff": "1.0", "deleted": ["101.000001"], field: value}
+    path = _state_path()
+    path.write_text(json.dumps({"threads": {KEY: record}, "cleanup": {}}), encoding="utf-8")
+    adapter, _ = make_adapter()
+
+    assert not (await adapter.send("C1", "still muted", metadata=META)).success
+    saved = json.loads(path.read_text(encoding="utf-8"))["threads"][KEY]
+    assert saved == {**record, field: FIELD_DEFAULTS[field]}
+    assert len(list(path.parent.glob("slack-deletions.json.corrupt-*"))) == 1
+
+    adapter._authorization_check = lambda *args, **kwargs: True
+    await adapter._handle_slack_message(mention("<@UBOT> resume", ts="140.000002"))
+    adapter.handle_message.assert_awaited_once()
+    assert (await adapter.send("C1", "reopened", metadata=META)).success
+
+
+@pytest.mark.asyncio
+async def test_unencodable_state_is_logged_and_the_send_still_succeeds(caplog):
+    # A lone surrogate is valid JSON but cannot be written back as UTF-8.
+    _state_path().write_text('{"threads": {}, "cleanup": {"\\ud800": 1}}', encoding="utf-8")
+    adapter, client = make_adapter()
+    caplog.set_level(logging.ERROR, logger="plugins.platforms.slack.deletion")
+
+    assert (await adapter.send("C1", "posted", metadata=META)).success
+    client.chat_postMessage.assert_awaited_once()
+    assert any("Cannot persist deletion state" in r.getMessage() for r in caplog.records)

@@ -41,12 +41,30 @@ def _sent_receipt_ok(key, surface) -> bool:
                for part in (sent, surface))
 
 
+_RECORD_FIELDS = {"generation": int, "cutoff": str, "deleted": list}
+
+
+def _salvage_record(record) -> tuple[dict, int]:
+    """Reset wrong-typed fields to their missing-field defaults (0, "", []); dropping the record would unmute it."""
+    clean = dict(record)
+    wrong = [field for field, kind in _RECORD_FIELDS.items() if field in clean and type(clean[field]) is not kind]
+    for field in wrong:
+        clean[field] = _RECORD_FIELDS[field]()
+    return clean, len(wrong)
+
+
 def _salvage_deletion_state(state) -> tuple[dict, int]:
     """Drop malformed entries but keep every valid fence; ValueError when there is no thread map at all."""
     if not isinstance(state, dict) or not isinstance(state.get("threads"), dict):
         raise ValueError("Invalid Slack deletion state")
-    clean = {**state, "threads": {key: record for key, record in state["threads"].items() if isinstance(record, dict)}}
-    dropped = len(state["threads"]) - len(clean["threads"])
+    clean = {**state, "threads": {}}
+    dropped = 0
+    for key, record in state["threads"].items():
+        if not isinstance(record, dict):
+            dropped += 1
+            continue
+        clean["threads"][key], reset = _salvage_record(record)
+        dropped += reset
     for part in ("cleanup", "sent"):
         if not isinstance(state.get(part, {}), dict):
             clean[part], dropped = {}, dropped + 1
@@ -179,7 +197,7 @@ class SlackDeletionMixin(BasePlatformAdapter):
                     kept = f"copied to {quarantine.name}"
                 except OSError:
                     kept = "could not copy it aside"
-                logger.error("[Slack] Malformed entries in deletion state %s; dropped %d (%s). "
+                logger.error("[Slack] Malformed entries in deletion state %s; dropped or reset %d (%s). "
                              "Every well-formed fence is kept.", path, dropped, kept)
                 self._save_deletions()
         return self._slack_deletions
@@ -190,7 +208,7 @@ class SlackDeletionMixin(BasePlatformAdapter):
                 json.dumps(key): surface for key, surface in self._slack_sent_surfaces.items()}
         try:
             atomic_json_write(self._slack_deletion_path, self._slack_deletions, mode=0o600)
-        except OSError:
+        except (OSError, ValueError):  # ValueError: e.g. a lone surrogate read back from a hand-edited file
             logger.exception("[Slack] Cannot persist deletion state; mute is memory-only until restart")
 
     def _deletion_messages(self):
