@@ -268,6 +268,10 @@ class GatewayStatusCommandsMixin:
                 t("gateway.status.matrix_scope_key",
                   session_key=self._redact_matrix_session_key(session_key)),
             ]
+        load_error = getattr(getattr(self, "config", None), "config_load_error", None)
+        if isinstance(load_error, str) and load_error:  # EZ-852
+            lines += ["", f"⚠️ **config.yaml failed to load ({load_error}).** Slack client context is denying "
+                          "every channel except the Slack home DM. Fix the file, then restart the gateway."]
         lines += ["", t("gateway.status.platforms", platforms=', '.join(p.value for p in self.adapters))]
         return "\n".join(lines)
 

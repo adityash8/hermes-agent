@@ -547,6 +547,9 @@ class GatewayConfig:
     quick_commands: Dict[str, Any] = field(default_factory=dict)  # slash commands that bypass the agent loop
     # Preserve malformed present values: client-context admission must deny, never coerce off.
     client_context: Any = field(default_factory=lambda: {"enabled": False})
+    # EZ-852: set by load_gateway_config when config.yaml could not be read ("ParserError at line 3").
+    # Never serialized and never holds config text.
+    config_load_error: Optional[str] = field(default=None, repr=False, compare=False)
     sessions_dir: Path = field(default_factory=lambda: get_hermes_home() / "sessions")
     # Legacy sessions.json mirror of the routing index (primary: state.db) for external tooling / downgrades.
     # The primary copy lives in state.db (gateway_routing table, #9006). Default True for backward
@@ -793,32 +796,53 @@ class GatewayConfig:
         return "public" if choice is None else choice
 
 
+_LOGGED_LOAD_FAILURES: set = set()
+
+
+def _config_load_error(error: Exception) -> str:
+    """Exception type and line only: YAML parser messages quote config lines, which can hold secrets."""
+    mark = getattr(error, "context_mark", None) or getattr(error, "problem_mark", None)
+    line = getattr(mark, "line", None)
+    return type(error).__name__ + (f" at line {line + 1}" if isinstance(line, int) else "")
+
+
+def _log_config_load_failure(path: Path, load_error: str) -> None:
+    """EZ-852: one ERROR per distinct failure, so a broken file cannot quietly mute Slack."""
+    if (key := (str(path), load_error)) in _LOGGED_LOAD_FAILURES:
+        return
+    _LOGGED_LOAD_FAILURES.add(key)
+    logger.error(
+        "Failed to process %s (%s) — falling back to .env / gateway.json values. Client context now "
+        "denies every Slack channel except the operator home DM until the file is fixed and the gateway restarts.",
+        path, load_error,
+    )
+
+
 def load_gateway_config() -> GatewayConfig:
     """Load gateway configuration. Priority: env > ~/.hermes/config.yaml > legacy gateway.json > defaults."""
     from gateway import config_loader
 
     _home = get_hermes_home()
     gw_data = config_loader.load_legacy_gateway_json(_home)
+    load_error = None
     try:
         config_loader.load_yaml_layer(_home, gw_data)
     except Exception as e:
         # A failed config read cannot prove the isolation feature was absent/off.
         gw_data.setdefault("client_context", {})
-        logger.warning(
-            # DingTalk settings → env vars: migrated to the dingtalk plugin's apply_yaml_config_fn hook
-            # (plugins/platforms/dingtalk/adapter.py). #41112 / #3823.
-            # Mattermost config bridge moved into plugins/platforms/mattermost/
-            # adapter.py::_apply_yaml_config — see #25443 (apply_yaml_config_fn).
-            # Matrix settings → env vars: migrated to the matrix plugin's apply_yaml_config_fn hook
-            # (plugins/platforms/matrix/adapter.py). #41112 / #3823.
-            # Feishu settings → env vars: migrated to the feishu plugin's apply_yaml_config_fn hook
-            # (plugins/platforms/feishu/adapter.py). #41112 / #3823.
-            "Failed to process config.yaml — falling back to .env / gateway.json values. "
-            "Check %s for syntax errors. Error: %s",
-            _home / "config.yaml", e,
-        )
+        load_error = _config_load_error(e)
+        # DingTalk settings → env vars: migrated to the dingtalk plugin's apply_yaml_config_fn hook
+        # (plugins/platforms/dingtalk/adapter.py). #41112 / #3823.
+        # Mattermost config bridge moved into plugins/platforms/mattermost/
+        # adapter.py::_apply_yaml_config — see #25443 (apply_yaml_config_fn).
+        # Matrix settings → env vars: migrated to the matrix plugin's apply_yaml_config_fn hook
+        # (plugins/platforms/matrix/adapter.py). #41112 / #3823.
+        # Feishu settings → env vars: migrated to the feishu plugin's apply_yaml_config_fn hook
+        # (plugins/platforms/feishu/adapter.py). #41112 / #3823.
+        _log_config_load_failure(_home / "config.yaml", load_error)
 
     config = GatewayConfig.from_dict(gw_data)
+    config.config_load_error = load_error
     _apply_env_overrides(config)
     _validate_gateway_config(config)
     return config

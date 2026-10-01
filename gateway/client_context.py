@@ -47,6 +47,21 @@ class ScopedReply(str):
     _codewords_validate: Callable[[], None] | None = None
 
 
+def _home_dm_during_load_failure(config, source) -> bool:
+    """EZ-852: a failed config.yaml read keeps client context closed except the operator's Slack home DM.
+
+    The home comes from SLACK_HOME_CHANNEL in .env, not the failed file. Only a 1:1 DM qualifies:
+    a home set to a channel could hold clients, so it stays closed.
+    """
+    if config is None or not vars(config).get("config_load_error"):
+        return False
+    from gateway.config import Platform
+
+    home = config.get_home_channel(Platform.SLACK)
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    return home is not None and chat_id.startswith("D") and chat_id == home.chat_id
+
+
 def applies(config, source) -> bool:
     from gateway.client_context_restricted import selected as restricted
     if restricted(source):
@@ -55,6 +70,8 @@ def applies(config, source) -> bool:
         return False
     if not hasattr(source, "chat_id"):
         return True  # Native Slack admission must protect the restricted sender even when revoked.
+    if _home_dm_during_load_failure(config, source):
+        return False
     # GatewayConfig stores explicit fields in __dict__. Do not synthesize a setting
     # through a dynamic attribute proxy used by callers/tests.
     value = vars(config).get("client_context", {"enabled": False}) if config is not None else {"enabled": False}
