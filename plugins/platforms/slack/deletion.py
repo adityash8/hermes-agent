@@ -30,6 +30,12 @@ _delivery_scope: contextvars.ContextVar[tuple[Any, tuple[str, str, str], int] | 
 _scheduled_delivery: contextvars.ContextVar[bool] = contextvars.ContextVar("slack_scheduled_delivery", default=False)
 
 
+def _valid_deletion_state(state) -> bool:
+    return (isinstance(state, dict) and isinstance(state.get("threads"), dict)
+            and all(isinstance(record, dict) for record in state["threads"].values())
+            and all(isinstance(state.get(part, {}), dict) for part in ("cleanup", "sent")))
+
+
 class DeletedSurfaceError(RuntimeError):
     def __init__(self):
         super().__init__("slack_thread_deleted")
@@ -120,14 +126,26 @@ class SlackDeletionMixin(BasePlatformAdapter):
 
     def _deletion_state(self):
         if not hasattr(self, "_slack_deletions"):
-            self._slack_deletion_path = get_hermes_home() / "slack-deletions.json"
+            self._slack_deletion_path = path = get_hermes_home() / "slack-deletions.json"
             try:
-                state = json.loads(self._slack_deletion_path.read_text(encoding="utf-8"))
-                if not isinstance(state, dict) or not isinstance(state.get("threads"), dict):
+                state = json.loads(path.read_text(encoding="utf-8"))
+                if not _valid_deletion_state(state):
                     raise ValueError("Invalid Slack deletion state")
             except FileNotFoundError:
                 state = {"threads": {}, "cleanup": {}}
-            # Corrupt/unreadable state must not silently reopen deleted surfaces.
+            except (OSError, ValueError) as exc:
+                # EZ-853: a bad file must not crash every Slack event. Reopen loudly, once,
+                # and keep the file; the next observed deletion re-fences its surface.
+                state = {"threads": {}, "cleanup": {}}
+                quarantine = path.with_name(f"{path.name}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}")
+                try:
+                    path.rename(quarantine)
+                    kept = f"moved to {quarantine.name}"
+                except OSError:
+                    kept = "could not move it aside"
+                logger.error(
+                    "[Slack] Unreadable deletion state %s (%s); %s. Starting empty: threads deleted "
+                    "before now are not fenced until deleted again.", path, type(exc).__name__, kept)
             self._slack_deletions = state
         return self._slack_deletions
 
@@ -282,7 +300,7 @@ class SlackDeletionMixin(BasePlatformAdapter):
                                 if not line.lstrip().startswith(">"))
         if (not bot_uid or f"<@{bot_uid}>" not in direct_text
                 or event.get("_slack_changed_event_ts") or event.get("_hermes_force_process")
-                or str(event.get("ts") or "") <= record["cutoff"]):
+                or str(event.get("ts") or "") <= record.get("cutoff", "")):
             return False
         if source is not None:
             if (getattr(source.platform, "value", source.platform) != "slack"
@@ -295,7 +313,7 @@ class SlackDeletionMixin(BasePlatformAdapter):
                 user_id, "dm" if is_dm else "group", key[1], thread_id=key[2])
         if authorized is not True:
             return False
-        record.update(muted=False, generation=record["generation"] + 1)
+        record.update(muted=False, generation=record.get("generation", 0) + 1)
         self._save_deletions()
         return True
 
