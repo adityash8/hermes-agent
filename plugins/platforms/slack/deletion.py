@@ -32,11 +32,13 @@ _scheduled_delivery: contextvars.ContextVar[bool] = contextvars.ContextVar("slac
 
 
 def _sent_receipt_ok(key, surface) -> bool:
+    """Receipts are written as three strings; anything else would break the tuple lookup later."""
     try:
         sent = json.loads(key)
-    except ValueError:
+    except (ValueError, RecursionError):
         return False
-    return all(isinstance(part, list) and len(part) == 3 for part in (sent, surface))
+    return all(isinstance(part, list) and len(part) == 3 and all(isinstance(item, str) for item in part)
+               for part in (sent, surface))
 
 
 def _salvage_deletion_state(state) -> tuple[dict, int]:

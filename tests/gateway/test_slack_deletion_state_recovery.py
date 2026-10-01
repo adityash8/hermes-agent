@@ -116,6 +116,17 @@ def test_malformed_sent_receipts_are_dropped_not_raised():
     good = [json.dumps(["T1", "C1", "9.000001"]), ["T1", "C1", META["thread_id"]]]
     _state_path().write_text(json.dumps({"threads": {}, "cleanup": {}, "sent": {
         "not-json": ["T1", "C1", "1.0"], json.dumps(["T1", "C1"]): ["T1", "C1", "1.0"],
-        json.dumps(["T1", "C1", "2.0"]): "not-a-surface", good[0]: good[1]}}), encoding="utf-8")
+        json.dumps(["T1", "C1", "2.0"]): "not-a-surface", good[0]: good[1],
+        json.dumps([["T1"], "C1", "3.0"]): ["T1", "C1", "1.0"],  # unhashable once turned into a tuple key
+        json.dumps(["T1", "C1", "4.0"]): ["T1", {"C1": 1}, "1.0"]}}), encoding="utf-8")
+    adapter, _ = make_adapter()
+    assert adapter._deletion_messages() == {("T1", "C1", "9.000001"): ("T1", "C1", META["thread_id"])}
+
+
+def test_deeply_nested_sent_receipt_key_is_dropped_not_raised():
+    good = [json.dumps(["T1", "C1", "9.000001"]), ["T1", "C1", META["thread_id"]]]
+    deep = "[" * 100000 + "]" * 100000  # json.loads raises RecursionError, which is not a ValueError
+    _state_path().write_text(json.dumps({"threads": {}, "cleanup": {}, "sent": {
+        deep: ["T1", "C1", "1.0"], good[0]: good[1]}}), encoding="utf-8")
     adapter, _ = make_adapter()
     assert adapter._deletion_messages() == {("T1", "C1", "9.000001"): ("T1", "C1", META["thread_id"])}
