@@ -277,7 +277,15 @@ _SLACK_TOOLS_NOTE = (
     "tools for Slack-specific requests, and do not promise Slack actions beyond what the "
     "loaded tools actually expose."
 )
+# EZ-885: client channels and other users must not be coached toward connector routes.
 _SLACK_NO_TOOLS_NOTE = (
+    "**Platform notes:** You are running inside Slack. No direct Slack tool detected for "
+    "this session. Do not look for another route to read or act on Slack (connectors, "
+    "discovery tools, raw tokens or terminal API calls). If a request needs Slack data you "
+    "cannot see, state that limitation plainly. The gateway may inline the current message's "
+    "Slack block/attachment payload when available."
+)
+_SLACK_HOME_DM_NO_TOOLS_NOTE = (
     "**Platform notes:** You are running inside Slack. No direct Slack tool detected for "
     "this session; this is not proof authenticated access is unavailable. If connector/discovery "
     "tools are already available in this session, use their returned schemas to discover a "
@@ -291,9 +299,21 @@ _SLACK_NO_TOOLS_NOTE = (
 )
 
 
+def _is_slack_home_dm(context: SessionContext) -> bool:
+    """True only for a DM in the configured Slack home lane; no home configured fails closed."""
+    source, home = context.source, context.home_channels.get(Platform.SLACK)
+    if home is None or source.chat_type != "dm":
+        return False
+    return source.chat_id == home.chat_id or bool(home.user_id and source.user_id == home.user_id)
+
+
 def _slack_platform_notes(context: SessionContext) -> List[str]:
     # Capability note only when Slack tools are loaded; otherwise an honest disclaimer.
-    lines = ["", _SLACK_TOOLS_NOTE if _slack_tools_loaded() else _SLACK_NO_TOOLS_NOTE]
+    if _slack_tools_loaded():
+        note = _SLACK_TOOLS_NOTE
+    else:
+        note = _SLACK_HOME_DM_NO_TOOLS_NOTE if _is_slack_home_dm(context) else _SLACK_NO_TOOLS_NOTE
+    lines = ["", note]
     if context.shared_multi_user_session:
         lines.append(
             "In shared Slack threads, use the current turn's sender prefix as the only verified "

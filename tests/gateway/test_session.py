@@ -160,7 +160,7 @@ class TestBuildSessionContextPrompt:
     def test_slack_fallback_discovery_requires_authorized_access(self, monkeypatch, connector_available):
         """A generic connector is not direct capability or evidence of authorized Slack access."""
         from agent.secret_scope import set_secret_scope, reset_secret_scope
-        from gateway.session import _slack_tools_loaded, _SLACK_NO_TOOLS_NOTE, _SLACK_TOOLS_NOTE
+        from gateway.session import _slack_tools_loaded, _SLACK_HOME_DM_NO_TOOLS_NOTE, _SLACK_TOOLS_NOTE
         from tools import mcp_tool, registry as registry_module
         from tools.mcp_tool_discovery import get_registered_mcp_server_names
         from tools.mcp_tool_registration import _track_mcp_tool_server, _forget_mcp_tool_server
@@ -183,12 +183,14 @@ class TestBuildSessionContextPrompt:
             assert get_registered_mcp_server_names() == ({"composio"} if connector_available else set())
             assert bool(isolated.get_definitions({name}, quiet=True)) is connector_available
             assert _slack_tools_loaded() is False
+            home = HomeChannel(platform=Platform.SLACK, chat_id="D123", name="home", user_id="U_OWNER")
             ctx = build_session_context(
-                SessionSource(platform=Platform.SLACK, chat_id="C123", chat_type="group"),
-                GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="fake")}),
+                SessionSource(platform=Platform.SLACK, chat_id="D123", chat_type="dm", user_id="U_OWNER"),
+                GatewayConfig(platforms={
+                    Platform.SLACK: PlatformConfig(enabled=True, token="fake", home_channel=home)}),
             )
             prompt = build_session_context_prompt(ctx)
-            assert _SLACK_NO_TOOLS_NOTE in prompt and _SLACK_TOOLS_NOTE not in prompt
+            assert _SLACK_HOME_DM_NO_TOOLS_NOTE in prompt and _SLACK_TOOLS_NOTE not in prompt
             note = prompt.lower()
             assert "no direct slack tool detected for this session" in note
             assert "not proof authenticated access is unavailable" in note
@@ -208,6 +210,54 @@ class TestBuildSessionContextPrompt:
             reset_secret_scope(scope)
         assert get_registered_mcp_server_names() == set()
 
+
+    @pytest.mark.parametrize("home_set", [True, False], ids=["home-set", "no-home"])
+    @pytest.mark.parametrize(
+        ("chat_id", "chat_type", "user_id"),
+        [("C_CLIENT", "group", "U_OWNER"), ("D_GUEST", "dm", "U_GUEST")],
+        ids=["client-channel", "non-owner-dm"],
+    )
+    def test_slack_no_tools_note_outside_home_dm_forbids_route_discovery(
+        self, monkeypatch, home_set, chat_id, chat_type, user_id,
+    ):
+        """EZ-885: only the operator's home DM may be told to look for a connector route to Slack."""
+        from gateway import session
+
+        monkeypatch.setattr(session, "_slack_tools_loaded", lambda: False)
+        home = HomeChannel(platform=Platform.SLACK, chat_id="D_OWNER", name="home", user_id="U_OWNER")
+        ctx = build_session_context(
+            SessionSource(platform=Platform.SLACK, chat_id=chat_id, chat_type=chat_type, user_id=user_id),
+            GatewayConfig(platforms={Platform.SLACK: PlatformConfig(
+                enabled=True, token="fake", home_channel=home if home_set else None)}),
+        )
+        prompt = build_session_context_prompt(ctx)
+        assert session._SLACK_NO_TOOLS_NOTE in prompt
+        assert session._SLACK_HOME_DM_NO_TOOLS_NOTE not in prompt
+        note = session._SLACK_NO_TOOLS_NOTE.lower()
+        assert "no direct slack tool detected for this session" in note
+        assert "do not look for another route" in note
+        assert "connector/discovery" not in note and "permalink" not in note
+
+    @pytest.mark.parametrize(
+        ("home_chat_id", "home_user_id", "expect_home"),
+        [("D_OWNER", None, True), ("C_HOME", "U_OWNER", True), ("C_HOME", None, False)],
+        ids=["home-is-this-dm", "home-set-by-owner-elsewhere", "home-elsewhere-no-owner"],
+    )
+    def test_slack_home_dm_matches_home_chat_or_home_owner(
+        self, monkeypatch, home_chat_id, home_user_id, expect_home,
+    ):
+        """The owner's DM keeps the discovery guidance; an unattributed home elsewhere fails closed."""
+        from gateway import session
+
+        monkeypatch.setattr(session, "_slack_tools_loaded", lambda: False)
+        home = HomeChannel(platform=Platform.SLACK, chat_id=home_chat_id, name="home", user_id=home_user_id)
+        ctx = build_session_context(
+            SessionSource(platform=Platform.SLACK, chat_id="D_OWNER", chat_type="dm", user_id="U_OWNER"),
+            GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="fake", home_channel=home)}),
+        )
+        prompt = build_session_context_prompt(ctx)
+        assert (session._SLACK_HOME_DM_NO_TOOLS_NOTE in prompt) is expect_home
+        assert (session._SLACK_NO_TOOLS_NOTE in prompt) is not expect_home
 
     def test_slack_tools_loaded_detects_real_mcp_registration(self):
         """Regression (review of #63234): a connected MCP server whose tools
