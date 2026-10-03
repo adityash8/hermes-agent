@@ -125,10 +125,12 @@ class TestCodexUltraForEveryModel:
             "some-responses-model": "xhigh",
         }
         for model, wire in expected.items():
+            # Astra's max is scoped to the Codex backend / official API, so pin the Codex route.
             kw = transport.build_kwargs(
                 model=model,
                 messages=[{"role": "user", "content": "hi"}],
                 tools=[],
                 reasoning_config={"enabled": True, "effort": "ultra"},
+                is_codex_backend=True,
             )
             assert kw["reasoning"]["effort"] == wire, model

@@ -256,13 +256,13 @@ async def handle_turn(runner, event, source, key, generation):
         policy = validate_event(runner.config, event)
         original = seal_event(event)
         require(event.source == source)
-        adapter = runner._adapter_for_source(source)
+        adapter = runner._delivery_adapter_for(source)
 
         def validate():
             require(not stopped.is_set() and time.monotonic() < deadline)
             require(validate_event(runner.config, event) == policy and seal_event(event) == original)
             require(event.source == source and runner._is_session_run_current(key, generation))
-            require(runner._adapter_for_source(source) is adapter)
+            require(runner._delivery_adapter_for(source) is adapter)
             for validate_credentials in receipts:
                 validate_credentials()
 
@@ -287,7 +287,7 @@ async def handle_turn(runner, event, source, key, generation):
                 event._codewords_failed = True
                 reply = cc.safe_output(chart.summary(visual.comparison, unavailable=True))
                 reply._codewords_validate = validate
-        runner._pop_post_delivery_callback(runner._adapter_for_source(source), key, generation)
+        runner._pop_post_delivery_callback(runner._delivery_adapter_for(source), key, generation)
         return True, reply
     except Exception:
         event._codewords_failed = True

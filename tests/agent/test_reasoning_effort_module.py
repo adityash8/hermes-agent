@@ -144,10 +144,10 @@ class TestCodexVocabulary:
         """Only catalog/live-proven Codex models may use ``max``.
 
         gpt-5.6 and the live-proven GPT-6 Astra/Sol/Luna variants have a max
-        tier. Unknown GPT-6 variants retain the legacy ceiling.
+        tier (Astra without ``none``). Unknown GPT-6 variants retain the legacy ceiling.
         """
         from agent.reasoning_effort import (
-            CODEX_GPT6_EFFORTS,
+            CODEX_ASTRA_EFFORTS,
             CODEX_GPT56_EFFORTS,
             CODEX_LEGACY_EFFORTS,
             codex_supported_efforts,
@@ -155,19 +155,32 @@ class TestCodexVocabulary:
 
         assert codex_supported_efforts("gpt-5.6") is CODEX_GPT56_EFFORTS
         assert codex_supported_efforts("gpt-5.6-codex") is CODEX_GPT56_EFFORTS
-        assert codex_supported_efforts("gpt-6-luna") is CODEX_GPT6_EFFORTS
-        assert codex_supported_efforts("openai/gpt-6-luna") is CODEX_GPT6_EFFORTS
-        assert codex_supported_efforts("gpt-6-astra") is CODEX_GPT6_EFFORTS
-        assert codex_supported_efforts("gpt-6-sol") is CODEX_GPT6_EFFORTS
+        assert codex_supported_efforts("gpt-6-luna") is CODEX_GPT56_EFFORTS
+        assert codex_supported_efforts("openai/gpt-6-luna") is CODEX_GPT56_EFFORTS
+        assert codex_supported_efforts("gpt-6-astra") is CODEX_ASTRA_EFFORTS
+        assert codex_supported_efforts("gpt-6-sol") is CODEX_GPT56_EFFORTS
         assert codex_supported_efforts("gpt-6-unverified") is CODEX_LEGACY_EFFORTS
         assert codex_supported_efforts("gpt-5.5") is CODEX_LEGACY_EFFORTS
         assert codex_supported_efforts("o5-pro") is CODEX_LEGACY_EFFORTS
         # The consequential clamps:
         assert clamp_effort("max", CODEX_GPT56_EFFORTS) == "max"
-        assert clamp_effort("max", CODEX_GPT6_EFFORTS) == "max"
+        assert clamp_effort("max", CODEX_ASTRA_EFFORTS) == "max"
         assert clamp_effort("max", CODEX_LEGACY_EFFORTS) == "xhigh"
         assert clamp_effort("ultra", CODEX_LEGACY_EFFORTS) == "xhigh"
         assert clamp_effort("minimal", CODEX_LEGACY_EFFORTS) == "low"
+
+    @pytest.mark.parametrize(
+        "model",
+        ["gpt-daybreak-blue-latest", "gpt-daybreak-blue-latest-900k"],
+    )
+    def test_daybreak_alias_uses_gpt56_max_support(self, model):
+        """Daybreak Blue is a GPT-5.6 Sol alias, so its base and 900k picker
+        slugs must preserve Sol's max reasoning level."""
+        from agent.reasoning_effort import codex_supported_efforts
+
+        supported = codex_supported_efforts(model)
+        assert clamp_effort("max", supported) == "max"
+        assert clamp_effort("ultra", supported) == "max"
 
 
 class TestRequestedEffort:

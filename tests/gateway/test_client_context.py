@@ -115,7 +115,7 @@ def runner(corpus, monkeypatch):
     obj._claim_active_session_slot = Mock(return_value=(None, None))
     obj._persist_active_agents = Mock()
     obj._hmwa_stop_typing_for_turn = AsyncMock()
-    obj._adapter_for_source = Mock(return_value=TextAdapter())
+    obj._delivery_adapter_for = Mock(return_value=TextAdapter())
     obj._hmwa_discard_stale_result = Mock()
     obj._pop_post_delivery_callback = Mock()
     for name in (
@@ -603,7 +603,8 @@ async def test_real_oauth_resolver_and_raw_responses_wire(runner, corpus, monkey
         return OpenAI(api_key="synthetic", base_url="https://synthetic.invalid/v1",
                       http_client=httpx.Client(transport=httpx.MockTransport(receive)))
 
-    monkeypatch.setattr(aux, "_read_codex_access_token", lambda: "synthetic")
+    monkeypatch.setattr(aux, "_select_pool_entry", lambda provider: (False, None))
+    monkeypatch.setattr(aux, "_read_codex_singleton_token", lambda: "synthetic")
     monkeypatch.setattr(aux, "_create_openai_client", create)
     result = await runner._handle_message(event())
     assert captured and captured[0]["tools"] == [] and captured[0]["tool_choice"] == "none"

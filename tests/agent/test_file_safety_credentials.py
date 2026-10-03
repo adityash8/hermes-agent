@@ -152,7 +152,7 @@ def test_search_tool_filters_credential_results(fake_home, tmp_path, monkeypatch
         path=str(fake_home),
         task_id="search-filter-credentials",
     )
-    out = json.loads(search_response.split("\n\n[Hint:", 1)[0])
+    out = json.loads(search_response)
     raw = json.dumps(out)
     returned_paths = {
         match["path"] for match in out.get("matches", [])
@@ -167,7 +167,7 @@ def test_search_tool_filters_credential_results(fake_home, tmp_path, monkeypatch
     assert out["_omitted"].startswith("4 result(s) omitted")
     assert out["total_count"] == 5
     assert out["truncated"] is True
-    assert "[Hint: Results truncated." in search_response
+    assert out["_hint"].startswith("Results truncated. Use offset=")
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +319,7 @@ def test_profile_mode_blocks_root_credentials(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize(
     "rel",
     ["AUTH.JSON", ".OP.ENV", ".Env", ".Anthropic_OAuth.json", "CACHE/OP_CACHE.JSON", "cache/BWS_CACHE.json"],
@@ -333,7 +333,7 @@ def test_case_variant_credential_store_read_blocked(fake_home, rel):
     assert "credential store" in (get_read_block_error(str(fake_home / rel)) or "")
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_case_variant_mcp_token_read_blocked(fake_home):
     from agent.file_safety import get_read_block_error
 
@@ -341,7 +341,7 @@ def test_case_variant_mcp_token_read_blocked(fake_home):
     assert "MCP token" in (get_read_block_error(str(fake_home / "MCP-Tokens" / "gh.json")) or "")
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize(
     "rel",
     [".OP.ENV", ".ENV", ".ANTHROPIC_OAUTH.JSON", "Cache/OP_CACHE.JSON", "cache/BWS_CACHE.ENC.JSON",
@@ -353,7 +353,7 @@ def test_case_variant_credential_store_write_denied(fake_home, rel):
     assert is_write_denied(str(fake_home / rel)) is True
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_case_variant_ssh_config_stays_approval_gated():
     """A case variant of ``~/.ssh/config`` must not slip between the hard deny
     and the approval gate (neither firing would allow a silent write)."""
@@ -364,7 +364,7 @@ def test_case_variant_ssh_config_stays_approval_gated():
     assert is_write_denied(variant) is False
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_case_variant_outside_safe_root_denied(tmp_path, monkeypatch):
     """The safe-root allowlist compares the caller's spelling: ``PROJ`` is a distinct
     directory from root ``proj`` on a case-sensitive volume, so it stays outside."""
@@ -378,7 +378,7 @@ def test_case_variant_outside_safe_root_denied(tmp_path, monkeypatch):
     assert is_write_denied(str(tmp_path / "PROJ" / "evil.txt")) is True
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("kind", ALIAS_KINDS)
 @pytest.mark.parametrize("rel", ["auth.json", ".op.env", "cache/bws_cache.json", "mcp-tokens/gh.json"])
 def test_macos_alias_spelling_read_blocked(fake_home, kind, rel):
@@ -388,7 +388,7 @@ def test_macos_alias_spelling_read_blocked(fake_home, kind, rel):
     assert get_read_block_error(macos_alias(_create(fake_home, rel), kind)) is not None
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("kind", ALIAS_KINDS)
 @pytest.mark.parametrize("rel", [".env", ".op.env", "state.db", "mcp-tokens/gh.json"])
 def test_macos_alias_spelling_write_denied(fake_home, kind, rel):
@@ -401,7 +401,7 @@ def test_macos_alias_spelling_write_denied(fake_home, kind, rel):
     assert is_write_denied(macos_alias(target, kind)) is True
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("kind", ALIAS_KINDS)
 def test_macos_alias_configured_hermes_home_guards_plain_spelling(tmp_path, monkeypatch, kind):
     """HERMES_HOME itself configured through an alias: the plain spelling stays guarded."""
@@ -415,7 +415,7 @@ def test_macos_alias_configured_hermes_home_guards_plain_spelling(tmp_path, monk
     assert fs.is_write_denied(str(home / ".env")) is True
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.parametrize("kind", ALIAS_KINDS)
 def test_macos_alias_spelling_of_ordinary_file_allowed(fake_home, kind):
     from agent.file_safety import get_read_block_error, is_write_denied

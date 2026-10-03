@@ -12,7 +12,6 @@ from unittest.mock import AsyncMock, MagicMock, call
 import pytest
 
 from gateway.config import PlatformConfig
-from plugins.platforms.slack import adapter as slack_module
 from plugins.platforms.slack.adapter import SlackAdapter
 
 

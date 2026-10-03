@@ -31,7 +31,7 @@ def slack(runner):
              "text": "The payment fix went live on September 12. This is a rollout report."},
         ], "has_more": False}),
     )
-    adapter = runner._adapter_for_source.return_value
+    adapter = runner._delivery_adapter_for.return_value
     adapter._team_clients = {route.WORKSPACE: client}
     adapter._team_bot_user_ids = {route.WORKSPACE: "Ujarvis"}
     adapter.authorize_turn = Mock(return_value=True)

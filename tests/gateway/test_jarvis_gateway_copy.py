@@ -36,6 +36,7 @@ async def test_system_labels_preserve_dynamic_payloads(monkeypatch, platform, br
             "/sample": {"description": PAYLOAD}})
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_commands", lambda: {})
         runner._telegramized_command_reply = lambda _event, text: text
+        runner._catalog_options = lambda _event: GatewaySlashCommandsMixin._catalog_options(runner, _event)
         handler = getattr(GatewaySlashCommandsMixin, f"_handle_{surface}_command")
         if surface == "commands":
             # Check all pages: a core description override and the dynamic skill tail.
@@ -69,9 +70,11 @@ async def test_system_labels_preserve_dynamic_payloads(monkeypatch, platform, br
         runner.adapters = {platform: None}
         runner._queue_depth = lambda *args, **kwargs: 0
         runner._cached_agent_for = lambda key: None
+        runner._rehydrate_session_model_override = runner._session_model_override = lambda key: None
         runner._status_session_db_facts = AsyncMock(return_value=(PAYLOAD, {}, 0, {}))
+        runner._resolve_route_context = AsyncMock(return_value=None)
         monkeypatch.setattr("gateway.slash_commands_status._status_model_route",
-                            lambda *args: ("Hermes-model", "Hermes-provider", 0, 0))
+                            lambda *args: ("Hermes-model", "Hermes-provider", 0, 0, None))
         text = await GatewayStatusCommandsMixin._handle_status_command(runner, evt)
         assert f"**{brand} Gateway Status**" in text
         assert PAYLOAD in text
@@ -98,7 +101,7 @@ async def test_system_labels_preserve_dynamic_payloads(monkeypatch, platform, br
         monkeypatch.setattr("cli.save_config_value", lambda *args: True)
         runner._busy_profile_name_for_source = lambda source: None
         runner._load_busy_text_mode = lambda: "queue"
-        runner._adapter_for_source = lambda source: None
+        runner._delivery_adapter_for = lambda source: None
         text = str(await GatewaySlashCommandsMixin._handle_busy_command(runner, event("/busy queue", platform)))
         assert f"while {brand} is busy" in text
     else:

@@ -118,7 +118,9 @@ async def _status(monkeypatch, config):
     runner._queue_depth = lambda *args, **kwargs: 0
     runner._cached_agent_for = lambda key: None
     runner._status_session_db_facts = AsyncMock(return_value=(None, {}, 0, {}))
-    monkeypatch.setattr("gateway.slash_commands_status._status_model_route", lambda *args: ("m", "p", 0, 0))
+    runner._rehydrate_session_model_override = runner._session_model_override = lambda key: None
+    runner._resolve_route_context = AsyncMock(return_value=None)
+    monkeypatch.setattr("gateway.slash_commands_status._status_model_route", lambda *args: ("m", "p", 0, 0, None))
     evt = MessageEvent(text="/status", source=SessionSource(
         platform=Platform.SLACK, chat_id=HOME_DM, user_id="U0OWNER", chat_type="dm"))
     return await GatewayStatusCommandsMixin._handle_status_command(runner, evt)

@@ -121,7 +121,7 @@ async def admission(runner, source) -> str:
             return "scoped"
         from gateway import client_context_restricted as restricted
         if restricted.selected(source):
-            restricted.native(source, runner._adapter_for_source(source))
+            restricted.native(source, runner._delivery_adapter_for(source))
             require(runner._is_user_authorized_for_source(source))
             restricted.policy()
             return "scoped"
@@ -389,7 +389,7 @@ async def handle_turn(runner, event, source, key: str, generation: int):
         runner._hmwa_discard_stale_result(source, key, generation)
         return True, None
     # Never run a legacy post-delivery callback for an isolated answer.
-    runner._pop_post_delivery_callback(runner._adapter_for_source(source), key, generation)
+    runner._pop_post_delivery_callback(runner._delivery_adapter_for(source), key, generation)
     return True, reply
 
 
@@ -402,9 +402,10 @@ async def handle_ingress(runner, event):
     from gateway import client_context_restricted as restricted
     restricted_turn = not bounded and (restricted.selected(source) or hasattr(event, "_restricted_request"))
     forced = getattr(event, "_client_context_required", False) is True
-    if not bounded and not restricted_turn and not forced and not applies(getattr(runner, "config", None), source):
+    config = getattr(runner, "config", None)
+    if not bounded and not restricted_turn and not forced and not applies(config, source):
         if (getattr(source.platform, "value", source.platform) == "slack"
-                and not codewords.CONFIG_KEYS.intersection(vars(runner.config).get("client_context") or {})):
+                and not codewords.CONFIG_KEYS.intersection((vars(config) if config is not None else {}).get("client_context") or {})):
             from gateway.client_context_turn import clear_history
 
             clear_history(runner)
@@ -470,7 +471,7 @@ async def handle_ingress(runner, event):
     state.turn.lease = lease
     state.turn.agent = _AGENT_PENDING_SENTINEL
     generation = runner._begin_session_run_generation(key)
-    runner._bind_adapter_run_generation(runner._adapter_for_source(source), key, generation)
+    runner._bind_adapter_run_generation(runner._delivery_adapter_for(source), key, generation)
     try:
         # Actual turn hook remains the second boundary, including direct callers.
         return True, await runner._handle_message_with_agent(event, source, key, generation)

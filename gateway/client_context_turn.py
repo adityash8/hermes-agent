@@ -63,7 +63,7 @@ def tool_policy(runner, source, opts) -> tuple:
         if isinstance(disabled, str):
             disabled = json.loads(disabled)
         require(_string_list(disabled))
-        adapter = runner._adapter_for_source(source)
+        adapter = runner._delivery_adapter_for(source)
         override = adapter.toolsets_for_source(source) if adapter is not None else None
         require(override is None or _string_list(override))
         base = _get_platform_tools(config, platform)

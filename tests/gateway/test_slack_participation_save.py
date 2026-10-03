@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from gateway.run import GatewayRunner
 from plugins.platforms.slack.adapter import SlackAdapter
 from plugins.platforms.slack.participation import _participation_scope
@@ -31,13 +31,14 @@ async def test_native_thread_save_preserves_source_grant_through_export(scenario
     adapter._get_client = MagicMock(return_value=client)
     runner = GatewayRunner.__new__(GatewayRunner)
     runner.get_adapter = lambda platform: adapter
+    runner.adapters = {Platform.SLACK: adapter}
     runner.session_store = SimpleNamespace()
     runner._async_session_store = SimpleNamespace(_store=runner.session_store,
         get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_id="saved")))
     entered, release = asyncio.Event(), asyncio.Event()
     grants, results, destinations = [], [], []
 
-    async def export_session(session_id):
+    async def export_session(session_id, include_compacted=False):
         assert session_id == "saved"
         grants.append(_participation_scope.get())
         entered.set()

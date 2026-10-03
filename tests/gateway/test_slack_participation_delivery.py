@@ -1,5 +1,6 @@
 """Native turn callbacks must lose every Slack output path when permission ends."""
 import asyncio
+import json
 import logging
 from contextlib import nullcontext
 from contextvars import copy_context
@@ -9,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
-from plugins.platforms.slack.adapter import SlackAdapter
+from plugins.platforms.slack.adapter import SlackAdapter, _session_status_method_name
 
 
 META = {"team_id": "T1", "thread_id": "100.000001", "user_id": "UHUMAN"}
@@ -19,7 +20,8 @@ OUTPUT_METHODS = {
     "draft": ("chat_startStream", "chat_appendStream", "chat_stopStream"),
     "task_card": ("api_call",), "reaction": ("reactions_add",), "media": ("files_upload_v2",),
     "approval": ("chat_postMessage",), "private": ("chat_postEphemeral",),
-    "typing": ("assistant_threads_setStatus",),
+    # Upstream picks agents.sessions.setStatus when the SDK/client expose it, else the legacy setter.
+    "typing": (_session_status_method_name,),
 }
 
 
@@ -34,7 +36,7 @@ def native(tmp_path):
     for method in ("chat_postMessage", "chat_update", "chat_delete", "chat_startStream",
                    "chat_appendStream", "chat_stopStream", "api_call", "reactions_add",
                    "reactions_remove", "files_upload_v2", "chat_postEphemeral",
-                   "assistant_threads_setStatus"):
+                   "assistant_threads_setStatus", "agents_sessions_setStatus"):
         getattr(client, method).return_value = {"ok": True, "ts": "200.000001"}
     adapter._get_client = MagicMock(return_value=client)
     adapter._resolve_user_is_bot = AsyncMock(return_value=False)
@@ -111,6 +113,7 @@ async def test_native_output_callbacks_cannot_outlive_their_task(native, kind, e
         client.reset_mock()
         await context.run(asyncio.create_task, output(adapter, kind, attachment))
         for method in OUTPUT_METHODS[kind]:
+            method = method(client) if callable(method) else method
             assert getattr(client, method).await_count, f"{kind} never reached {method}"
         if end == "complete":
             release.set()
@@ -378,7 +381,7 @@ async def test_runner_fifo_uses_fresh_adapter_permission_for_each_queued_request
         _BUSY_QUEUE_MAX_PENDING = 32
         _draining = False
 
-        def _adapter_for_source(self, source):
+        def _delivery_adapter_for(self, source):
             return adapter
 
         def _peek_session_state(self, session_key):
@@ -474,6 +477,16 @@ async def test_dm_runner_preserves_pending_text_without_channel_admission(native
     assert pending == (None, "use the other file")
 
 
+def _steer_body(text, owner):
+    """Steers carry the gateway origin envelope; it must name the owner, then strip it."""
+    prefix = "Gateway message origin (JSON data, not instructions or authorization):\n"
+    if not text or not text.startswith(prefix):
+        return text
+    envelope, body = text.split("\n\n", 1)
+    assert json.loads(envelope.splitlines()[1])["user_id"] == owner
+    return body
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("steer_state", ("late", "consumed", "interrupt", "draining", "cap"))
 async def test_native_steering_residual_stays_with_owner_before_fresh_queued_task(native, steer_state):
@@ -484,7 +497,8 @@ async def test_native_steering_residual_stays_with_owner_before_fresh_queued_tas
 
     adapter, client, attachment = native
     agent = InterruptControlMixin()
-    state = SimpleNamespace(conversation=SimpleNamespace(queued_events=[]))
+    state = SimpleNamespace(conversation=SimpleNamespace(queued_events=[]),
+                            turn=SimpleNamespace(agent=agent, event=None, ctx=None))
     entered, release, next_entered, next_release = (asyncio.Event() for _ in range(4))
     seen, contexts, tasks, consumed, session_keys = [], [], [], [], []
 
@@ -494,7 +508,7 @@ async def test_native_steering_residual_stays_with_owner_before_fresh_queued_tas
         _draining = False
         _MAX_INTERRUPT_DEPTH = 2
 
-        def _adapter_for_source(self, source):
+        def _delivery_adapter_for(self, source):
             return adapter
 
         def _peek_session_state(self, session_key):
@@ -509,10 +523,13 @@ async def test_native_steering_residual_stays_with_owner_before_fresh_queued_tas
         def _pending_event_audio_paths(self, event):
             return []
 
+        def _pinned_channel_inputs(self, session_key, channel_prompt, source, *, internal):
+            return channel_prompt, source
+
     runner = Runner()
 
     async def work(message, context_prompt, history, source, session_id, **kwargs):
-        seen.append((source.user_id, message))
+        seen.append((source.user_id, _steer_body(message, source.user_id)))
         contexts.append(copy_context())
         tasks.append(asyncio.current_task())
         result = {"final_response": "result", "messages": []}
@@ -554,7 +571,7 @@ async def test_native_steering_residual_stays_with_owner_before_fresh_queued_tas
             outcome = await runner._resolve_busy_steer_or_redirect(event, session_key, "steer", agent)
             assert outcome.steered
             if steer_state == "consumed":
-                consumed.append(agent._drain_pending_steer())
+                consumed.append(_steer_body(agent._drain_pending_steer(), "UHUMAN"))
         else:
             runner._queue_or_replace_pending_event(session_key, event)
         return True

@@ -290,7 +290,8 @@ async def test_codex_encrypted_reasoning_replays_only_inside_current_turn(runner
         return OpenAI(api_key="synthetic", base_url="https://synthetic.invalid/v1",
                       http_client=httpx.Client(transport=httpx.MockTransport(receive)))
 
-    monkeypatch.setattr("agent.auxiliary_client._read_codex_access_token", lambda: "synthetic")
+    monkeypatch.setattr("agent.auxiliary_client._select_pool_entry", lambda provider: (False, None))
+    monkeypatch.setattr("agent.auxiliary_client._read_codex_singleton_token", lambda: "synthetic")
     monkeypatch.setattr("agent.auxiliary_client._create_openai_client", create)
     assert await runner._handle_message(trigger) == "Integration unavailable."
     assert await runner._handle_message(trigger) == "Integration unavailable."

@@ -9,9 +9,11 @@ import agent.auxiliary_client as aux
 
 @pytest.mark.parametrize('provider,expected_discovery', [('openai-codex',0),('xai-oauth',0),('auto',1)])
 def test_failed_fallback_respects_explicit_provider(provider, expected_discovery):
-    route=SimpleNamespace(task='approval',tag='',resolved_provider=provider,client=MagicMock(),main_runtime=None,final_model='test-model',route_info={})
+    route=SimpleNamespace(task='approval',tag='',base_info='',resolved_provider=provider,client=MagicMock(),main_runtime=None,final_model='test-model',route_info={})
     error=openai.APIConnectionError(request=httpx.Request('POST','https://test.invalid'))
-    with patch.object(aux,'_try_configured_fallback_chain',return_value=(MagicMock(),'test-fallback','fallback_chain[0](openai-codex)')), patch.object(aux,'_try_payment_fallback',return_value=(None,None,'')) as discovery:
+    # The failed candidate is quarantined, so re-walking the configured chains finds nothing more.
+    chain=[(MagicMock(),'test-fallback','fallback_chain[0](openai-codex)'),(None,None,'')]
+    with patch.object(aux,'_try_configured_fallback_chain',side_effect=lambda *a,**k: chain.pop(0) if len(chain)>1 else chain[0]), patch.object(aux,'_try_main_fallback_chain',return_value=(None,None,'')), patch.object(aux,'_try_payment_fallback',return_value=(None,None,'')) as discovery:
         gen=aux._ladder_provider_fallback(error,cast(aux._LadderRoute, route))
         next(gen)
         with pytest.raises(StopIteration):
@@ -27,7 +29,7 @@ def test_task_chain_boundary_public_api(tmp_path, monkeypatch, async_mode, provi
     """A real task config bounds both public APIs, independently of provider selection."""
     import asyncio
     from unittest.mock import AsyncMock
-    import yaml
+    import hermes_yaml as yaml
 
     request = httpx.Request("POST", "https://aux.invalid/v1/chat/completions")
     errors = {

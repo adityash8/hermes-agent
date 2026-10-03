@@ -7,11 +7,13 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import yaml
+from ruamel.yaml import YAML
+from ruamel.yaml.nodes import MappingNode, ScalarNode
 
 from gateway.client_context_analytics import calendar_date
 from gateway.client_context_google_stripe import _integer
 from gateway.client_context_policy import ContextDenied, fields, items, require
+from hermes_yaml import YAMLError
 
 CUSTOMER = "9855813343"
 CURRENCY = "GBP"
@@ -30,16 +32,18 @@ def developer_token(guard):
     require(len(content) <= 65536)
     try:
         # Compose a safe syntax tree rather than constructing unrelated config.
-        root = yaml.compose(content, Loader=yaml.SafeLoader)
-    except yaml.YAMLError:
+        parser = YAML(typ="safe", pure=True)
+        parser.version = (1, 1)
+        root = parser.compose(content)
+    except YAMLError:
         raise ContextDenied("invalid Google Ads credential document") from None
-    require(isinstance(root, yaml.MappingNode))
+    require(isinstance(root, MappingNode))
     tokens = [value for key, value in root.value
-              if isinstance(key, yaml.ScalarNode) and key.tag == "tag:yaml.org,2002:str"
+              if isinstance(key, ScalarNode) and key.tag == "tag:yaml.org,2002:str"
               and key.value == "developer_token"]
     require(len(tokens) == 1)
     token = tokens[0]
-    require(isinstance(token, yaml.ScalarNode) and token.tag == "tag:yaml.org,2002:str")
+    require(isinstance(token, ScalarNode) and token.tag == "tag:yaml.org,2002:str")
     value = token.value
     require(type(value) is str and 0 < len(value) <= 8192
             and re.fullmatch(r"[A-Za-z0-9._~+/=-]+", value))

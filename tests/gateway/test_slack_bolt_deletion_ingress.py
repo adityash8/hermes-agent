@@ -38,7 +38,7 @@ async def connected_adapter(monkeypatch):
     post = AsyncMock(return_value={"ok": True, "ts": "101.000001"})
     monkeypatch.setattr(AsyncWebClient, "auth_test", auth)
     monkeypatch.setattr(AsyncWebClient, "chat_postMessage", post)
-    monkeypatch.setattr(slack_module, "get_secret", lambda name: "xapp-fake")
+    monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-fake")
     monkeypatch.setattr(slack_module, "AsyncApp", lambda **kwargs: AsyncApp(process_before_response=True, **kwargs))
     adapter = slack_module.SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
     monkeypatch.setattr(adapter, "_acquire_platform_lock", Mock(return_value=True))

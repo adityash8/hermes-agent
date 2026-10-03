@@ -144,7 +144,7 @@ async def test_tool_derivation_never_uses_defaults(runner, extended, wire, monke
                     "override-broaden": ["file", "session_search"]}[setting]
         if setting == "override-broaden":
             extended["platform_toolsets"]["slack"] = ["web"]
-        monkeypatch.setattr(runner._adapter_for_source(None), "toolsets_for_source", lambda s: override)
+        monkeypatch.setattr(runner._delivery_adapter_for(None), "toolsets_for_source", lambda s: override)
     else:
         runner._resolve_turn_toolsets = lambda *a: ([] if setting == "resolver-empty" else None, None)
     assert await runner._handle_message(event())
@@ -470,7 +470,8 @@ async def test_codex_responses_function_round_uses_only_explicit_sdk(runner, ext
     def create(**kwargs):
         return OpenAI(api_key="synthetic", base_url="https://synthetic.invalid/v1",
                       http_client=httpx.Client(transport=httpx.MockTransport(receive)))
-    monkeypatch.setattr("agent.auxiliary_client._read_codex_access_token", lambda: "synthetic")
+    monkeypatch.setattr("agent.auxiliary_client._select_pool_entry", lambda provider: (False, None))
+    monkeypatch.setattr("agent.auxiliary_client._read_codex_singleton_token", lambda: "synthetic")
     monkeypatch.setattr("agent.auxiliary_client._create_openai_client", create)
     assert await runner._handle_message(event()) == "verified local record. [brief-a]"
     assert len(captured) == 2 and captured[0]["tools"][0]["name"] == "scoped_source_read"

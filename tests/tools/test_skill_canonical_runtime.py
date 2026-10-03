@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 
 def _content(name, body="Original instructions."):
@@ -297,6 +297,8 @@ def test_batch_aliases_preserve_conflict_checks_and_snapshot_boundaries(home, tm
         {"action": "patch", "name": "cat/folder", "old_string": "Missing passage", "new_string": "No"},
     ])
     assert not failed["success"] and failed["completed_before_failure"] == 1, failed
-    after = {p.relative_to(canonical): p.read_bytes() for p in canonical.rglob("*") if p.is_file() and not p.name.startswith(".")}
+    # Hidden state (skill_manage's .locks/ lock files) is not skill content.
+    after = {p.relative_to(canonical): p.read_bytes() for p in canonical.rglob("*")
+             if p.is_file() and not any(part.startswith(".") for part in p.relative_to(canonical).parts)}
     assert after == before
     assert (second / "SKILL.md").is_file()

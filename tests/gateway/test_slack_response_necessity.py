@@ -205,7 +205,7 @@ async def test_native_participation_composes_with_real_scoped_runner(native, cor
     adapter, client = native
     runner.session_store = None
     runner._busy_text_mode = "queue"
-    runner._adapter_for_source.return_value = adapter
+    runner._delivery_adapter_for.return_value = adapter
     runner._wire_adapter_handlers(adapter, authorization_check=lambda *args, **kwargs: True)
     adapter._team_bot_user_ids = {"workspace-synthetic": "UBOT"}
     adapter._team_clients = {"workspace-synthetic": client}

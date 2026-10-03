@@ -364,6 +364,41 @@ async def test_old_approval_card_cannot_resolve_a_new_pending_request():
             approval.unregister_gateway_notify(session_key)
 
 
+@pytest.mark.asyncio
+async def test_model_picker_clicks_belong_to_the_original_requester():
+    adapter, client = native()
+    ready, done = asyncio.Event(), asyncio.Event()
+    selected = AsyncMock(return_value="Switched")
+    providers = [{"slug": "openrouter", "name": "OpenRouter", "models": ["m1"], "total_models": 1}]
+
+    async def handler(event):
+        await adapter.send_model_picker(
+            "C1", providers, "old", "openrouter", adapter._event_session_key(event), selected,
+            metadata={"team_id": "T1", "thread_id": "100.000001"})
+        ready.set()
+        await done.wait()
+
+    adapter.set_message_handler(handler)
+    try:
+        await adapter._handle_slack_message(message("<@UBOT> /model"))
+        await asyncio.wait_for(ready.wait(), timeout=2)
+        body = {"team": {"id": "T1"}, "channel": {"id": "C1"},
+                "user": {"id": "UOTHER"}, "message": {"ts": "200.000001"}}
+        action = {"action_id": "hermes_model_provider", "selected_option": {"value": "0"}}
+        client.reset_mock()
+        await adapter._handle_model_picker_action(AsyncMock(), body, action)
+        assert not client.mock_calls
+        body["user"]["id"] = "UHUMAN"
+        await adapter._handle_model_picker_action(AsyncMock(), body, action)
+        client.chat_update.assert_awaited_once()
+        await adapter._handle_model_picker_action(AsyncMock(), body, {
+            "action_id": "hermes_model_model", "selected_option": {"value": "0"}})
+        selected.assert_awaited_once_with("C1", "m1", "openrouter")
+    finally:
+        done.set()
+        await drain(adapter)
+
+
 def test_scheduled_text_and_media_carry_same_job_authority():
     from types import SimpleNamespace
     from gateway.config import Platform
@@ -405,7 +440,7 @@ async def test_gateway_turn_entry_rejects_unscoped_and_completed_native_tasks():
     adapter, _ = native()
     runner = GatewayTurnMixin()
     runner._profile_scope_for_source = lambda source: nullcontext()
-    runner._adapter_for_source = lambda source: adapter
+    runner._delivery_adapter_for = lambda source: adapter
     runner._run_agent_inner = AsyncMock(return_value={"final_response": "", "messages": []})
     captured = []
 
@@ -523,7 +558,8 @@ async def test_no_reply_revokes_even_still_pending_prompt_callbacks():
             "team": {"id": "T1"}, "channel": {"id": "C1"}, "user": {"id": "UHUMAN"},
             "message": {"ts": "200.000001"}},
             {"action_id": "hermes_clarify_choice_0", "value": "stopped-prompt|0"})
-        assert not entry.response
+        # Revocation resolves the prompt as cancelled; the stale click records no choice.
+        assert entry.response == clarify_gateway.CANCELLED
         assert not client.mock_calls
         fresh = AsyncMock(return_value="fresh result")
         adapter.set_message_handler(fresh)

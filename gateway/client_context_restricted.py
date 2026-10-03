@@ -126,7 +126,7 @@ def validate_event(runner, event):
     from gateway.client_context_policy import MAX_QUESTION
 
     source = event.source
-    native(source, runner._adapter_for_source(source))
+    native(source, runner._delivery_adapter_for(source))
     require(not getattr(runner.config, "multiplex_profiles", False))
     require(runner._is_user_authorized_for_source(source))
     require(getattr(event, "_restricted_request", None) == seal_event(event))
@@ -212,7 +212,7 @@ async def handle_turn(runner, event, source, key, generation):
         reply._restricted_validate = validate
         reply._restricted_destination = (WORKSPACE, source.chat_id, source.thread_id)
         reply._restricted_adapter = native(source).adapter
-        runner._pop_post_delivery_callback(runner._adapter_for_source(source), key, generation)
+        runner._pop_post_delivery_callback(runner._delivery_adapter_for(source), key, generation)
         return True, reply
     except Exception:
         stopped.set()

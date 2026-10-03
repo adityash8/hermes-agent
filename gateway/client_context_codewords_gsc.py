@@ -12,8 +12,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit
 
-import yaml
 from dotenv import dotenv_values
+
+import hermes_yaml as yaml
 
 from gateway import client_context_google_stripe as google
 from gateway import client_context_reads as transport

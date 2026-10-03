@@ -70,7 +70,7 @@ async def test_bounded_policy_preserves_other_routes(runner, chat, outer):
 async def test_current_codewords_provider_boundary(runner, wire, monkeypatch, admin):
     runner.config.client_context = copy.deepcopy(SETTING)
     runner._is_user_authorized_for_source.return_value = admin
-    runner._adapter_for_source.return_value.authorize_turn = Mock(return_value=True)
+    runner._delivery_adapter_for.return_value.authorize_turn = Mock(return_value=True)
     trigger = event(chat_id=CHANNEL, scope_id="T07MMEX5658", thread_id="1789084800.000001",
                     user_id="U07MJJMMK9T" if admin else "U092L0QKYMB")
     trigger.message_id = "1789430400.000001"
@@ -106,8 +106,8 @@ def sealed(runner):
     trigger = event(chat_id=CHANNEL, scope_id="T07MMEX5658", user_id="U092L0QKYMB",
                     thread_id="1789084800.000001")
     trigger.message_id = "1789430400.000001"
-    if not hasattr(runner._adapter_for_source.return_value, "authorize_turn"):
-        runner._adapter_for_source.return_value.authorize_turn = Mock(return_value=True)
+    if not hasattr(runner._delivery_adapter_for.return_value, "authorize_turn"):
+        runner._delivery_adapter_for.return_value.authorize_turn = Mock(return_value=True)
     trigger.source._codewords_native_identity = native_identity(trigger.source)
     trigger.source._codewords_policy = route(runner.config, trigger.source)
     trigger._codewords_request = seal_event(trigger)
@@ -208,7 +208,7 @@ def native_text(runner):
     runner._busy_text_mode = "queue"
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="synthetic", typing_indicator=False))
     runner._wire_adapter_handlers(adapter, authorization_check=lambda *args, **kwargs: False)
-    runner._adapter_for_source = Mock(return_value=adapter)
+    runner._delivery_adapter_for = Mock(return_value=adapter)
     adapter._bot_user_id = "U0B2X1D8R17"
     client = AsyncMock()
     client.token = "synthetic-slack-credential"

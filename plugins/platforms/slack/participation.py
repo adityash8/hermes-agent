@@ -514,14 +514,30 @@ class SlackParticipationMixin(SlackDeletionMixin):
             self._pending_messages[session_key] = queued.pop(0)
         return True
 
-    def _spawn_drain_task(self, pending_event, session_key):
+    def _promote_followup(self, session_key):
         queues = self._lazy_attr("_slack_followup_queues", dict)
         queue = queues.get(session_key)
         if queue and session_key not in self._pending_messages:
             self._pending_messages[session_key] = queue.pop(0)
         if not queue:
             queues.pop(session_key, None)
-        super()._spawn_drain_task(pending_event, session_key)
+
+    def _spawn_drain_task(self, pending_event, session_key, delay: float = 0.0):
+        self._promote_followup(session_key)
+        super()._spawn_drain_task(pending_event, session_key, delay=delay)
+
+    async def _drain_after(self, pending_event, session_key, delay, guard):
+        # A backed-off head keeps the slot through the sleep, so the FIFO can only advance once
+        # it is popped; promoting at spawn time would strand every later follow-up.
+        if delay > 0:
+            await asyncio.sleep(delay)
+            await self._flush_text_debounce_now(session_key)
+            pending_event = self._pending_messages.pop(session_key, None)
+            if pending_event is None:
+                self._cleanup_finished_session_task(session_key, guard)
+                return
+            self._promote_followup(session_key)
+        await super()._drain_after(pending_event, session_key, 0.0, guard)
 
     async def _cancel_deleted_surface(self, key):
         sources = self._lazy_attr("_slack_surface_sessions", dict)
@@ -850,6 +866,9 @@ class SlackParticipationMixin(SlackDeletionMixin):
             pending = bool(entry and entry["confirm_id"] == confirm_id
                            and value == f"{session_key}|{entry['confirm_id']}"
                            and not slash_confirm._is_stale(entry, slash_confirm.DEFAULT_TIMEOUT_SECONDS))
+        elif kind == "model-picker":
+            # The prompt record binds requester and generation; the handler owns stage/expiry.
+            pending = True
         if not pending:
             return None
         return _Participation(self, original.key, user, session_key, original.generation,

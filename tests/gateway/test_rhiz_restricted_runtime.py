@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-import yaml
+import hermes_yaml as yaml
 
 from gateway import client_context as cc
 from gateway import client_context_restricted as route

@@ -168,7 +168,7 @@ async def test_closed_allowlist_intersection_and_proposals(runner, corpus, exten
     elif mode == "no_allow":
         runner.config.client_context["read_tools"]["allow"].remove(ga.TOOL)
     elif mode == "channel_narrowed":
-        runner._adapter_for_source.return_value.toolsets_for_source = lambda source: ["file"]
+        runner._delivery_adapter_for.return_value.toolsets_for_source = lambda source: ["file"]
     else:
         extended["agent"]["disabled_toolsets"] = ["web"]
     corpus.save()
