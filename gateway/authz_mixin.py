@@ -619,6 +619,13 @@ class GatewayAuthorizationMixin:
         ``GATEWAY_ALLOW_ALL_USERS``, default deny. A bot-authored message that any of these admits
         is still refused while its chat's loop guard is cooling down.
         """
+        from gateway import client_context_restricted as cookunity_lane
+        if cookunity_lane.selected(source):
+            try:
+                cookunity_lane.native(source, self._delivery_adapter_for(source))
+                return True
+            except Exception:
+                return False
         if not self._principal_authorized(source, allow_adapter_delegation=allow_adapter_delegation):
             return False
         if not getattr(source, "is_bot", False):

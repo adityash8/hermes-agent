@@ -97,6 +97,8 @@ async def admit_event(adapter, event, body=None, *, original_source=None):
             or user in {adapter._bot_user_id, adapter._team_bot_user_ids.get(team)}
             or adapter._user_is_bot_cache.get((team, user), False),
         )
+        from gateway.client_context_cookunity import EXTRA_USERS, CHANNEL as COOKUNITY_CHANNEL
+        require(user not in EXTRA_USERS or channel == COOKUNITY_CHANNEL)
         if codewords:
             from gateway.client_context_codewords import CHANNEL, WORKSPACE, native_identity
 
@@ -127,8 +129,7 @@ async def admit_event(adapter, event, body=None, *, original_source=None):
             require(original_source is None)
             await restricted.admit_native(adapter, event, body, source)
         if restricted.selected(source):
-            # Rhiz is an ordinary Slack operator again. Do not stamp a sandbox
-            # receipt; the runner grant supplies Linear, terminal, and files.
+            # CookUnity must keep its fresh native receipt, never a legacy source.
             pass
         elif original_source is not None:
             require((original_source.platform, original_source.scope_id, original_source.chat_id,
@@ -218,6 +219,10 @@ async def send_codewords(adapter, chat_id, content, reply_to, metadata):
 
 async def interaction_is_legacy(adapter, body, *, original_source=None):
     from gateway.client_context_restricted import USER
+    from gateway.client_context_cookunity import EXTRA_USERS, CHANNEL as COOKUNITY_CHANNEL
+    if (body.get("user", {}).get("id") in EXTRA_USERS
+            or body.get("channel", {}).get("id") == COOKUNITY_CHANNEL):
+        return False
     if not adapter.client_context_enabled and body.get("user", {}).get("id") != USER:
         return True
     # Only the actor/channel of the authenticated interaction, never action.value
@@ -285,8 +290,17 @@ async def dispatch_scoped(adapter, event, source):
         if not question or question.startswith(("/", "!")):
             return
     elif restricted_turn:
-        # No assistant-based participation check, thread lookup or inherited summon.
-        if source.chat_type != "dm" and not native_summon:
+        # Exact native summon only; ordinary acknowledgements stay silent.
+        if not native_summon or adapter._silence_requested(routing_text):
+            return
+        current = routing_text.replace(f"<@{bot_uid}>", "").strip()
+        bare = routing_text.strip() == f"<@{bot_uid}>"
+        if not bare and (adapter._participation_chatter(routing_text)
+                         or not current or current.startswith(("/", "!"))):
+            return
+        try:
+            text = await restricted.thread_question(adapter, event, source, text, bare)
+        except Exception:
             return
     elif not await adapter._response_needed(event, source.scope_id, source.chat_id, text, scoped=True):
         return
