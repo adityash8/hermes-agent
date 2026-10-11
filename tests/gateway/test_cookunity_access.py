@@ -109,6 +109,8 @@ async def test_native_exact_humans_isolated_sdk_and_reply(native, runner, wire, 
     assert len(wire.captured) == 1
     body = wire.captured[0]
     assert {t["function"]["name"] for t in body["tools"]} == set(cu.METHODS)
+    assert "lowercase except proper names" in body["messages"][0]["content"]
+    assert "not markdown tables" in body["messages"][0]["content"]
     assert "PRIVATE_" not in json.dumps(body)
     assert client.chat_postMessage.await_count == 1
     assert client.chat_postMessage.call_args.kwargs["channel"] == cu.CHANNEL
@@ -296,6 +298,73 @@ async def test_before_reply_revalidation_silently_drops(native, connectors, wire
     adapter._extract_response_content = extract
     await invoke(native)
     assert len(wire.captured) == 1
+    client.chat_postMessage.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entities", [
+    "<@UOTHER> <#COTHER> <!channel> <!here> <!everyone>",
+    "&lt;@UOTHER&gt; &lt;#COTHER&gt; &lt;!channel&gt; &lt;!here&gt; &lt;!everyone&gt;",
+    "&#60;@UOTHER&#62; &#x3c;!channel&#x3e; &amp;lt;#COTHER&amp;gt;",
+])
+async def test_native_reply_formats_markdown_without_activating_mentions(native, wire, entities):
+    from gateway.client_context import safe_output
+    adapter, client, event = native
+    prose = "# CookUnity CAC\n\n**trend** from [Mixpanel](https://example.invalid/report?a=1&b=2)\n"
+    code = "`**inline** [label](url)`\n```\n**fenced** [label](url)\n```"
+    wire.state.text = prose + code + f"\n{entities}\n[{entities}](https://example.invalid/{entities})"
+    formatter = Mock(wraps=adapter.format_message)
+    adapter.format_message = formatter
+    await invoke(native)
+    assert len(wire.captured) == 1
+    formatter.assert_called_once_with(str(safe_output(wire.state.text)))
+    client.chat_postMessage.assert_awaited_once()
+    payload = client.chat_postMessage.call_args.kwargs
+    assert payload == {"channel": cu.CHANNEL, "thread_ts": event["thread_ts"],
+                       "text": payload["text"], "mrkdwn": True, "parse": "none",
+                       "link_names": False, "unfurl_links": False, "unfurl_media": False}
+    text = payload["text"]
+    assert "*CookUnity CAC*" in text and "*trend*" in text
+    assert "<https://example.invalid/report?a=1&amp;b=2|Mixpanel>" in text
+    assert code in text
+    assert all(entity not in text for entity in ("<@", "<!", "<#"))
+    assert "@UOTHER" not in text and "@\u200bUOTHER" in text
+    assert str(safe_output(entities)) in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["error", "oversized", "empty", "entity", "raw_oversized",
+                                         "grant", "bot", "client", "destination"])
+async def test_native_reply_fails_closed_during_formatting(native, connectors, wire, variant):
+    adapter, client, _ = native
+    original = adapter.format_message
+    def format_message(text):
+        if variant == "error":
+            raise RuntimeError("PRIVATE_FORMATTER_ERROR")
+        if variant == "oversized":
+            return "x" * 6001
+        if variant == "empty":
+            return ""
+        if variant == "entity":
+            return "<@UOTHER> <!channel> <#COTHER>"
+        if variant == "grant":
+            connectors.value["generation"] = "revoked-during-formatting"
+            connectors.save()
+        elif variant == "bot":
+            adapter._team_bot_user_ids[cu.WORKSPACE] = "UOTHERBOT"
+        elif variant == "client":
+            adapter._team_clients[cu.WORKSPACE] = AsyncMock()
+        elif variant == "destination":
+            adapter._metadata_team_id = lambda metadata: "TOTHER"
+        return original(text)
+    adapter.format_message = Mock(side_effect=format_message)
+    wire.state.text = "x" * 6001 if variant == "raw_oversized" else "**CookUnity CAC**"
+    await invoke(native)
+    assert len(wire.captured) == 1
+    if variant == "raw_oversized":
+        adapter.format_message.assert_not_called()
+    else:
+        adapter.format_message.assert_called_once()
     client.chat_postMessage.assert_not_called()
 
 

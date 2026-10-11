@@ -204,7 +204,7 @@ async def handle_turn(runner, event, source, key, generation):
 
 
 async def send(adapter, chat_id, content, reply_to, metadata):
-    from gateway.client_context import ScopedReply
+    from gateway.client_context import MAX_OUTPUT, ScopedReply
     from gateway.platforms.base import SendResult
 
     try:
@@ -215,9 +215,21 @@ async def send(adapter, chat_id, content, reply_to, metadata):
         validate()
         team = adapter._metadata_team_id(metadata)
         thread = adapter._resolve_thread_ts(reply_to, metadata)
-        require((team, chat_id, thread) == content._restricted_destination)
+        destination = getattr(content, "_restricted_destination", None)
+        require((team, chat_id, thread) == destination)
+        # The reply has already passed safe_output; preserve its escaped entities
+        # and inert @ characters while using the ordinary Slack markdown renderer.
+        text = str(content)
+        require(0 < len(text.encode("utf-8")) <= MAX_OUTPUT)
+        text = adapter.format_message(text)
+        require(isinstance(text, str) and bool(text.strip())
+                and len(text.encode("utf-8")) <= MAX_OUTPUT)
+        require(not any(entity in text for entity in ("<@", "<!", "<#")))
+        validate()
+        require((adapter._metadata_team_id(metadata), chat_id,
+                 adapter._resolve_thread_ts(reply_to, metadata)) == destination)
         client = adapter._team_clients[WORKSPACE]
-        payload = {"channel": chat_id, "text": str(content), "mrkdwn": False, "parse": "none",
+        payload = {"channel": chat_id, "text": text, "mrkdwn": True, "parse": "none",
                    "link_names": False, "unfurl_links": False, "unfurl_media": False}
         if thread:
             payload["thread_ts"] = thread
