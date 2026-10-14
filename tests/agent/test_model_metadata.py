@@ -1690,6 +1690,27 @@ class TestGrok46StaleCacheGuard:
         assert ctx == 500_000
 
 
+class TestGrokEffortCapabilities:
+    """xAI 400s on ``reasoning.effort`` outside its allowlist and above a family's ceiling."""
+
+    @pytest.mark.parametrize("model", ["grok-4.7", "x-ai/grok-4.7", "XAI/Grok-4.7", "grok-4.7-fast"])
+    def test_grok_47_is_effort_capable_with_xhigh_ceiling(self, model):
+        from agent.model_metadata import grok_supports_reasoning_effort, grok_supports_xhigh, is_grok_46_family
+
+        assert grok_supports_reasoning_effort(model)
+        assert grok_supports_xhigh(model)
+        assert not is_grok_46_family(model)
+
+    @pytest.mark.parametrize(("model", "xhigh"), [
+        ("grok-4.6", True), ("x-ai/grok-4.6-fast", True), ("grok-4.5", False), ("grok-4.3", False),
+        ("grok-4.70", False), ("grok-4", False), ("", False),
+    ])
+    def test_xhigh_ceiling_is_exact_family_match(self, model, xhigh):
+        from agent.model_metadata import grok_supports_xhigh
+
+        assert grok_supports_xhigh(model) is xhigh
+
+
 class TestGenericPreCatalogStaleGuard:
     """Generic _stale_pre_catalog_cache_entry guard: models whose catalog
     entry postdates a shorter catch-all (qwen3.6-plus, grok-4-fast,

@@ -1356,6 +1356,21 @@ class TestCodexTransportXaiReasoningEffort:
 
         assert kw["reasoning"]["effort"] == "xhigh"
 
+    @pytest.mark.parametrize(("effort", "expected"), [
+        ("low", "low"), ("medium", "medium"), ("high", "high"), ("xhigh", "xhigh"), ("max", "xhigh"),
+    ])
+    def test_grok_47_sends_effort_up_to_xhigh(self, transport, effort, expected):
+        """grok-4.7 accepts low..xhigh but 400s on "max"; Hermes's max means its xhigh ceiling."""
+        kw = transport.build_kwargs(
+            model="grok-4.7",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            is_xai_responses=True,
+            reasoning_config={"effort": effort},
+        )
+
+        assert kw["reasoning"]["effort"] == expected
+
     @pytest.mark.parametrize("effort", ["max", "ultra"])
     def test_older_grok_clamps_aliases_to_high(self, transport, effort):
         """Older Grok tops out at high; above-ceiling aliases land there."""
