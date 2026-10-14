@@ -386,7 +386,9 @@ DEFAULT_CONTEXT_LENGTHS = {
 # /v1/responses). Unlisted Grok models still reason natively but 400 on the
 # parameter, so callers must send no `reasoning` key rather than a default `medium`.
 # grok-4.5/4.6 accept low/medium/high (default high) but REJECT "none", unlike grok-4.3.
-_GROK_EFFORT_CAPABLE_PREFIXES = ("grok-3-mini", "grok-4.20-multi-agent", "grok-4.3", "grok-4.5", "grok-4.6")
+# grok-4.7 accepts high/xhigh (default high) and 400s on "max".
+_GROK_EFFORT_CAPABLE_PREFIXES = (
+    "grok-3-mini", "grok-4.20-multi-agent", "grok-4.3", "grok-4.5", "grok-4.6", "grok-4.7")
 
 
 def grok_supports_reasoning_effort(model: str) -> bool:
@@ -399,6 +401,12 @@ def is_grok_46_family(model: str) -> bool:
     """Whether *model* is a Grok 4.6 family identifier."""
     name = (model or "").strip().lower().replace("_", "-").rsplit("/", 1)[-1]
     return name == "grok-4.6" or name.startswith("grok-4.6-")
+
+
+def grok_supports_xhigh(model: str) -> bool:
+    """Whether *model* is a Grok family whose effort ladder tops out at xhigh (4.6, 4.7)."""
+    name = (model or "").strip().lower().replace("_", "-").rsplit("/", 1)[-1]
+    return any(name == family or name.startswith(family + "-") for family in ("grok-4.6", "grok-4.7"))
 
 
 _CONTEXT_LENGTH_KEYS = (
