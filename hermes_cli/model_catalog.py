@@ -76,7 +76,20 @@ def _load_catalog_config() -> dict[str, Any]:
         "enabled": bool(raw.get("enabled", True)),
         "url": str(raw.get("url") or DEFAULT_CATALOG_URL),
         "ttl_hours": ttl_minutes / 60.0,
-        "providers": raw.get("providers") if isinstance(raw.get("providers"), dict) else {}}
+        "providers": raw.get("providers") if isinstance(raw.get("providers"), dict) else {},
+        "picker_allowlist": raw.get("picker_allowlist") if isinstance(raw.get("picker_allowlist"), dict) else {}}
+
+
+def get_picker_allowlist() -> dict[str, list[str]]:
+    """``model_catalog.picker_allowlist``: ``{provider_slug: [model_id, ...]}`` — picker rows for a
+    listed slug show only those ids (visibility only; typed ``/model`` ids are not restricted)."""
+    out: dict[str, list[str]] = {}
+    for slug, ids in _load_catalog_config()["picker_allowlist"].items():
+        if isinstance(ids, str):
+            ids = [ids]
+        if isinstance(ids, list):
+            out[str(slug).strip().lower()] = [s for i in ids if (s := str(i).strip())]
+    return out
 
 
 def _cache_path() -> Path:

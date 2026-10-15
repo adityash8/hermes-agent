@@ -1264,8 +1264,31 @@ def list_authenticated_providers(
     return _finalize_picker_rows(b.results, user_providers, current_model)
 
 
+def _apply_picker_allowlist(rows: list) -> list:
+    """Rows whose slug is listed in ``model_catalog.picker_allowlist`` show exactly the configured
+    ids, in order. The row itself still needs credentials; the ids are the user's explicit choice,
+    so they are not intersected with a possibly stale cached catalog."""
+    try:
+        from hermes_cli.model_catalog import get_picker_allowlist
+        allow = get_picker_allowlist()
+    except Exception:
+        return rows
+    if not allow:
+        return rows
+    out = []
+    for row in rows:
+        ids = allow.get(str(row.get("slug", "")).strip().lower())
+        if ids is None:
+            out.append(row)
+            continue
+        if ids:
+            out.append({**row, "models": list(ids), "total_models": len(ids)})
+    return out
+
+
 def _finalize_picker_rows(results: list, user_providers, current_model: str) -> list:
-    """Post-passes: drop ``providers.<name>.enabled: false`` rows, inject the current model, sort."""
+    """Post-passes: drop ``providers.<name>.enabled: false`` rows, apply the picker allowlist,
+    inject the current model, sort."""
     # The enabled post-filter covers built-in rows (sections 1-2) that bypass the per-section
     # gate; matched by slug and ``provider_id``.
     try:
@@ -1281,6 +1304,8 @@ def _finalize_picker_rows(results: list, user_providers, current_model: str) -> 
                     and str(r.get("slug", "")).strip().lower() not in disabled]
     except Exception:
         pass
+
+    results = _apply_picker_allowlist(results)
 
     # A custom/uncurated model set via `/model <provider>/<name>` would be invisible in every
     # picker (main and MoA slot pickers read these rows); inject it at the front of the current
@@ -1360,5 +1385,7 @@ def list_picker_providers(
             filtered.append(p)
     from hermes_cli.models_validate import drop_unofferable_model_ids
 
+    # OpenRouter's row was rebuilt above, after list_authenticated_providers applied the allowlist.
+    filtered = _apply_picker_allowlist(filtered)
     drop_unofferable_model_ids(filtered)
     return filtered
