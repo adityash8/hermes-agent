@@ -124,3 +124,28 @@ async def test_unavailable_raw_route_is_quiet_without_hiding_invalid_routes(tmp_
         assert not api._background_tasks and not caplog.records
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connected", [True, False])
+async def test_codewords_gated_durable_completion_converges_to_dropped(connected):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from gateway import client_context_codewords as codewords
+
+    runner = GatewayRunner(GatewayConfig())
+    runner.config.client_context = {"codewords_read_channels": {codewords.CHANNEL: {}}}
+    adapter = SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())
+    runner.adapters = {Platform.SLACK: adapter} if connected else {}
+    source = SessionSource(platform=Platform.SLACK, chat_id=codewords.CHANNEL, chat_type="group",
+                           thread_id="1791567190.347139", user_id="U07MJJMMK9T",
+                           scope_id=codewords.WORKSPACE)
+    key = build_session_key(source)
+    runner.session_store._entries[key] = SimpleNamespace(origin=source)
+    evt = pending(key, f"codewords-gated-{connected}")
+
+    for _ in range(3):
+        assert await runner._deliver_async_delegation_group([evt]) is not False
+    adapter.handle_message.assert_not_awaited()
+    assert delegation.get_durable_delegation(evt["delegation_id"])["delivery_state"] == "dropped"

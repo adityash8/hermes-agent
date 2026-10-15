@@ -385,6 +385,29 @@ async def test_post_turn_watch_drain_off_consumes_without_injecting(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_codewords_gated_watch_event_is_consumed_not_requeued(monkeypatch, tmp_path):
+    from gateway import client_context_codewords as codewords
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.config.client_context = {"codewords_read_channels": {codewords.CHANNEL: {}}}
+    adapter = SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())
+    runner.adapters = {Platform.SLACK: adapter}
+    key = f"agent:main:slack:group:{codewords.WORKSPACE}:{codewords.CHANNEL}:1791567190.347139"
+    runner.session_store._entries[key] = SimpleNamespace(origin=SessionSource(
+        platform=Platform.SLACK, chat_id=codewords.CHANNEL, chat_type="group",
+        thread_id="1791567190.347139", user_id="U07MJJMMK9T", scope_id=codewords.WORKSPACE,
+    ))
+    completion_queue = queue.Queue()
+    completion_queue.put(dict(_watch_event(), session_key=key))
+
+    await runner._drain_watch_notifications(completion_queue)
+
+    adapter.handle_message.assert_not_awaited()
+    assert completion_queue.empty()
+
+
+@pytest.mark.asyncio
 async def test_post_turn_watch_drain_all_injects_from_queued_event_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 

@@ -1275,6 +1275,20 @@ class GatewayNotificationsMixin:
             return _transport.adapter
         return next((a for p, a in adapters.items() if p.value == platform_name), None)
 
+    def _codewords_gated(self, source) -> bool:
+        """Codewords admits only sealed native requests, never internal wakes, so a retry can never
+        succeed: callers treat this as terminal instead of requeueing/deferring every 2s forever."""
+        from gateway.client_context_codewords import selected
+        return source is not None and selected(getattr(self, "config", None), source)
+
+    @staticmethod
+    def _log_codewords_drop(source, evt: dict) -> None:
+        logger.warning(
+            "Dropping %s notification for Codewords-gated chat=%s thread=%s (%s)",
+            evt.get("type") or "process", source.chat_id, source.thread_id,
+            evt.get("delegation_id") or evt.get("session_id") or "unknown",
+        )
+
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict, *, raise_not_accepted: bool = False,
     ) -> Optional[bool]:
@@ -1319,6 +1333,9 @@ class GatewayNotificationsMixin:
                 "Dropping watch notification with no routing metadata for process %s",
                 evt.get("session_id", "unknown"),
             )
+            return None
+        if self._codewords_gated(source):
+            self._log_codewords_drop(source, evt)
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         adapter = self._resolve_injection_adapter(platform_name, source)
@@ -1481,13 +1498,16 @@ class GatewayNotificationsMixin:
         """Unavailable owners/transports must not spend a durable delivery attempt."""
         from gateway.wake import adapter_supports_push
 
+        source = await asyncio.to_thread(self._build_process_event_source, evt)
+        if self._codewords_gated(source):
+            # Terminal regardless of transport health: preflight claims and drops it.
+            return True
         parent_session_id = str(evt.get("parent_session_id") or "").strip()
         if parent_session_id:
             verdict = await self._classify_completion_target(parent_session_id)
             if verdict != "deliver":
                 # Definitively closed targets still need the normal terminal disposition.
                 return verdict == "terminal"
-        source = await asyncio.to_thread(self._build_process_event_source, evt)
         if source is not None:
             platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
             adapter = self._resolve_injection_adapter(platform, source)
@@ -1536,6 +1556,13 @@ class GatewayNotificationsMixin:
                     claim.proceed, claim.early_result = False, False
                     return claim
         elif evt_type != "completion":
+            return claim
+        source = await asyncio.to_thread(self._build_process_event_source, evt)
+        if self._codewords_gated(source):
+            self._log_codewords_drop(source, evt)
+            if claim.claim_id:
+                self._settle_durable_claim("drop", claim.delegation_id, claim.claim_id)
+            claim.proceed = False
             return claim
         # Background completions carry only session_key, so after /new the OLD session's notification
         # would land in the NEW one. Stamped events get the async-delegation pre-flight; unstamped deliver.
