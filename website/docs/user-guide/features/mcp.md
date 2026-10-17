@@ -487,6 +487,7 @@ Hermes reads MCP config from `~/.hermes/config.yaml` under `mcp_servers`.
 | `command` | string | Executable for a stdio MCP server |
 | `args` | list | Arguments for the stdio server |
 | `env` | mapping | Environment variables passed to the stdio server |
+| `inherit_secret_sources` | bool | If `false`, a stdio server does not receive the vars your external secret source (1Password, Bitwarden) applied; it gets only the safe baseline plus its own `env` (reference secrets there as `${VAR}`). Default `true` |
 | `cwd` | string | Working directory for the stdio server process. Default: the session working directory when one is pinned (ACP/gateway sessions, `terminal.cwd`), else the Hermes process directory |
 | `url` | string | HTTP MCP endpoint |
 | `headers` | mapping | HTTP headers for remote servers |
