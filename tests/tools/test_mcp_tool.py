@@ -1534,6 +1534,34 @@ class TestBuildSafeEnv:
         assert result["NOTION_TOKEN"] == "from-op"
         assert "UNTRACKED_SECRET_KEY" not in result
 
+    def test_secret_source_vars_skipped_when_inherit_disabled(self, monkeypatch):
+        """``inherit_secret_sources: false`` drops source-tagged vars; the server's own env still wins."""
+        from hermes_cli import env_loader
+        from tools.mcp_tool_config import _build_safe_env
+
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "ALPACA_API_KEY", "bitwarden")
+        monkeypatch.setitem(env_loader._SECRET_SOURCES, "NOTION_TOKEN", "onepassword")
+        fake_env = {"PATH": "/usr/bin", "ALPACA_API_KEY": "from-bws-key", "NOTION_TOKEN": "from-op"}
+        with patch.dict("os.environ", fake_env, clear=True):
+            result = _build_safe_env({"NOTION_TOKEN": "explicit"}, inherit_secret_sources=False)
+
+        assert result["PATH"] == "/usr/bin"
+        assert "ALPACA_API_KEY" not in result
+        assert result["NOTION_TOKEN"] == "explicit"
+
+    def test_stdio_launch_honours_inherit_secret_sources(self, monkeypatch):
+        """The server config key reaches ``_build_safe_env``; absent means inherit (upstream default)."""
+        from tools import mcp_tool_config, mcp_tool_transport
+
+        seen = []
+        monkeypatch.setattr(mcp_tool_config, "_build_safe_env",
+                            lambda env, inherit_secret_sources=True: seen.append(inherit_secret_sources) or {})
+        monkeypatch.setattr(mcp_tool_config, "_resolve_stdio_command", lambda command, env: (command, env))
+        for config in ({"command": "x"}, {"command": "x", "inherit_secret_sources": False},
+                       {"command": "x", "inherit_secret_sources": True}):
+            mcp_tool_transport._stdio_launch(config)
+        assert seen == [True, False, True]
+
     def test_secret_source_vars_resolve_through_active_profile_scope(self, monkeypatch):
         """Under multiplex the stdio child gets the ROUTED profile's value for a source-tagged name,
         never the launch profile's os.environ copy; a name the profile lacks is omitted."""
