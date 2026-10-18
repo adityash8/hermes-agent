@@ -940,3 +940,77 @@ async def test_raw_output_modes_are_human_facing(monkeypatch, tmp_path):
         assert "proc_deadbeef" not in text and "[Background process" not in text and "~" not in text
         assert "\x1b[" not in text
         assert "make -j8 all" in text
+
+
+def _refusing_runner(monkeypatch, tmp_path):
+    """Runner whose Telegram adapter silently refuses every internal wake (never sets the receipt)."""
+    from gateway.session import SessionSource
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = SimpleNamespace(send=AsyncMock(), handle_message=AsyncMock())
+    runner.adapters[Platform.TELEGRAM] = adapter
+    runner.session_store._entries["agent:main:telegram:dm:123:42"] = SimpleNamespace(origin=SessionSource(
+        platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", thread_id="42", user_id="proc_owner",
+    ))
+    return runner, adapter
+
+
+@pytest.mark.asyncio
+async def test_refused_watch_event_requeue_loop_is_capped(monkeypatch, tmp_path, caplog):
+    """EZ-1576: a wake the adapter can never admit was requeued every drain, forever."""
+    import gateway.run_notifications as rn
+
+    monkeypatch.setattr(rn, "_WATCH_REQUEUE_MAX_ATTEMPTS", 4)
+    runner, adapter = _refusing_runner(monkeypatch, tmp_path)
+    completion_queue = queue.Queue()
+    completion_queue.put(_watch_event())
+
+    for _ in range(10):
+        await runner._drain_watch_notifications(completion_queue)
+
+    assert adapter.handle_message.await_count == 4
+    assert completion_queue.empty()
+    assert sum("EZ-1576 requeue cap" in r.getMessage() for r in caplog.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_retryable_watch_event_still_delivers_before_cap(monkeypatch, tmp_path):
+    runner, adapter = _refusing_runner(monkeypatch, tmp_path)
+    completion_queue = queue.Queue()
+    completion_queue.put(_watch_event())
+
+    await runner._drain_watch_notifications(completion_queue)
+    assert completion_queue.qsize() == 1
+    adapter.handle_message = AdmittingHandler()
+    await runner._drain_watch_notifications(completion_queue)
+
+    adapter.handle_message.assert_awaited_once()
+    assert completion_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_watch_injections_rate_capped_per_thread_per_hour(monkeypatch, tmp_path, caplog):
+    import gateway.run_notifications as rn
+
+    monkeypatch.setattr(rn, "_WATCH_INJECT_MAX_PER_THREAD_PER_HOUR", 3)
+    clock = [1000.0]
+    monkeypatch.setattr(rn.time, "monotonic", lambda: clock[0])
+    runner, adapter = _refusing_runner(monkeypatch, tmp_path)
+    adapter.handle_message = AdmittingHandler()
+    other_thread = dict(_watch_event(thread_id="77"), session_key="agent:main:telegram:dm:123:77")
+    completion_queue = queue.Queue()
+    for i in range(6):
+        completion_queue.put(_watch_event(session_id=f"proc_{i}"))
+    completion_queue.put(other_thread)
+
+    await runner._drain_watch_notifications(completion_queue)
+
+    keys = [c.args[0].metadata.get("gateway_session_key") for c in adapter.handle_message.await_args_list]
+    assert keys.count("agent:main:telegram:dm:123:42") == 3
+    assert completion_queue.empty()
+    assert sum("rate cap tripped" in r.getMessage() for r in caplog.records) == 1
+
+    clock[0] += rn._WATCH_INJECT_WINDOW_SECONDS
+    completion_queue.put(_watch_event(session_id="proc_after_window"))
+    await runner._drain_watch_notifications(completion_queue)
+    assert adapter.handle_message.await_count == 3 + 1 + 1
