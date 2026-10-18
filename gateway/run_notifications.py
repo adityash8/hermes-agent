@@ -39,6 +39,23 @@ def _update_failed_notice() -> str:
 # deferred line on every poll, in every process, forever. Stop waiting past this age.
 _UPDATE_NOTIFY_MAX_ADAPTER_WAIT_SECONDS = 3600.0
 
+# Watch/completion events whose injection returns a retryable failure are requeued and retried on
+# every drain (~2s). A rejection that can never succeed (an adapter silently refusing internal wakes)
+# would otherwise spin forever: ~5,300 "injecting" lines/hour per thread with no alert (EZ-1576).
+# Bound both the retries of one event and the injection attempts per session thread per hour.
+_WATCH_REQUEUE_MAX_ATTEMPTS = 150
+_WATCH_INJECT_MAX_PER_THREAD_PER_HOUR = 120
+_WATCH_INJECT_WINDOW_SECONDS = 3600.0
+
+
+def _watch_thread_key(evt: dict) -> str:
+    """Rate-cap/log key for a queued watch event: its session key (thread-scoped), else its route."""
+    session_key = str(evt.get("session_key") or "").strip()
+    if session_key:
+        return session_key
+    route = ":".join(str(evt.get(f) or "") for f in ("platform", "chat_id", "thread_id"))
+    return route if route.strip(":") else f"process:{evt.get('session_id') or 'unknown'}"
+
 
 def _served_notice_target_key(profile: Optional[str], platform_value: str, chat_id, thread_id) -> tuple:
     """Notice-dedupe key for one SERVED profile's home channel.
@@ -1176,13 +1193,44 @@ class GatewayNotificationsMixin:
                 synth_text = _format_gateway_process_notification(evt)
                 if not synth_text:
                     continue
+                if not self._admit_watch_injection(evt):
+                    continue
                 try:
                     delivered = await self._inject_watch_notification(synth_text, evt)
                 except Exception:
                     logger.exception("Watch notification injection error")
                     delivered = False
             if delivered is False:
+                attempts = int(evt.get("_watch_requeue_attempts") or 0) + 1
+                if attempts >= _WATCH_REQUEUE_MAX_ATTEMPTS:
+                    logger.warning(
+                        "Dropping %s notification for %s after %d undelivered attempts: "
+                        "the adapter keeps refusing it (EZ-1576 requeue cap)",
+                        evt.get("type") or "watch", _watch_thread_key(evt), attempts,
+                    )
+                    continue
+                evt["_watch_requeue_attempts"] = attempts
                 completion_queue.put(evt)
+
+    def _admit_watch_injection(self, evt: dict) -> bool:
+        """Per-thread hourly cap on watch injection attempts; warns once each time a thread trips it."""
+        key = _watch_thread_key(evt)
+        now = time.monotonic()
+        windows = self.__dict__.setdefault("_watch_inject_windows", {})
+        window_start, count, warned = windows.get(key, (now, 0, False))
+        if now - window_start >= _WATCH_INJECT_WINDOW_SECONDS:
+            window_start, count, warned = now, 0, False
+        if count >= _WATCH_INJECT_MAX_PER_THREAD_PER_HOUR:
+            if not warned:
+                logger.warning(
+                    "Watch notification rate cap tripped for %s: %d injections in the last hour; "
+                    "dropping further %s events for this thread until the window resets (EZ-1576)",
+                    key, count, evt.get("type") or "watch",
+                )
+            windows[key] = (window_start, count, True)
+            return False
+        windows[key] = (window_start, count + 1, warned)
+        return True
 
     def _adapter_by_platform_value(self, platform_name: str):
         """Literal ``p.value == platform_name`` scan over connected adapters (native adapters only)."""
