@@ -1,13 +1,17 @@
-"""Shutdown forensics — capture context when the gateway receives SIGTERM/SIGINT.
+"""Shutdown forensics — capture context when the gateway receives SIGTERM/SIGINT (and SIGUSR1 restarts).
 
 ``shutdown_signal_handler`` runs synchronously inside the asyncio loop, so
 :func:`snapshot_shutdown_context` is a fast (<10ms) non-blocking probe and
 :func:`spawn_async_diagnostic` is a fire-and-forget ``ps`` walk in a detached
 subprocess. Anything that waits belongs in the async helper, never in the probe.
+The async helper also names the live requester (``launchctl kickstart``/``bootout``,
+``hermes gateway restart``, ``kill``) by its matched verb phrase only (redacted), with
+its launchd label and ancestor names; nothing else from any argv is written (EZ-1577).
 """
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import shutil
@@ -62,7 +66,26 @@ def _proc_summary(pid: int) -> Dict[str, Any]:
             summary["ppid"] = int(ppid)
     if (uid := _read_proc_field(pid, "Uid")) is not None:
         summary["uid"] = uid.split()[0] if uid else uid  # "real effective saved fs"
+    if "name" not in summary and (name := _darwin_proc_name(pid)):
+        summary["name"] = name  # macOS has no /proc; without this every parent logs as "?" (EZ-1577)
     return summary
+
+
+_LIBPROC: List[Any] = []
+
+
+def _darwin_proc_name(pid: int) -> Optional[str]:
+    """Short process name via libproc ``proc_name`` (one syscall, no subprocess). macOS only."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        if not _LIBPROC:
+            _LIBPROC.append(ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True))
+        buf = ctypes.create_string_buffer(256)
+        n = _LIBPROC[0].proc_name(int(pid), buf, ctypes.c_uint32(len(buf)))
+        return buf.value.decode("utf-8", "replace") if n > 0 else None
+    except (OSError, AttributeError, ValueError):
+        return None
 
 
 def _read_marker(path: Path) -> Optional[str]:
@@ -116,8 +139,13 @@ def snapshot_shutdown_context(received_signal: Any = None) -> Dict[str, Any]:
 
 
 def _async_diagnostic_script(signal_name: str, self_pid: int) -> str:
-    """POSIX listing used by the detached diagnostic. Columns are identity/resource only — no argv."""
+    """POSIX listing used by the detached diagnostic. Columns are identity/resource only — no argv.
+
+    macOS ``comm`` is argv[0], which a process can rewrite (``exec -a``, setproctitle), so the whole
+    listing is piped through :data:`_REDACT_SED` before it reaches the log.
+    """
     return (
+        "{ "
         f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
         "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
         "echo '--- ps (top 60 by cpu, comm only) ---'; "
@@ -128,8 +156,57 @@ def _async_diagnostic_script(signal_name: str, self_pid: int) -> str:
         "echo '--- loadavg ---'; cat /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg 2>/dev/null || true; "
         "echo '--- recent dmesg (oom/killed) ---'; "
         "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
-        "echo '=== end ==='"
+        + _REQUESTER_PROBE.replace("@SELF@", str(int(self_pid)))
+        + "echo '=== end ==='; "
+        "} 2>&1 | sed -E " + _REDACT_SED
     )
+
+
+_REDACT_SED = (
+    "'s/[A-Za-z0-9_+=-]{32,}/<redacted>/g; "
+    "s/((KEY|TOKEN|SECRET|PASSWORD|key|token|secret|password)[A-Za-z_]*[=:])[^ ]+/\\1<redacted>/g'"
+)
+
+
+# Who asked for the stop/restart (EZ-1577). Neither asyncio nor macOS gives the handler the sender pid,
+# and the gateway's own parent is just the per-launch wrapper, so this looks for the requester while it
+# is still alive: ``launchctl kickstart -k``/``bootout`` and ``hermes gateway restart|stop`` block until
+# we exit. Only the matched verb phrase is persisted (redacted), never the rest of argv; the launchd
+# label comes from the nearest ancestor's XPC_SERVICE_NAME (Linux: its systemd ``.service``).
+_REQUESTER_VERB_RE = (
+    r"launchctl +(kickstart( +-[a-z]+)*|bootout|stop|kill +[A-Za-z0-9]+|unload|remove) +[^ ]+"
+    r"|hermes[^ ]* +gateway +(restart|stop|start)( +--[a-z-]+)*"
+    r"|(^|[ /])(kill|pkill|killall)( +-[A-Za-z0-9]+)* +[^ ]+"
+)
+_REQUESTER_PROBE = (
+    "echo '--- ancestry of self ---'; "
+    "snap=$(ps -axo pid=,ppid=,etime=,comm= 2>/dev/null); "
+    "_chain() { printf '%s\\n' \"$snap\" | awk -v p=\"$1\" -v want=\"$2\" '"
+    "{pp[$1]=$2; et[$1]=$3; c=$4; for(i=5;i<=NF;i++) c=c \" \" $i; n=split(c,a,\"/\"); split(a[n],w,\" \"); cm[$1]=w[1]} "
+    "END{q=p; s=\"\"; ids=\"\"; k=0; while(q>1 && k<12 && (q in cm)){s=s (s?\" < \":\"\") cm[q] \"(\" q \")\"; "
+    "ids=ids \" \" q; q=pp[q]; k++} if(want==\"ids\") print ids; else if(want==\"etime\") print et[p]; else print s}'; }; "
+    "_label() { for q in $1; do "
+    "l=$(ps -E -ww -o command= -p \"$q\" 2>/dev/null | tr ' ' '\\n' | grep -m1 '^XPC_SERVICE_NAME=' | cut -d= -f2-); "
+    "[ -z \"$l\" ] && l=$(grep -o '[^/]*[.]service' /proc/$q/cgroup 2>/dev/null | head -1); "
+    "if [ -n \"$l\" ] && [ \"$l\" != 0 ]; then echo \"$l\"; return; fi; done; echo '-'; }; "
+    "_chain @SELF@; "
+    "echo '--- requester candidates (EZ-1577) ---'; "
+    "cands=$(ps -axo pid=,args= 2>/dev/null | awk -v self=@SELF@ -v re='" + _REQUESTER_VERB_RE + "' "
+    "'index($0, \"shutdown diagnostic\") {next} $1 == self {next} "
+    # Direct matches (argv starts with the verb, e.g. the ``launchctl`` process itself) rank ahead of
+    # shells/agents whose script text merely contains it.
+    "match($0, re) {st=index($0, $2); m=$1 \"\\t\" substr($0, RSTART, RLENGTH); "
+    "if (index(substr($0, st, RSTART-st), \" \")) ind[++ni]=m; else dir[++nd]=m} "
+    "END{for(i=1;i<=nd;i++) print dir[i]; for(i=1;i<=ni;i++) print ind[i]}' | head -3); "
+    "if [ -z \"$cands\" ]; then echo 'requester: none found (sender exited, launchd KeepAlive/jetsam, or bare kill)'; "
+    "else tag=requester; printf '%s\\n' \"$cands\" | while IFS=\"$(printf '\\t')\" read -r pid cmd; do "
+    "echo \"$tag: pid=$pid etime=$(_chain \"$pid\" etime) label=$(_label \"$(_chain \"$pid\" ids)\") "
+    "cmd=[${cmd# }] chain=$(_chain \"$pid\")\"; tag=candidate; done; fi; "
+)
+
+
+_DIAGNOSTIC_DEDUPE_S = 2.0
+_LAST_DIAGNOSTIC: List[float] = []
 
 
 def spawn_async_diagnostic(log_path: Path, signal_name: str, *,
@@ -138,14 +215,19 @@ def spawn_async_diagnostic(log_path: Path, signal_name: str, *,
     ``timeout`` so a wedged ``ps`` self-cleans) rather than a blocking process listing in the signal
     handler, which can freeze the loop >2s on a busy host. Returns the subprocess PID, or ``None``
     on failure / Windows (bash -c is available on every POSIX target; Windows has no ps anyway).
-    The listing is comm-only: full argv is not persisted.
+    The listing is comm-only plus the requester's matched verb phrase: full argv is not persisted.
     """
+    if sys.platform == "win32":
+        return None
+    # launchd/wrappers deliver the same SIGTERM twice ~20ms apart; one listing per burst (EZ-1577).
+    now = time.monotonic()
+    if _LAST_DIAGNOSTIC and now - _LAST_DIAGNOSTIC[0] < _DIAGNOSTIC_DEDUPE_S:
+        return None
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
-    if sys.platform == "win32":
-        return None
+    _LAST_DIAGNOSTIC[:] = [now]
     script = _async_diagnostic_script(signal_name, os.getpid())
     try:  # O_APPEND so concurrent diagnostics from rapid signals don't trample each other
         fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
