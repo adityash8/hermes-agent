@@ -13,6 +13,26 @@ import pytest
 
 from gateway import shutdown_forensics as sf
 
+
+@pytest.fixture(autouse=True)
+def _reset_diagnostic_dedupe():
+    sf._LAST_DIAGNOSTIC.clear()
+    yield
+    sf._LAST_DIAGNOSTIC.clear()
+
+
+def _wait_for_end(log_path, pid, timeout=8.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if log_path.exists() and "=== end ===" in log_path.read_text(encoding="utf-8", errors="replace"):
+            break
+        time.sleep(0.1)
+    try:
+        os.waitpid(pid, 0)
+    except (ChildProcessError, OSError):
+        pass
+    return log_path.read_text(encoding="utf-8", errors="replace")
+
 # ---------------------------------------------------------------------------
 # _signal_name
 # ---------------------------------------------------------------------------
@@ -150,6 +170,55 @@ class TestSpawnAsyncDiagnostic:
         assert "shutdown diagnostic" in contents
         assert _ARGV_CANARY not in contents
         assert (log_path.stat().st_mode & 0o777) == 0o600
+
+class TestRequesterAttribution:
+    """EZ-1577: the diagnostic names who asked for the stop while that requester is still alive."""
+
+    @pytest.mark.platforms("macos")
+    def test_names_live_launchctl_kickstart_and_redacts_its_args(self, tmp_path):
+        fake = subprocess.Popen(
+            ["bash", "-c", f'exec -a "launchctl kickstart -k gui/501/ai.hermes.gateway TOKEN={_ARGV_CANARY}" sleep 30'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(0.3)
+            log_path = tmp_path / "diag.log"
+            pid = sf.spawn_async_diagnostic(log_path, "SIGTERM", timeout_seconds=5.0)
+            contents = _wait_for_end(log_path, pid)
+        finally:
+            fake.kill()
+            fake.wait()
+        requester = [l for l in contents.splitlines() if l.startswith("requester: ")]
+        assert requester and f"pid={fake.pid} " in requester[0], contents
+        assert "cmd=[launchctl kickstart -k gui/501/ai.hermes.gateway]" in requester[0]
+        assert " label=" in requester[0] and " chain=" in requester[0]
+        assert _ARGV_CANARY not in contents
+        assert "--- ancestry of self ---" in contents
+
+    @pytest.mark.platforms("macos")
+    def test_reports_none_found_without_a_requester(self, tmp_path):
+        log_path = tmp_path / "diag.log"
+        pid = sf.spawn_async_diagnostic(log_path, "SIGTERM", timeout_seconds=5.0)
+        contents = _wait_for_end(log_path, pid)
+        assert "--- requester candidates (EZ-1577) ---" in contents
+        assert any(l.startswith("requester: ") for l in contents.splitlines())
+
+    def test_back_to_back_signals_spawn_one_diagnostic(self, tmp_path, monkeypatch):
+        spawned = []
+
+        class _Proc:
+            pid = 4242
+
+        monkeypatch.setattr(sf.subprocess, "Popen", lambda *a, **k: spawned.append(a) or _Proc())
+        if sys.platform == "win32":
+            pytest.skip("no async diagnostic on Windows")
+        assert sf.spawn_async_diagnostic(tmp_path / "d.log", "SIGTERM") == 4242
+        assert sf.spawn_async_diagnostic(tmp_path / "d.log", "SIGTERM") is None
+        assert len(spawned) == 1
+
+    @pytest.mark.platforms("macos")
+    def test_proc_summary_names_parent_on_macos(self):
+        assert sf._proc_summary(os.getpid()).get("name")
+        assert sf._darwin_proc_name(2 ** 22 + 7) is None
 
 # ---------------------------------------------------------------------------
 # parse_systemd_duration_to_us

@@ -67,8 +67,14 @@ async def test_sigusr1_handler_installed_by_start_gateway_logs_graceful_restart(
 
     await gateway_run.start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
 
+    diagnostics = []
+    monkeypatch.setattr("gateway.shutdown_forensics.spawn_async_diagnostic",
+                        lambda path, sig, **kw: diagnostics.append((path.name, sig)))
+
     handler, args = installed[signal.SIGUSR1]
     with caplog.at_level(logging.INFO, logger="gateway.run"):
         handler(*args)
 
     assert runners[0].restart_calls == [{"detached": False, "via_service": True}]
+    # EZ-1577: in-band restarts are attributed to a requester like SIGTERM stops.
+    assert diagnostics == [("gateway-shutdown-diag.log", "SIGUSR1")]

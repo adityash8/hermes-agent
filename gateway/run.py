@@ -5284,6 +5284,13 @@ def _start_gateway_make_restart_signal_handler(runner):
             "SIGUSR1 received (systemctl reload / hermes gateway restart): performing a graceful "
             "gateway restart — drain active turns, exit, supervisor relaunches. Not an in-process "
             "config reload.")
+
+        def _diagnostic() -> None:
+            # `hermes gateway restart` arrives as SIGUSR1, not SIGTERM: name its requester too (EZ-1577).
+            from gateway.shutdown_forensics import spawn_async_diagnostic
+            spawn_async_diagnostic(_hermes_home / "logs" / "gateway-shutdown-diag.log", "SIGUSR1", timeout_seconds=5.0)
+
+        _best_effort(_diagnostic, "spawn_async_diagnostic failed: %s")
         runner.request_restart(detached=False, via_service=True)
     return restart_signal_handler
 
