@@ -18,52 +18,131 @@ logger = logging.getLogger(__name__)
 
 
 class MessageDeduplicator:
-    """TTL-based message deduplication cache (``if dedup.is_duplicate(msg_id): return``)."""
+    """TTL-based message deduplication cache.
+
+    ``is_duplicate`` preserves the legacy atomic check-and-claim behavior. Slack's
+    retry path uses token-owned reservations so only the invocation that acquired
+    a claim can commit or release it.
+    """
 
     def __init__(self, max_size: int = 2000, ttl_seconds: float = 300):
         self._seen: dict[str, float] = {}
+        self._reserved: dict[str, object] = {}
         self._max_size = max_size
         self._ttl = ttl_seconds
+        self._lock = threading.Lock()
+
+    def _prune_locked(self, now: float) -> None:
+        """Preserve the existing bounded-cache TTL/oldest-first eviction policy."""
+        if len(self._seen) <= self._max_size:
+            return
+        cutoff = now - self._ttl
+        stale = [key for key, seen_at in self._seen.items() if seen_at <= cutoff]
+        for key in stale:
+            self._seen.pop(key, None)
+            self._reserved.pop(key, None)
+        if len(self._seen) > self._max_size:
+            # All entries are still fresh: keep the newest so max_size holds under load.
+            newest = dict(sorted(self._seen.items(), key=lambda item: item[1])[-self._max_size:])
+            removed = self._seen.keys() - newest.keys()
+            for key in removed:
+                self._reserved.pop(key, None)
+            self._seen = newest
 
     def is_duplicate(self, msg_id: str) -> bool:
         """Return True if *msg_id* was already seen within the TTL window."""
         if not msg_id:
             return False
         now = time.time()
-        if msg_id in self._seen:
-            if now - self._seen[msg_id] < self._ttl:
-                return True
-            del self._seen[msg_id]  # expired: treat as new
-        self._seen[msg_id] = now
-        if len(self._seen) > self._max_size:
-            cutoff = now - self._ttl
-            self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
-            if len(self._seen) > self._max_size:
-                # All entries still fresh: keep the newest so max_size holds under load.
-                self._seen = dict(sorted(self._seen.items(), key=lambda item: item[1])[-self._max_size:])
-        return False
+        with self._lock:
+            if msg_id in self._seen:
+                if now - self._seen[msg_id] < self._ttl:
+                    return True
+                self._seen.pop(msg_id, None)  # expired: treat as new
+                self._reserved.pop(msg_id, None)
+            self._seen[msg_id] = now
+            self._reserved.pop(msg_id, None)
+            self._prune_locked(now)
+            return False
+
+    def reserve(self, msg_id: str) -> Optional[tuple[str, object]]:
+        """Atomically claim *msg_id* and return its owner token, or ``None`` if already live."""
+        if not msg_id:
+            return None
+        now = time.time()
+        with self._lock:
+            if msg_id in self._seen:
+                if now - self._seen[msg_id] < self._ttl:
+                    return None
+                self._seen.pop(msg_id, None)
+                self._reserved.pop(msg_id, None)
+            token = object()
+            self._seen[msg_id] = now
+            self._reserved[msg_id] = token
+            self._prune_locked(now)
+            if self._reserved.get(msg_id) is not token:
+                # An overfull bounded cache may evict the just-added entry.
+                return None
+            return msg_id, token
+
+    def commit(self, reservation: Optional[tuple[str, object]]) -> bool:
+        """Make an owned reservation permanent for its original TTL window."""
+        if reservation is None:
+            return False
+        msg_id, token = reservation
+        with self._lock:
+            if self._reserved.get(msg_id) is not token:
+                return False
+            self._reserved.pop(msg_id, None)
+            return True
+
+    def release(self, reservation: Optional[tuple[str, object]]) -> bool:
+        """Remove only the still-live reservation owned by *reservation*'s token."""
+        if reservation is None:
+            return False
+        msg_id, token = reservation
+        with self._lock:
+            if self._reserved.get(msg_id) is not token:
+                return False
+            self._reserved.pop(msg_id, None)
+            self._seen.pop(msg_id, None)
+            return True
 
     def contains(self, msg_id: str) -> bool:
-        """Return whether *msg_id* is live in the cache without inserting it."""
-        seen_at = self._seen.get(msg_id) if msg_id else None
-        if seen_at is None:
+        """Return whether *msg_id* is live in the cache without inserting or refreshing it."""
+        if not msg_id:
             return False
-        if time.time() - seen_at < self._ttl:
-            return True
-        del self._seen[msg_id]
-        return False
+        now = time.time()
+        with self._lock:
+            if msg_id not in self._seen:
+                return False
+            if now - self._seen[msg_id] < self._ttl:
+                return True
+            self._seen.pop(msg_id, None)
+            self._reserved.pop(msg_id, None)
+            return False
 
     def discard(self, msg_id: str) -> None:
-        """Release a claimed message ID after cancelled/failed handoff."""
-        self._seen.pop(msg_id, None)
+        """Release a claimed message ID after cancelled/failed handoff (legacy API)."""
+        with self._lock:
+            self._seen.pop(msg_id, None)
+            self._reserved.pop(msg_id, None)
 
     def clear(self):
-        self._seen.clear()
+        with self._lock:
+            self._seen.clear()
+            self._reserved.clear()
 
     def absorb(self, other: "MessageDeduplicator") -> None:
         """Adopt *other*'s still-live IDs (at their original seen times) into this cache."""
-        cutoff = time.time() - self._ttl
-        self._seen.update({k: v for k, v in other._seen.items() if v > cutoff and k not in self._seen})
+        now = time.time()
+        with other._lock:
+            transferred = {
+                key: seen_at for key, seen_at in other._seen.items()
+                if seen_at > now - self._ttl
+            }
+        with self._lock:
+            self._seen.update({key: seen_at for key, seen_at in transferred.items() if key not in self._seen})
 
 
 def inbound_dedup_caches(adapter: Any) -> dict[str, MessageDeduplicator]:

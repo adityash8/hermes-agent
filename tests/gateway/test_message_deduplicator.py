@@ -10,7 +10,9 @@ the past, the entry is treated as expired and the message is allowed through.
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 
+import gateway.platforms.helpers as helpers
 from gateway.platforms.helpers import MessageDeduplicator
 
 
@@ -56,5 +58,45 @@ class TestMessageDeduplicatorTTL:
         assert len(dedup._seen) == 4
         assert "old-0" not in dedup._seen
         assert "new-0" in dedup._seen
+
+    def test_reservation_commit_preserves_existing_ttl_behavior(self, monkeypatch):
+        now = [100.0]
+        monkeypatch.setattr(helpers.time, "time", lambda: now[0])
+        dedup = MessageDeduplicator(ttl_seconds=5)
+
+        reservation = dedup.reserve("msg")
+        assert reservation is not None
+        assert dedup.reserve("msg") is None
+        assert dedup.commit(reservation) is True
+        assert dedup.reserve("msg") is None
+
+        now[0] += 5
+        expired_reservation = dedup.reserve("msg")
+        assert expired_reservation is not None
+
+    def test_release_only_removes_the_reservation_owned_by_its_token(self, monkeypatch):
+        now = [100.0]
+        monkeypatch.setattr(helpers.time, "time", lambda: now[0])
+        dedup = MessageDeduplicator(ttl_seconds=5)
+
+        old_reservation = dedup.reserve("msg")
+        assert old_reservation is not None
+        now[0] += 5
+        new_reservation = dedup.reserve("msg")
+        assert new_reservation is not None
+
+        assert dedup.release(old_reservation) is False
+        assert dedup.contains("msg") is True
+        assert dedup.release(new_reservation) is True
+        assert dedup.contains("msg") is False
+
+    def test_only_one_thread_can_reserve_a_live_event(self):
+        dedup = MessageDeduplicator(ttl_seconds=60)
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            reservations = list(pool.map(lambda _index: dedup.reserve("same-event"), range(64)))
+
+        winners = [reservation for reservation in reservations if reservation is not None]
+        assert len(winners) == 1
+        assert dedup.release(winners[0]) is True
 
 

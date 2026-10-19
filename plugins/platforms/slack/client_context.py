@@ -311,7 +311,7 @@ async def dispatch_scoped(adapter, event, source):
         is_dm=False, force_process=False, allow_thread_lookup=False, source=source,
     ):
         return
-    if ts and adapter._dedup.is_duplicate(adapter._workspace_event_id(source.scope_id, ts)):
+    if adapter._claim_inbound_event_dedup(source.scope_id or "", source.chat_id, ts):
         return
     if bot_uid:
         text = text.replace(f"<@{bot_uid}>", "").strip()
