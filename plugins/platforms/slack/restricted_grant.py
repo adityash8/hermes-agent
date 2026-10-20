@@ -13,16 +13,24 @@ from __future__ import annotations
 NO_MCP = "no_mcp"
 
 
-def _enabled_mcp_servers(config):
-    from hermes_cli.tools_config import enabled_mcp_server_names
+def _allowlisted_mcp_servers(names, servers):
+    """MCP servers the resolver will treat as an explicit allowlist for these names.
 
-    return enabled_mcp_server_names(config)
+    Mirrors _get_platform_tools: a name that is also a configurable, plugin or
+    platform-default toolset key never counts as an MCP passthrough there.
+    """
+    from hermes_cli.tools_config import _configurable_keys, _get_plugin_toolset_keys, _platform_default_keys
+
+    shadowed = _configurable_keys() | _get_plugin_toolset_keys() | _platform_default_keys()
+    return {n for n in names if n not in shadowed} & servers
 
 
 def _fence_mcp(config, names):
     """Listed MCP servers stay an allowlist; none listed means none at all."""
-    servers = _enabled_mcp_servers(config)
-    if NO_MCP in names or not servers or set(names) & servers:
+    from hermes_cli.tools_config import enabled_mcp_server_names
+
+    servers = enabled_mcp_server_names(config)
+    if NO_MCP in names or not servers or _allowlisted_mcp_servers(names, servers):
         return names
     return names + [NO_MCP]
 

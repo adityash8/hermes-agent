@@ -66,6 +66,14 @@ def test_grant_without_mcp_names_inherits_no_mcp_server(resolve, grant):
     assert not tools & {"terminal", "file", "memory", "delegation"}
 
 
+def test_mcp_server_shadowed_by_toolset_key_does_not_open_the_fence(resolve):
+    cfg = config({"enabled_toolsets": ["clarify", "web"]})
+    cfg["mcp_servers"]["web"] = {"enabled": True, "command": "must-not-start"}
+    tools = resolve(cfg)
+    assert not tools & MCP
+    assert NO_MCP in grant_toolsets(cfg, RHIZ, "COTHER")
+
+
 @pytest.mark.parametrize("grant", [
     {"enabled_toolsets": []}, {"enabled_toolsets": "terminal"}, {"enabled_toolsets": {"terminal": True}},
     "terminal", ["terminal"],
