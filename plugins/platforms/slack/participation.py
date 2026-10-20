@@ -543,6 +543,18 @@ class SlackParticipationMixin(SlackDeletionMixin):
         sources = self._lazy_attr("_slack_surface_sessions", dict)
         sessions = [session for session, source in list(sources.items())
                     if (source.scope_id or "", source.chat_id, source.thread_id or "") == key]
+        # A flat-channel post is its own surface key, never the writer's
+        # channel-wide session key: revoke and stop the request that wrote it.
+        roots = [grant for grant in list(self._participations().values())
+                 if self._owns_root_surface(grant, key) and not grant.revoked]
+        for grant in roots:
+            grant.revoked = True
+            if grant.session_key not in sessions:
+                sessions.append(grant.session_key)
+                try:
+                    await self.request_session_cancellation(grant.session_key, self._grant_source(grant))
+                except Exception:
+                    logger.exception("[Slack] Could not cancel deleted root-surface session")
         await super()._cancel_deleted_surface(key)
         queues = self._lazy_attr("_slack_followup_queues", dict)
         for session in sessions:
