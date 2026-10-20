@@ -1,5 +1,36 @@
 # Scoped client context implementation
 
+## Current EZ-826 local acceptance (2026-10-16)
+
+This receipt supersedes the older red/baseline checkpoints below; those remain as
+historical evidence, not current release verdicts.
+
+- Parent combined run: **2,301 passed, zero failed across 44 actual files**, exit 0
+  (113.60 seconds), with isolated HOME/HERMES_HOME/TMPDIR, no cache provider,
+  no retries, no xfails/skips and unchanged filesystem/native-request guards.
+- The file set covers client-context, Codewords tools/history/charts, CookUnity,
+  native Slack participation/deletion, approvals and the current restricted-lane contract.
+- Charts now use Pillow's bundled font without named host-font lookup. The regression
+  rejects string-based host-font access; delivery, revocation and task/client fences
+  remain exercised through the SDK fixtures.
+- Synthetic reaction adapters explicitly isolate operator emoji/DM-routing defaults.
+  A poisoned-environment regression was RED before the fix; both full reaction files
+  then passed 124 tests. Production reaction routing was not changed.
+- The obsolete Rhiz/SPI route tests were replaced, not called repaired production bugs:
+  the lane was retired in `7cf1d17a2c`. The old 46 cases become 8 current-contract
+  cases, with generic admission/revocation/delivery coverage mapped to existing suites.
+  Parent verified all 12 referenced replacement test functions exist. No Rhiz SPI,
+  Composio, memory, terminal or filesystem permission was added.
+- Ruff on the five changed Python files and `git diff --check` passed. Independent
+  review of the native-grant repair found no actionable source-diff findings.
+
+This is scoped offline/source acceptance, **not a full-repository pass or live
+Slack/provider proof**. No live checkout, configuration, grants, credentials,
+accounts, service or client-channel traffic was changed. Aditya will execute
+reviewed iMac integration/activation steps from SSH; Codewords goes first and
+CookUnity follows only after acceptance. CookUnity Meta/Pipeboard activation stays
+cancelled. EZ-822 owns authenticated acceptance; Linear Done remains behind it.
+
 ## EZ-831 complete local acceptance (2026-09-08)
 
 All eight named platforms now have fixed, identity-bound read operations: GA4,
@@ -369,6 +400,55 @@ The initial worktree HEAD is the implementation baseline. Its comparison with lo
 `origin/main` includes substantial preexisting divergence; no unrelated files were
 reconciled. Preexisting untracked `research.md`, `tasks/` and
 `.client-context-test-tmp/` remain untouched and outside the scoped change.
+
+## EZ-826 scoped Slack history continuation (2026-10-16)
+
+This isolated continuation adds a fresh Slack-history reader for explicitly routed
+Codewords requests in `C09PF4QGQMC` and `C0BUYTE6D0T`, plus the existing CookUnity
+client-context lane in `C0BBD05512M`. Each reader is bound to one client/workspace
+and its configured channel set; Codewords adds a secondary channel only when its
+entire route policy matches the current channel. CookUnity cannot read either
+Codewords channel, and Codewords cannot read CookUnity. The Aditya owner DM
+`D0B2DLPUSB1` remains on its legacy path. No configuration, credentials, connector
+state, service or live checkout was changed; activation remains dependent on the
+existing explicit route and disabled-by-default behavior.
+
+The history tool reads only the current native thread or a date-bounded channel
+query (maximum 31 UTC days). Channel queries discover thread roots by paginating
+history from Slack timestamp `0.000000` through the requested end date, then fetch
+only replies in the requested date window. Pages contain at most 15 messages; a
+single tool call scans at most 8 API pages, with an in-memory per-reader ceiling of
+48 Slack reads and an 8 KiB result limit. The turn-local `next_cursor` is opaque and
+bound to identical arguments. Results carry channel/client IDs, thread timestamp,
+message timestamp, author kind, permalink and `untrusted: true`; observations are
+never promoted to approved decisions or source grants.
+
+Coverage is explicitly partial until completed: results expose
+`thread_roots_complete`, `pagination_complete`, `read_budget_exhausted`, page/message
+counts, truncation flags, the root-scan start/end, `has_more` and a turn-local cursor.
+Root discovery starts at epoch but is not claimed exhaustive while a cursor remains; when
+the read budget is exhausted, partial results have no unusable continuation cursor.
+Edited/deleted Codewords messages invalidate the in-flight history revision;
+secondary-channel route membership is revalidated before provider continuation and
+Slack reads. Existing candidate-source review and approval semantics are unchanged.
+CookUnity history is read-only Slack context; the cancelled CookUnity Meta access
+was not re-enabled or otherwise changed.
+
+No live Slack/provider run or authenticated acceptance proof was performed. Linear
+Done remains blocked on the separate authenticated Slack proof and parent-owned
+activation gate.
+
+Local verification used `/Users/adityasheth/.hermes/hermes-agent/venv/bin/python`
+with isolated `HERMES_HOME` and scratch `TMPDIR`. The focused history/account/CookUnity
+suite passed **177 tests, 2 skipped**. The 11-file client-context regression run
+reported **618 passed, 7 skipped, 1 failed**; the same owner-path assertion
+(`test_native_owner_keeps_media_approvals_reactions_busy_and_hooks`, expected two
+`handle_message` awaits but observed one) fails at baseline HEAD `9c77179998`
+(**617 passed, 1 failed**). A separate restricted-runtime comparison was also red
+at both current and baseline HEAD: **41 failed, 5 passed** in
+`test_rhiz_restricted_runtime.py`; those failures were not introduced by this
+continuation. The reporting-only pytest override used for comparison changes
+exception formatting only and leaves filesystem guards and test behavior intact.
 
 ## Earlier pilot implementation receipt (historical)
 

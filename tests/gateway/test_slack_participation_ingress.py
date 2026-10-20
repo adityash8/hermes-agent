@@ -11,6 +11,8 @@ from tools import clarify_gateway
 
 def native():
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="fake"))
+    # Explicit fixture defaults keep live operator routing out of native tests.
+    adapter.config.extra.update({"reaction_triggers": False, "reaction_trigger_target": ""})
     adapter._app = MagicMock()
     adapter._bot_user_id = "UBOT"
     adapter._team_bot_user_ids = {"T1": "UBOT"}
@@ -838,7 +840,7 @@ async def test_compat_real_reaction_producer_admits_only_authorized_trigger(poli
     elif policy == "other_channel":
         adapter.config.extra["allowed_channels"] = ["COTHER"]
     elif policy == "not_opted_in":
-        adapter.config.extra.pop("reaction_triggers")
+        adapter.config.extra["reaction_triggers"] = False
     handler = AsyncMock(return_value="trigger result")
     adapter.set_message_handler(handler)
     await adapter._handle_slack_reaction({

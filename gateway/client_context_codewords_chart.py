@@ -225,16 +225,8 @@ def unavailable_summary() -> str:
             "• no chart was created; verified comparison counts are unavailable.")
 
 
-def _font(size: int, *, bold: bool = False):
+def _font(size: int):
     from PIL import ImageFont
-
-    for family in (("DejaVuSans-Bold.ttf", "Arial Bold.ttf") if bold
-                   else ("DejaVuSans.ttf", "Arial.ttf")):
-        try:
-            return ImageFont.truetype(family, size)
-        except OSError:
-            continue
-    # Pillow's bundled scalable font avoids private machine-specific font paths.
     return ImageFont.load_default(size=size)
 
 
@@ -247,7 +239,7 @@ def render(comparison: Comparison) -> Chart:
     draw = ImageDraw.Draw(image)
     black, gray, gold, line = "#171717", "#c4c4c4", "#f4c542", "#ececec"
     draw.rectangle((24, 24, 1575, 1175), outline=line, width=2)
-    draw.text((80, 65), TITLE, font=_font(54, bold=True), fill=black)
+    draw.text((80, 65), TITLE, font=_font(54), fill=black, stroke_width=1, stroke_fill=black)
     draw.text((80, 140), "Chronological comparison of canceled subscription endings",
               font=_font(30), fill=black)
     for x, fill, first, last in ((80, gray, comparison.baseline_start, comparison.baseline_end),
@@ -259,12 +251,15 @@ def render(comparison: Comparison) -> Chart:
     for index, (label, old, new, delta, percent) in enumerate(zip(
             _LABELS, comparison.baseline, comparison.current, comparison.delta, comparison.percent_change)):
         y = 300 + index * 171
-        draw.text((80, y + 16), label, font=_font(34, bold=True), fill=black)
+        draw.text((80, y + 16), label, font=_font(34), fill=black,
+                  stroke_width=1, stroke_fill=black)
         for offset, value, fill in ((0, old, gray), (62, new, gold)):
             if value:
                 draw.rectangle((455, y + offset, 455 + value * scale, y + offset + 43), fill=fill)
-            draw.text((473 + value * scale, y + offset + 2), f"{value:,}", font=_font(32, bold=True), fill=black)
-        draw.text((1260, y + 3), f"{delta:+,}", font=_font(45, bold=True), fill=black)
+            draw.text((473 + value * scale, y + offset + 2), f"{value:,}", font=_font(32),
+                      fill=black, stroke_width=1, stroke_fill=black)
+        draw.text((1260, y + 3), f"{delta:+,}", font=_font(45), fill=black,
+                  stroke_width=1, stroke_fill=black)
         percentage = f"{percent:+.1f}%" if percent is not None else "no baseline"
         draw.text((1260, y + 65), percentage, font=_font(29), fill=black)
         if index < 3:

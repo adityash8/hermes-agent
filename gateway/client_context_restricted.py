@@ -129,11 +129,14 @@ def session_key(key, source):
     return f"{key}:cookunity:{source.user_id}" if selected(source) else key
 
 
-def _loop(grant, question, validate, context=()):
+def _loop(grant, question, validate, context=(), history=None):
     from gateway import client_context as cc
+    from gateway import client_context_codewords_history as slack_history
 
     _, opts, _ = grant
-    tools = cookunity.schemas()
+    history_schema = slack_history.schema("cookunity")
+    history_name = history_schema["function"]["name"]
+    tools = cookunity.schemas() + [history_schema]
     allowed = {t["function"]["name"] for t in tools}
     messages = cc.request_messages(json.dumps({"current_request": question,
         "same_thread_evidence": context, "request_time_utc": datetime.now(timezone.utc).isoformat()}))
@@ -159,12 +162,19 @@ def _loop(grant, question, validate, context=()):
             fn = fields(call["function"], {"name", "arguments"})
             require(type(fn["name"]) is str and fn["name"] in allowed)
             require(type(fn["arguments"]) is str and len(fn["arguments"].encode()) <= 4096)
-            cookunity.parameters(fn["name"], cookunity.validate(fn["name"], fn["arguments"]))
+            if fn["name"] == history_name:
+                slack_history.validate_call(fn["arguments"])
+            else:
+                cookunity.parameters(fn["name"], cookunity.validate(fn["name"], fn["arguments"]))
             validated.append((call["id"], fn))
         messages.append(response)
         for cid, fn in validated:
             validate()
-            result = cookunity.execute(fn["name"], fn["arguments"], validate)
+            if fn["name"] == history_name:
+                require(history is not None)
+                result = history.execute(fn["arguments"])
+            else:
+                result = cookunity.execute(fn["name"], fn["arguments"], validate)
             validate()
             require(type(result) is str and len(result.encode()) <= 10000)
             messages.append({"role": "tool", "tool_call_id": cid, "content": result})
@@ -179,6 +189,8 @@ async def handle_turn(runner, event, source, key, generation):
         grant = validate_event(runner, event)
         original = seal_event(event)
         require(event.source is source)
+        adapter = runner._delivery_adapter_for(source)
+        require(native(source, adapter).adapter is adapter)
 
         def validate():
             require(not stopped.is_set() and time.monotonic() < deadline)
@@ -186,11 +198,17 @@ async def handle_turn(runner, event, source, key, generation):
             require(validate_event(runner, event) == grant)
             require(runner._is_session_run_current(key, generation))
 
-        reply = await asyncio.wait_for(asyncio.to_thread(_loop, grant, event.text, validate, getattr(source, "_cookunity_context", ())), TIMEOUT)
+        from gateway.client_context_codewords_history import HistoryReader
+
+        history = HistoryReader(adapter, event, validate, asyncio.get_running_loop(),
+                                client_id="cookunity", channels=(cookunity.CHANNEL,))
+        reply = await asyncio.wait_for(asyncio.to_thread(
+            _loop, grant, event.text, validate, getattr(source, "_cookunity_context", ()), history,
+        ), TIMEOUT)
         validate()
         reply._restricted_validate = validate
         reply._restricted_destination = (WORKSPACE, source.chat_id, source.thread_id)
-        reply._restricted_adapter = native(source).adapter
+        reply._restricted_adapter = adapter
         runner._pop_post_delivery_callback(runner._delivery_adapter_for(source), key, generation)
         return True, reply
     except Exception:

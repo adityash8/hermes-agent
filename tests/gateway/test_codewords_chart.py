@@ -196,15 +196,15 @@ def test_png_is_legible_deterministic_and_uses_only_fixed_or_validated_labels(ob
         setattr(rendered, "png", b"forged")
 
 
-def test_portable_font_fallback_and_honest_text_fallback(observation, monkeypatch):
+def test_embedded_font_and_honest_text_fallback(observation, monkeypatch):
     original = ImageFont.truetype
 
-    def unavailable(font, *args, **kwargs):
+    def no_host_font_lookup(font, *args, **kwargs):
         if isinstance(font, str):
-            raise OSError("private-font-path-canary")
+            pytest.fail(f"renderer attempted a host font lookup: {font}")
         return original(font, *args, **kwargs)
 
-    monkeypatch.setattr(ImageFont, "truetype", unavailable)
+    monkeypatch.setattr(ImageFont, "truetype", no_host_font_lookup)
     comparison = chart.from_read(observation)
     assert comparison is not None
     assert chart.render(comparison).png.startswith(b"\x89PNG")

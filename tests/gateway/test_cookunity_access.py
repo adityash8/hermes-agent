@@ -108,7 +108,8 @@ async def test_native_exact_humans_isolated_sdk_and_reply(native, runner, wire, 
     await invoke(native)
     assert len(wire.captured) == 1
     body = wire.captured[0]
-    assert {t["function"]["name"] for t in body["tools"]} == set(cu.METHODS)
+    assert {t["function"]["name"] for t in body["tools"]} == (
+        set(cu.METHODS) | {"cookunity_slack_history_read"})
     assert "lowercase except proper names" in body["messages"][0]["content"]
     assert "not markdown tables" in body["messages"][0]["content"]
     assert "PRIVATE_" not in json.dumps(body)
@@ -509,3 +510,148 @@ def test_new_mcp_sdk_schema_and_error_aliases(connectors):
         is_error=True, content=[SimpleNamespace(type="text", text="must not reach model")])
     with pytest.raises(ContextDenied):
         cu.execute("cookunity_mixpanel_query", {"event": "$all_events", "weeks": 1}, lambda: cu.policy())
+
+
+@pytest.mark.asyncio
+async def test_cookunity_history_reader_without_live_turn_grant_denies_before_io(native, connectors):
+    from gateway import client_context_codewords_history as history
+    from gateway.platforms.base import MessageEvent
+
+    adapter, client, payload = native
+    payload["ts"] = "1789948800.000001"
+    source = SessionSource(Platform.SLACK, cu.CHANNEL, scope_id=cu.WORKSPACE,
+                           user_id=payload["user"], chat_type="group", thread_id=payload.get("thread_ts") or payload["ts"])
+    await lane.admit_native(adapter, payload, {"team_id": cu.WORKSPACE}, source)
+    trigger = MessageEvent("find the earlier decision", source=source, message_id=payload["ts"])
+    client.conversations_history = AsyncMock(return_value={"ok": True, "has_more": False, "messages": [
+        {"type": "message", "channel": "C09PF4QGQMC", "ts": "1789473600.000001", "user": "UOTHER",
+         "text": "CODEWORDS_PRIVATE_DECISION"},
+        {"type": "message", "channel": cu.CHANNEL, "ts": "1789473601.000001", "user": "UOTHER",
+         "text": "CookUnity earlier decision", "reply_count": 0},
+    ]})
+    validate = lambda: lane.native(source, adapter)
+    reader = history.HistoryReader(adapter, trigger, validate, asyncio.get_running_loop(),
+                                   client_id="cookunity", channels=(cu.CHANNEL,))
+    result = json.loads(await asyncio.to_thread(
+        reader.execute,
+        json.dumps({"operation": "channel", "start_date": "2026-09-14",
+                    "end_date": "2026-09-20", "query": "decision"}),
+    ))
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "history_read_failed_or_budget_exhausted"
+    client.conversations_history.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cookunity_native_turn_reads_history_under_its_live_grant(native, wire):
+    from plugins.platforms.slack.participation import _participation_scope
+
+    adapter, client, event = native
+    event.update(ts="1789948800.000001", thread_ts="1789948700.000001")
+    history_response = {"ok": True, "has_more": False, "messages": [
+        {"type": "message", "channel": "C09PF4QGQMC", "ts": "1789473600.000001",
+         "user": "UOTHER", "text": "CODEWORDS_PRIVATE_DECISION"},
+        {"type": "message", "channel": cu.CHANNEL, "ts": "1789473601.000001",
+         "user": event["user"], "text": "CookUnity earlier decision", "reply_count": 0},
+    ]}
+
+    async def read_under_native_grant(**kwargs):
+        grant = _participation_scope.get()
+        assert grant is not None and grant.adapter is adapter
+        assert grant.key[:2] == (cu.WORKSPACE, cu.CHANNEL)
+        assert grant.requester == event["user"] and grant.task is not None and not grant.task.done()
+        assert kwargs["channel"] == cu.CHANNEL
+        return history_response
+
+    client.conversations_history = AsyncMock(side_effect=read_under_native_grant)
+    wire.state.finish = "tool_calls"
+    wire.state.tool_calls = [{"id": "history-call", "type": "function", "function": {
+        "name": "cookunity_slack_history_read",
+        "arguments": json.dumps({"operation": "channel", "start_date": "2026-09-14",
+                                  "end_date": "2026-09-20", "query": "decision"}),
+    }}]
+    def finish_history_call(_body):
+        if len(wire.captured) > 1:
+            wire.state.tool_calls = None
+            wire.state.finish = "stop"
+    wire.state.callback = finish_history_call
+
+    await invoke(native)
+
+    assert len(wire.captured) == 2
+    assert "CookUnity earlier decision" in wire.captured[1]["messages"][-1]["content"]
+    assert "CODEWORDS_PRIVATE_DECISION" not in wire.captured[1]["messages"][-1]["content"]
+    client.conversations_history.assert_awaited()
+    assert all(call.kwargs["channel"] == cu.CHANNEL
+               for call in client.conversations_history.await_args_list)
+    client.chat_postMessage.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["revoked", "different_task", "wrong_channel", "wrong_client", "write"])
+async def test_cookunity_native_history_grant_is_confined(native, wire, control):
+    from plugins.platforms.slack.participation import ParticipationDenied, _participation_scope
+
+    adapter, client, event = native
+    event.update(ts="1789948800.000001", thread_ts="1789948700.000001")
+    client.conversations_history = AsyncMock(return_value={"ok": True, "has_more": False, "messages": [
+        {"type": "message", "channel": cu.CHANNEL, "ts": "1789473601.000001",
+         "user": event["user"], "text": "CookUnity earlier decision", "reply_count": 0},
+    ]})
+
+    async def inspect_scope(**kwargs):
+        grant = _participation_scope.get()
+        assert grant is not None and grant.adapter is adapter and grant.task is not None
+        if control == "revoked":
+            grant.revoked = True
+        elif control == "different_task":
+            async def wrong_task():
+                with pytest.raises(ParticipationDenied):
+                    adapter._check_deletion_scope(api_method="conversations.history", payload=kwargs,
+                                                  sdk_client=client)
+            await asyncio.create_task(wrong_task())
+        elif control == "wrong_channel":
+            with pytest.raises(ParticipationDenied):
+                adapter._check_deletion_scope(api_method="conversations.history",
+                                              payload={**kwargs, "channel": "COTHER"}, sdk_client=client)
+        elif control == "wrong_client":
+            with pytest.raises(ParticipationDenied):
+                adapter._check_deletion_scope(api_method="conversations.history", payload=kwargs,
+                                              sdk_client=object())
+        elif control == "write":
+            with pytest.raises(ParticipationDenied):
+                adapter._check_deletion_scope(api_method="chat.postMessage", payload=kwargs,
+                                              sdk_client=client)
+        return {"ok": True, "has_more": False, "messages": [
+            {"type": "message", "channel": cu.CHANNEL, "ts": "1789473601.000001",
+             "user": event["user"], "text": "CookUnity earlier decision", "reply_count": 0},
+        ]}
+
+    client.conversations_history.side_effect = inspect_scope
+    wire.state.finish = "tool_calls"
+    wire.state.tool_calls = [{"id": "history-call", "type": "function", "function": {
+        "name": "cookunity_slack_history_read",
+        "arguments": json.dumps({"operation": "channel", "start_date": "2026-09-14",
+                                  "end_date": "2026-09-20", "query": "decision"}),
+    }}]
+    def finish_history_call(_body):
+        if len(wire.captured) > 1:
+            wire.state.tool_calls = None
+            wire.state.finish = "stop"
+    wire.state.callback = finish_history_call
+
+    await invoke(native)
+
+    client.conversations_history.assert_awaited_once()
+    if control == "revoked":
+        client.chat_postMessage.assert_not_awaited()
+    else:
+        client.chat_postMessage.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cookunity_completion_exposes_scoped_history_tool(native, wire):
+    await invoke(native)
+    tools = {tool["function"]["name"] for tool in wire.captured[0]["tools"]}
+    assert "cookunity_slack_history_read" in tools
+    assert not any(name.startswith("codewords_") for name in tools)

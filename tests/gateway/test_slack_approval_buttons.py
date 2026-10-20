@@ -51,6 +51,8 @@ def _make_adapter():
     """Create a SlackAdapter instance with mocked internals."""
     config = PlatformConfig(enabled=True, token="xoxb-test-token")
     adapter = SlackAdapter(config)
+    # Synthetic adapters must not inherit the operator's live emoji/DM routing.
+    adapter.config.extra.update({"reaction_triggers": False, "reaction_trigger_target": ""})
     adapter._app = MagicMock()
     adapter._bot_user_id = "U_BOT"
     adapter._team_clients = {"T1": AsyncMock()}
@@ -819,6 +821,13 @@ class TestSlackReactionForwarding:
         assert hook_events[0]["channel_id"] == "C1"
         assert hook_events[0]["message_ts"] == "1000.0"
 
+
+    def test_fixture_does_not_inherit_operator_reaction_routing(self, monkeypatch):
+        monkeypatch.setenv("SLACK_REACTION_TRIGGER_TARGET", "D_PRIVATE_OPERATOR")
+        monkeypatch.setenv("SLACK_REACTION_TRIGGERS", "all")
+        adapter = _make_adapter()
+        assert adapter._slack_reaction_trigger_target() == ("", "")
+        assert adapter._slack_reaction_triggers() is None
 
     def test_trigger_config_parsing(self):
         """reaction_triggers accepts bool / list / string forms."""

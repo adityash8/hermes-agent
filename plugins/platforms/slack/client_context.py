@@ -47,11 +47,11 @@ async def admit_event(adapter, event, body=None, *, original_source=None, intera
         if codewords and event.get("subtype") in {"message_changed", "message_deleted"}:
             # Authenticated lifecycle evidence can revoke reads without supplying
             # an actor capable of starting a request or broadening the grant.
-            from gateway.client_context_codewords import CHANNEL, WORKSPACE
+            from gateway.client_context_codewords import CHANNELS, WORKSPACE
             from gateway.client_context_codewords_history import slack_timestamp
 
             require(body is not None and event.get("type") == "message")
-            require(team == WORKSPACE and channel == CHANNEL and team in adapter._team_clients
+            require(team == WORKSPACE and channel in CHANNELS and team in adapter._team_clients
                     and bool(adapter._team_bot_user_ids.get(team)))
             slack_timestamp(event.get("event_ts") or event.get("ts"))
             changed = event.get("message") if event["subtype"] == "message_changed" else event.get("previous_message", {})
@@ -100,10 +100,10 @@ async def admit_event(adapter, event, body=None, *, original_source=None, intera
         from gateway.client_context_cookunity import EXTRA_USERS, CHANNEL as COOKUNITY_CHANNEL
         require(user not in EXTRA_USERS or channel == COOKUNITY_CHANNEL)
         if codewords:
-            from gateway.client_context_codewords import CHANNEL, WORKSPACE, native_identity
+            from gateway.client_context_codewords import CHANNELS, WORKSPACE, native_identity
 
             require(body is not None and not is_dm)
-            require(team == WORKSPACE and channel == CHANNEL)
+            require(team == WORKSPACE and channel in CHANNELS)
             require(interaction or channel_type in {"channel", "group"}
                     or channel_type in {None, ""} and event.get("type") == "app_mention")
             require(team in adapter._team_clients and bool(adapter._team_bot_user_ids.get(team)))

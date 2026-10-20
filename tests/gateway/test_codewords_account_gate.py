@@ -1,6 +1,6 @@
 """Per-route account capabilities through the real gateway/provider and native lane."""
 import json
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -10,7 +10,7 @@ from gateway import client_context_codewords_chart as chart
 from gateway import client_context_codewords_history as history
 from gateway import client_context_codewords_reads as reads
 from gateway.client_context_policy import ContextDenied
-from tests.gateway.test_client_context import corpus, forbidden, runner, wire  # noqa: F401
+from tests.gateway.test_client_context import corpus, event, forbidden, runner, wire  # noqa: F401
 from tests.gateway.test_codewords_tool_loop import call, respond, unavailable  # noqa: F401
 from tests.gateway.test_slack_channel_isolation import (  # noqa: F401
     CHANNEL, drain_native, native_text, sealed,
@@ -245,3 +245,32 @@ async def test_stripe_off_chart_is_unavailable_without_render_or_upload(runner, 
     assert reply._codewords_chart_unavailable is True
     assert not hasattr(reply, "_codewords_chart")
     assert wire.captured[0]["tools"] == [history.schema()]
+
+
+def test_codewords_history_channels_require_matching_approved_client_route(runner):
+    from gateway import client_context_codewords as cw
+
+    route_spec = {"scope_id": "T07MMEX5658", "provider": "openai", "model": "synthetic-main",
+                  "generation": "v1"}
+    runner.config.client_context = {"enabled": False, "codewords_read_channels": {
+        CHANNEL: dict(route_spec), "C0BUYTE6D0T": dict(route_spec),
+    }}
+    source = event(chat_id="C0BUYTE6D0T", scope_id="T07MMEX5658", user_id="U07MJJMMK9T").source
+    policy = cw.route(runner.config, source)
+    assert cw.selected(runner.config, source)
+    assert cw.approved_history_channels(runner.config, source, policy) == (CHANNEL, "C0BUYTE6D0T")
+    source.chat_id = "CUNAPPROVED"
+    with pytest.raises(ContextDenied):
+        cw.route(runner.config, source)
+
+
+@pytest.mark.asyncio
+async def test_aditya_owner_dm_keeps_legacy_behavior_without_client_history(runner):
+    runner.config.client_context = {"enabled": False, "codewords_read_channels": {CHANNEL: {
+        "scope_id": "T07MMEX5658", "provider": "openai", "model": "synthetic-main", "generation": "v1",
+    }}}
+    runner._hm_admit_event = AsyncMock(return_value=None)
+    trigger = event(chat_id="D0B2DLPUSB1", scope_id=None, user_id="U07MJJMMK9T", chat_type="dm")
+    assert await cc.admission(runner, trigger.source) == "legacy"
+    assert await runner._handle_message(trigger) is None
+    runner._hm_admit_event.assert_awaited_once_with(trigger)

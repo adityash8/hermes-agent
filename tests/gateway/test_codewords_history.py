@@ -19,6 +19,8 @@ from tests.gateway.test_slack_channel_isolation import native_text, drain_native
 
 
 CHANNEL = "C09PF4QGQMC"
+SECOND_CHANNEL = "C0BUYTE6D0T"
+COOKUNITY_CHANNEL = "C0BBD05512M"
 WORKSPACE = "T07MMEX5658"
 BOT = "U0B2X1D8R17"
 
@@ -37,6 +39,10 @@ def message(text, day="2026-09-15", *, user="UPEER", thread=ROOT, **extra):
             "user": user, "text": text, **extra}
 
 
+def channel_message(text, day="2026-09-15", *, user="UPEER", fraction=1, **extra):
+    return {"type": "message", "ts": stamp(day, fraction), "user": user, "text": text, **extra}
+
+
 @pytest.fixture
 def history_case():
     history = importlib.import_module("gateway.client_context_codewords_history")
@@ -46,7 +52,7 @@ def history_case():
     @contextmanager
     def read_scope(selected, api_method, arguments, validate):
         assert selected is client and api_method in {"conversations.replies", "conversations.history"}
-        assert arguments["channel"] == CHANNEL
+        assert arguments["channel"] in {CHANNEL, SECOND_CHANNEL}
         validate()
         yield
         validate()
@@ -60,8 +66,9 @@ def history_case():
     return SimpleNamespace(history=history, client=client, adapter=adapter, event=event, validate=validate)
 
 
-def reader(case):
-    return case.history.HistoryReader(case.adapter, case.event, case.validate, asyncio.get_running_loop())
+def reader(case, **kwargs):
+    return case.history.HistoryReader(case.adapter, case.event, case.validate,
+                                     asyncio.get_running_loop(), **kwargs)
 
 
 async def context(case, instance=None):
@@ -190,33 +197,44 @@ async def test_read_and_receipt_revalidate_changes_without_releasing_data(histor
 async def test_channel_query_pagination_is_fixed_and_cursors_are_query_bound(history_case):
     case = history_case
     case.client.conversations_history.side_effect = [
-        {"ok": True, "messages": [message("Actual rollout happened September 15."), message("Other discussion")],
+        {"ok": True, "messages": [channel_message("Actual rollout happened September 15."),
+                                    channel_message("Other discussion", fraction=2)],
          "has_more": True, "response_metadata": {"next_cursor": "slack-native-cursor="}},
-        {"ok": True, "messages": [message("rollout confirmed", "2026-09-16")], "has_more": False},
+        *[{"ok": True, "messages": [], "has_more": True,
+           "response_metadata": {"next_cursor": f"native-cursor-{number}="}}
+          for number in range(1, case.history.SEARCH_PAGES)],
+        {"ok": True, "messages": [channel_message("rollout confirmed", "2026-09-16")], "has_more": False},
     ]
     instance = reader(case)
     args = {"operation": "channel", "start_date": "2026-09-14", "end_date": "2026-09-20", "query": "rollout"}
     first = await execute(instance, **args)
     assert len(first["messages"]) == 1
     assert first["has_more"] and not first["coverage"]["pagination_complete"]
+    assert not first["coverage"]["thread_roots_complete"]
+    assert first["coverage"]["thread_root_scan_start"] == "0.000000"
+    assert first["coverage"]["thread_root_scan"] == "approved_channel_history_from_epoch_through_end_date"
     assert first["next_cursor"] != "slack-native-cursor="
     with pytest.raises(ContextDenied):
         await execute(instance, **{**args, "query": "different", "cursor": first["next_cursor"]})
-    assert case.client.conversations_history.await_count == 1
+    assert case.client.conversations_history.await_count == case.history.SEARCH_PAGES
     second = await execute(instance, **args, cursor=first["next_cursor"])
     assert not second["has_more"] and second["coverage"]["pagination_complete"]
-    assert case.client.conversations_history.call_args.kwargs["cursor"] == "slack-native-cursor="
+    assert second["coverage"]["thread_roots_complete"]
+    assert second["coverage"]["thread_root_scan_end"] == "1789948800.000000"
+    assert any(call.kwargs.get("cursor") == "slack-native-cursor="
+               for call in case.client.conversations_history.call_args_list)
+    assert case.client.conversations_history.call_args.kwargs["cursor"] == "native-cursor-7="
     assert all(call.kwargs["channel"] == CHANNEL for call in case.client.conversations_history.call_args_list)
-    assert case.client.conversations_history.call_args.kwargs["oldest"] == stamp("2026-09-14", 0)
-    assert "timeline" in second["coverage"]["scope"]
+    assert case.client.conversations_history.call_args.kwargs["oldest"] == "0.000000"
+    assert "approved" in second["coverage"]["scope"]
 
 
 @pytest.mark.asyncio
 async def test_channel_dates_are_enforced_even_if_server_returns_outside_rows(history_case):
     case = history_case
     case.client.conversations_history.return_value = {"ok": True, "has_more": False, "messages": [
-        message("before", "2026-09-13"), message("at start", ts=stamp("2026-09-14", 0)),
-        message("after end", "2026-09-16"), message("at end boundary", ts=stamp("2026-09-16", 0)),
+        channel_message("before", "2026-09-13"), channel_message("at start", fraction=0),
+        channel_message("after end", "2026-09-16"), channel_message("at end boundary", ts=stamp("2026-09-16", 0)),
     ]}
     result = await execute(reader(case), operation="channel", start_date="2026-09-14", end_date="2026-09-15")
     assert [item["text"] for item in result["messages"]] == ["at start"]
@@ -248,13 +266,17 @@ async def test_bounded_context_reports_api_more_and_output_truncation(history_ca
     case = history_case
     rows = [message("🔒" * 3000, "2026-09-15", ts=stamp("2026-09-15", index + 1))
             for index in range(case.history.PAGE_SIZE)]
-    case.client.conversations_replies.return_value = {"ok": True, "messages": rows, "has_more": True}
+    case.client.conversations_replies.side_effect = [
+        {"ok": True, "messages": rows, "has_more": True,
+         "response_metadata": {"next_cursor": f"slack-native-{page}"}}
+        for page in range(1, case.history.CONTEXT_PAGES + 1)
+    ]
     raw = await asyncio.to_thread(reader(case).context)
     result = json.loads(raw)
     assert len(raw.encode()) <= case.history.MAX_OUTPUT
     assert result["has_more"] and not result["coverage"]["pagination_complete"]
     assert result["coverage"]["text_truncated"] or result["coverage"]["output_truncated"]
-    assert result["next_cursor"] is None
+    assert result["next_cursor"] and not result["next_cursor"].startswith("slack-native-")
 
 
 @pytest.mark.asyncio
@@ -396,3 +418,105 @@ async def test_native_deletion_requires_a_new_source_authorized_direct_summon(na
     await adapter._handle_slack_message(deletion, {"team_id": WORKSPACE})
     assert adapter._codewords_history_revision == revision
     assert not adapter._deletion_record((WORKSPACE, CHANNEL, thread))["muted"]
+
+
+@pytest.mark.asyncio
+async def test_search_reads_other_approved_codewords_channel_and_every_thread_reply(history_case):
+    case = history_case
+    thread = stamp("2026-09-15", 1)
+    rows = {
+        CHANNEL: [],
+        SECOND_CHANNEL: [{"type": "message", "ts": thread, "user": "UPEER",
+                         "text": "launch review", "reply_count": 2}],
+    }
+
+    async def channel_page(**kwargs):
+        return {"ok": True, "messages": rows[kwargs["channel"]], "has_more": False}
+
+    async def thread_page(**kwargs):
+        assert kwargs["channel"] == SECOND_CHANNEL and kwargs["ts"] == thread
+        return {"ok": True, "messages": [
+            {"type": "message", "ts": thread, "thread_ts": thread, "user": "UPEER", "text": "launch review",
+             "reply_count": 2},
+            message("still considering", "2026-09-16", thread=thread, ts=stamp("2026-09-16", 1)),
+            {"type": "message", "ts": stamp("2026-09-17", 2), "user": "UPEER",
+             "text": "earlier approved decision with missing thread provenance"},
+            message("earlier approved decision: launch only after the audit", "2026-09-17", thread=thread,
+                    ts=stamp("2026-09-17", 1)),
+        ], "has_more": False}
+
+    case.client.conversations_history.side_effect = channel_page
+    case.client.conversations_replies.side_effect = thread_page
+    instance = reader(case, client_id="codewords", channels=(CHANNEL, SECOND_CHANNEL),
+                      validate_channels=lambda: None)
+    result = await execute(instance, operation="channel", start_date="2026-09-14",
+                           end_date="2026-09-20", query="earlier approved decision")
+    assert [item["text"] for item in result["messages"]] == [
+        "earlier approved decision: launch only after the audit"]
+    decision = result["messages"][0]
+    assert decision["channel_id"] == SECOND_CHANNEL and decision["thread_ts"] == thread
+    assert f"/archives/{SECOND_CHANNEL}/" in decision["permalink"]
+    assert f"thread_ts={thread}" in decision["permalink"]
+    assert result["client_id"] == "codewords"
+    assert {call.kwargs["channel"] for call in case.client.conversations_history.call_args_list} == {
+        CHANNEL, SECOND_CHANNEL}
+    assert not any(COOKUNITY_CHANNEL == call.kwargs["channel"]
+                   for call in case.client.conversations_history.call_args_list)
+    assert any(call.kwargs["channel"] == SECOND_CHANNEL and call.kwargs["ts"] == thread
+               for call in case.client.conversations_replies.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_client_history_scope_rejects_cookunity_or_unknown_codewords_sources_before_io(history_case):
+    case = history_case
+    with pytest.raises(ContextDenied):
+        reader(case, client_id="codewords", channels=(CHANNEL, COOKUNITY_CHANNEL))
+    case.event.source.chat_id = "CUNAPPROVED"
+    with pytest.raises(ContextDenied):
+        reader(case)
+    case.client.conversations_history.assert_not_awaited()
+    case.client.conversations_replies.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_secondary_route_revocation_denies_before_provider_or_slack_io(history_case, runner):
+    from gateway import client_context_codewords as cw
+
+    case = history_case
+    spec = {"scope_id": WORKSPACE, "provider": "openai", "model": "synthetic-main",
+            "generation": "v1"}
+    runner.config.client_context = {"enabled": False, "codewords_read_channels": {
+        CHANNEL: dict(spec), SECOND_CHANNEL: dict(spec),
+    }}
+    policy = cw.route(runner.config, case.event.source)
+    channels = cw.approved_history_channels(runner.config, case.event.source, policy)
+    assert channels == (CHANNEL, SECOND_CHANNEL)
+
+    def validate_channels():
+        if cw.approved_history_channels(runner.config, case.event.source, policy) != channels:
+            raise ContextDenied("approved history channel policy changed")
+
+    instance = reader(case, client_id="codewords", channels=channels,
+                      validate_channels=validate_channels)
+    instance.validate_receipt()
+    runner.config.client_context["codewords_read_channels"][SECOND_CHANNEL]["generation"] = "revoked"
+    with pytest.raises(ContextDenied):
+        instance.validate_receipt()
+    with pytest.raises(ContextDenied):
+        await execute(instance, operation="channel", start_date="2026-09-14", end_date="2026-09-20")
+    case.client.conversations_history.assert_not_awaited()
+    case.client.conversations_replies.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_channel_read_budget_exhaustion_is_partial_without_dead_cursor(history_case):
+    case = history_case
+    instance = reader(case)
+    instance.reads = case.history.MAX_READS
+    result = await execute(instance, operation="channel", start_date="2026-09-14", end_date="2026-09-20")
+    assert result["has_more"] and result["next_cursor"] is None
+    assert not result["coverage"]["pagination_complete"]
+    assert result["coverage"]["read_budget_exhausted"]
+    assert not result["coverage"]["thread_roots_complete"]
+    case.client.conversations_history.assert_not_awaited()
+    case.client.conversations_replies.assert_not_awaited()

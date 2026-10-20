@@ -50,6 +50,7 @@ _participation_scope: ContextVar[_Participation | None] = ContextVar(
     "slack_participation", default=None)
 _codewords_release: ContextVar[tuple | None] = ContextVar("slack_codewords_release", default=None)
 _codewords_history_read: ContextVar[tuple | None] = ContextVar("slack_codewords_history_read", default=None)
+_cookunity_history_read: ContextVar[tuple | None] = ContextVar("slack_cookunity_history_read", default=None)
 
 
 def _bind_participation(grant):
@@ -157,19 +158,19 @@ class SlackParticipationMixin(SlackDeletionMixin):
 
     @contextmanager
     def _codewords_history_read_scope(self, client, method, payload, validate):
-        """Permit one exact SDK read on its own task without inheriting write authority."""
-        from gateway.client_context_codewords import CHANNEL, WORKSPACE
+        """Permit one exact approved-channel read on its own task."""
+        from gateway.client_context_codewords import CHANNELS, WORKSPACE
 
         grant = _participation_scope.get()
-        if (grant is None or grant.adapter is not self or grant.key[:2] != (WORKSPACE, CHANNEL)
-                or not self._codewords_surface(grant.key) or not self._participation_valid(grant)
+        allowed = {"channel", "ts", "limit", "oldest", "latest", "inclusive", "cursor"}
+        if (grant is None or grant.adapter is not self or grant.key[0] != WORKSPACE
+                or grant.key[1] not in CHANNELS or not self._codewords_surface(grant.key)
+                or not self._participation_valid(grant)
                 or self._authenticated_client_team(client) != WORKSPACE
                 or method not in {"conversations.replies", "conversations.history"}
-                or payload.get("channel") != CHANNEL
-                or set(payload) - {"channel", "ts", "limit", "oldest", "latest", "inclusive", "cursor"}
+                or payload.get("channel") not in CHANNELS or set(payload) - allowed
                 or type(payload.get("limit")) is not int or not 0 < payload["limit"] <= 15
-                or method == "conversations.replies" and payload.get("ts") != (
-                    grant.key[2] or grant.request_ts)):
+                or method == "conversations.replies" and not isinstance(payload.get("ts"), str)):
             self._deny_participation()
         validate()
         token = _codewords_history_read.set((self, client, method, dict(payload), validate,
@@ -179,6 +180,76 @@ class SlackParticipationMixin(SlackDeletionMixin):
             validate()
         finally:
             _codewords_history_read.reset(token)
+
+    @contextmanager
+    def _cookunity_history_read_scope(self, source, client, method, payload, validate):
+        """Permit bounded reads only for this task's live CookUnity native grant."""
+        from gateway.client_context_cookunity import CHANNEL, WORKSPACE
+        from gateway.client_context_restricted import identity, native
+
+        grant = _participation_scope.get()
+        try:
+            receipt = native(source, self)
+            grant_source_receipt = native(grant.source, self) if grant is not None else None
+        except Exception:
+            self._deny_participation()
+        expected_key = (WORKSPACE, CHANNEL, source.thread_id or "")
+        allowed = {"channel", "ts", "limit", "oldest", "latest", "inclusive", "cursor"}
+        if (grant is None or grant.adapter is not self or grant.key != expected_key
+                or grant.requester != source.user_id or grant.source is None
+                or grant_source_receipt is not receipt or receipt.client is not client
+                or self._authenticated_client_team(client) != WORKSPACE
+                or method not in {"conversations.replies", "conversations.history"}
+                or not isinstance(payload, dict) or payload.get("channel") != CHANNEL
+                or set(payload) - allowed or type(payload.get("limit")) is not int
+                or not 0 < payload["limit"] <= 15
+                or method == "conversations.replies" and not isinstance(payload.get("ts"), str)
+                or grant.task is None or grant.task.done()
+                or self._session_tasks.get(grant.session_key) is not grant.task
+                or not self._participation_valid(grant)):
+            self._deny_participation()
+        validate()
+        read = (self, source, client, method, dict(payload), validate, asyncio.current_task(),
+                grant, receipt, grant.task, grant.key, grant.requester, grant.generation,
+                identity(source))
+        token = _cookunity_history_read.set(read)
+        try:
+            yield
+        finally:
+            try:
+                self._validate_cookunity_history_read(read)
+            finally:
+                _cookunity_history_read.reset(token)
+
+    def _validate_cookunity_history_read(self, read):
+        from gateway.client_context_cookunity import CHANNEL, WORKSPACE
+        from gateway.client_context_restricted import identity, native
+
+        (adapter, source, client, method, payload, validate, task, grant, receipt,
+         grant_task, key, requester, generation, source_identity) = read
+        allowed = {"channel", "ts", "limit", "oldest", "latest", "inclusive", "cursor"}
+        if (adapter is not self or _participation_scope.get() is not grant
+                or asyncio.current_task() is not task or grant.adapter is not self
+                or grant.key != key or key != (WORKSPACE, CHANNEL, source.thread_id or "")
+                or grant.requester != requester or requester != source.user_id
+                or grant.task is not grant_task or grant_task is None or grant_task.done()
+                or self._session_tasks.get(grant.session_key) is not grant_task
+                or grant.generation != generation or grant.source is None
+                or identity(source) != source_identity or identity(grant.source) != source_identity
+                or receipt.client is not client or method not in {"conversations.replies", "conversations.history"}
+                or not isinstance(payload, dict) or payload.get("channel") != CHANNEL
+                or set(payload) - allowed or type(payload.get("limit")) is not int
+                or not 0 < payload["limit"] <= 15
+                or method == "conversations.replies" and not isinstance(payload.get("ts"), str)
+                or self._authenticated_client_team(client) != WORKSPACE
+                or not self._participation_valid(grant)):
+            self._deny_participation()
+        try:
+            if native(source, self) is not receipt or native(grant.source, self) is not receipt:
+                self._deny_participation()
+            validate()
+        except Exception:
+            self._deny_participation()
 
     def _codewords_owner_grant(self, grant):
         check = getattr(self, "_client_context_codewords_owner", None)
@@ -195,12 +266,12 @@ class SlackParticipationMixin(SlackDeletionMixin):
             platform=self.platform, scope_id=key[0], chat_id=key[1])) is True
 
     def _codewords_channel_allowed(self, key):
-        from gateway.client_context_codewords import CHANNEL, WORKSPACE
+        from gateway.client_context_codewords import CHANNELS, WORKSPACE
 
         allowed = self._slack_allowed_channels()
-        return (key[:2] == (WORKSPACE, CHANNEL) and self._codewords_surface(key)
-                and not self._is_ignored_channel(CHANNEL)
-                and (not allowed or CHANNEL in allowed))
+        return (key[0] == WORKSPACE and key[1] in CHANNELS and self._codewords_surface(key)
+                and not self._is_ignored_channel(key[1])
+                and (not allowed or key[1] in allowed))
 
     @staticmethod
     def _participation_text(text):
@@ -410,6 +481,18 @@ class SlackParticipationMixin(SlackDeletionMixin):
                     or {key: value for key, value in payload.items() if value is not None} != read[3]):
                 self._deny_participation()
             read[4]()
+            return
+        cookunity_read = _cookunity_history_read.get()
+        if cookunity_read is not None:
+            if (cookunity_read[0] is not self or cookunity_read[2] is not sdk_client
+                    or cookunity_read[3] != api_method or cookunity_read[6] is not asyncio.current_task()
+                    or cookunity_read[7] is not grant or not isinstance(payload, dict)
+                    or {key: value for key, value in payload.items() if value is not None} != cookunity_read[4]):
+                self._deny_participation()
+            try:
+                self._validate_cookunity_history_read(cookunity_read)
+            except Exception:
+                self._deny_participation()
             return
         if api_method == "files.completeUploadExternal" and payload and payload.get("channels"):
             # This adapter authorizes one destination; Slack's plural legacy

@@ -757,10 +757,20 @@ async def test_native_owner_keeps_media_approvals_reactions_busy_and_hooks(nativ
 
     runner.hooks = SimpleNamespace(emit=AsyncMock())
     adapter.config.extra["reaction_triggers"] = ["thumbsup"]
-    await adapter._handle_slack_reaction({"type": "reaction_added", "user": "owner-user",
-        "reaction": "thumbsup", "event_ts": "102.1", "item_user": "bot-synthetic",
-        "item": {"type": "message", "channel": "Downer", "ts": "100.1"}}, body=body)
+    reaction = {"type": "reaction_added", "user": "owner-user", "reaction": "thumbsup",
+                "event_ts": "1789948800.000002", "item_user": "bot-synthetic",
+                "item": {"type": "message", "channel": "Downer", "ts": "100.1"}}
+    client.conversations_replies.return_value = {"ok": True, "channel": "Downer", "messages": [
+        {"type": "message", "user": "bot-synthetic", "text": "OWNER_THREAD_CONTEXT",
+         "ts": "100.1", "thread_ts": "100.1"}]}
+    reaction_body = {**body, "type": "event_callback", "event_id": "Ev-owner-reaction",
+                     "event_time": 1789948800, "event": reaction}
+    adapter.config.extra["reaction_trigger_target"] = ""
+    assert adapter._slack_reaction_trigger_target() == ("", "")
+    await adapter._handle_slack_reaction(reaction, body=reaction_body)
     runner.hooks.emit.assert_awaited_once()
+    assert client.conversations_replies.await_count == 2
+    assert "1789948800.000002" in adapter._processed_message_ts
     assert adapter.handle_message.await_count == 2
 
     runner._is_user_authorized = Mock(return_value=True)
@@ -774,6 +784,28 @@ async def test_native_owner_keeps_media_approvals_reactions_busy_and_hooks(nativ
     monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", hook)
     await runner._handle_gateway_platform_event({"kind": "owner-event"}, trigger.source)
     hook.assert_called_once_with("gateway_platform_event", kind="owner-event")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("actor", "team"), [
+    ("intruder", "workspace-synthetic"),
+    ("owner-user", "foreign-workspace"),
+])
+async def test_owner_private_reaction_requires_authenticated_owner_and_workspace(native_owner, actor, team):
+    adapter, client = native_owner
+    adapter.handle_message = AsyncMock()
+    adapter.config.extra["reaction_triggers"] = ["thumbsup"]
+    adapter.config.extra["reaction_trigger_target"] = ""
+    reaction = {"type": "reaction_added", "user": actor, "reaction": "thumbsup",
+                "event_ts": "1789948800.000003", "item_user": "bot-synthetic",
+                "item": {"type": "message", "channel": "Downer", "ts": "100.1"}}
+    body = {"team_id": team, "type": "event_callback", "event_id": "Ev-owner-reaction-negative",
+            "event_time": 1789948800, "event": reaction}
+
+    await adapter._handle_slack_reaction(reaction, body=body)
+
+    adapter.handle_message.assert_not_awaited()
+    client.conversations_replies.assert_not_awaited()
 
 
 @pytest.mark.asyncio
