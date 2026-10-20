@@ -26,7 +26,13 @@ class TestIsOAuthToken:
         assert _is_oauth_token("sk-ant-oat01-abcdef1234567890") is True
 
     def test_api_key(self):
-        assert _is_oauth_token("sk-ant-api03-abcdef1234567890") is False
+        assert _is_oauth_token("sk-ant-api03-abc") is False
+
+    def test_console_user_key_is_not_oauth(self):
+        # sk-ant-usr* is a console user key. Classifying it as OAuth sends it as
+        # a Bearer token, and Anthropic then bills it as Claude Code extra usage.
+        assert _is_oauth_token("sk-ant-usr-abc") is False
+        assert _is_oauth_token("sk-ant-admin01-abc") is False
 
 
 def test_missing_sdk_error_reports_why_the_lazy_install_did_not_land(monkeypatch):

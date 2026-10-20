@@ -61,10 +61,15 @@ def _first_env(*names: str) -> str:
 
 
 def _is_oauth_token(key: str) -> bool:
-    """True for Anthropic OAuth/setup tokens (sk-ant-*, eyJ JWTs, cc-); False for sk-ant-api* Console keys."""
-    if not key or key.startswith("sk-ant-api"):
+    """True for Claude Code OAuth/setup tokens (sk-ant-oat*, eyJ JWTs, cc-).
+
+    Console API keys (sk-ant-api*, sk-ant-usr*, sk-ant-admin*) are not OAuth:
+    sending one as a Bearer token makes Anthropic treat the request as Claude
+    Code extra usage and reject a healthy key with a credit-balance 400.
+    """
+    if not key or key.startswith(("sk-ant-api", "sk-ant-usr", "sk-ant-admin")):
         return False
-    return key.startswith(("sk-ant-", "eyJ", "cc-"))
+    return key.startswith(("sk-ant-oat", "eyJ", "cc-"))
 
 
 def anthropic_route_is_oauth(base_url: Any, credential: Any, *, provider: Optional[str] = None) -> bool:
