@@ -250,9 +250,10 @@ async def test_real_authz_requires_unforgeable_receipt_and_preserves_rhiz_elsewh
     assert GatewayRunner._is_user_authorized(runner, source) is False
     rhiz = SessionSource(Platform.SLACK, "COTHER", scope_id=cu.WORKSPACE, user_id=lane.USER, chat_type="group")
     assert lane.selected(rhiz) is False
-    from plugins.platforms.slack.restricted_grant import grant_toolsets
-    config = {"gateway": {"restricted_users": {"slack": {lane.USER: {"enabled_toolsets": ["terminal", "file", "linear"]}}}}}
-    assert grant_toolsets(config, lane.USER, "COTHER") == ["terminal", "file", "linear"]
+    from plugins.platforms.slack.restricted_grant import NO_MCP, grant_toolsets
+    config = {"gateway": {"restricted_users": {"slack": {lane.USER: {"enabled_toolsets": ["terminal", "file", "linear"]}}}},
+              "mcp_servers": {"composio": {"enabled": True}}}
+    assert grant_toolsets(config, lane.USER, "COTHER") == ["terminal", "file", "linear", NO_MCP]
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,8 @@ matching entry anywhere) stays unrestricted platform resolution.
 """
 from types import SimpleNamespace
 
+import pytest
+
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -16,6 +18,12 @@ OWNER_DM = "D0OWNER"
 CLIENT = "CCLIENT"
 SENDER = "USENDER"
 OTHER = "UOTHER"
+
+
+@pytest.fixture(autouse=True)
+def _no_mcp_servers(monkeypatch):
+    # Grant precedence only; the MCP fence (EZ-1073) is pinned in test_rhiz_restricted_runtime.
+    monkeypatch.setattr("hermes_cli.tools_config.enabled_mcp_server_names", lambda config: set())
 
 
 def _cfg(slack):
