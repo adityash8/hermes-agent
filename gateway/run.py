@@ -5927,91 +5927,99 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         name="planned-stop-watcher")
     _planned_stop_watcher_thread.start()
 
-    # PID file BEFORE adapters: of two concurrent `run --replace`, only the O_EXCL winner opens sockets.
-    # Only --force skips the host-lock refusal. Every generated unit carries --replace, so reading it as
-    # --force there disabled the one arbiter of the two-units-at-once race; a replace that took the
-    # owner over already freed the lock with that process. Consequence: a live holder this process
-    # cannot interrogate (its record never published, or it speaks another HOST_PROTOCOL_VERSION
-    # mid-upgrade) blocks every other unit with exit 75 until it exits; only --force gets past it.
-    if not _start_gateway_claim_pid_file(force=force):
-        return False
-
-    # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
-    _control_server = await _start_gateway_start_control_socket(runner)
-    # Now the attach channel answers: republish the host record with the settled served set.
-    _refresh_host_gateway_record(runner)
-    _log_standalone_profiles_at_boot(runner)
-
-    def _lifecycle_record_startup() -> None:
-        # Report if the previous life died uncleanly (SIGKILL / OOM / VM death), then claim the
-        # sentinel for this life. After the PID-file claim so a --replace loser can't clobber it.
-        from gateway.lifecycle_ledger import record_startup
-        record_startup()
-
-    def _start_keepalive() -> None:
-        from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
-        start_nous_auth_keepalive()
-
-    _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s")
-    _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
-    _ensure_windows_gateway_venv_imports()
-
-    # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
+    # Every exit below (PID-claim refusal, failed or raising runner.start(), clean exit, aborted startup,
+    # cancellation) must stop the watcher too; only the normal tail did, so each early exit leaked one
+    # polling thread for the life of the process (EZ-1139). The tail's own stop keeps its ordering.
     try:
-        # MCP tool discovery — run in an executor so the asyncio event loop stays responsive even when a
-        # configured MCP server is slow or unreachable.  discover_mcp_tools() uses a blocking 120s wait
-        # internally; calling it from the loop thread would freeze platform heartbeats (Discord shard,
-        # Telegram polling) until it returned. See #16856.
-        await _discover_gateway_mcp_tools(runner.config)
-    except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
+        # PID file BEFORE adapters: of two concurrent `run --replace`, only the O_EXCL winner opens sockets.
+        # Only --force skips the host-lock refusal. Every generated unit carries --replace, so reading it as
+        # --force there disabled the one arbiter of the two-units-at-once race; a replace that took the
+        # owner over already freed the lock with that process. Consequence: a live holder this process
+        # cannot interrogate (its record never published, or it speaks another HOST_PROTOCOL_VERSION
+        # mid-upgrade) blocks every other unit with exit 75 until it exits; only --force gets past it.
+        if not _start_gateway_claim_pid_file(force=force):
+            return False
 
-    try:
-        success = await runner.start()
-    except BaseException:
-        _shutdown_gateway_health_export(runner)
-        raise
-    if not success:
-        _shutdown_gateway_health_export(runner)
-        return False
+        # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
+        _control_server = await _start_gateway_start_control_socket(runner)
+        # Now the attach channel answers: republish the host record with the settled served set.
+        _refresh_host_gateway_record(runner)
+        _log_standalone_profiles_at_boot(runner)
 
-    def _recover_pending() -> None:
-        recovered = _recover_pending_flushes(runner)
-        if recovered:
-            logger.info("Recovered %d pending message(s) from shutdown flush", recovered)
+        def _lifecycle_record_startup() -> None:
+            # Report if the previous life died uncleanly (SIGKILL / OOM / VM death), then claim the
+            # sentinel for this life. After the PID-file claim so a --replace loser can't clobber it.
+            from gateway.lifecycle_ledger import record_startup
+            record_startup()
 
-    _best_effort(_recover_pending)
-    if runner.should_exit_cleanly:
-        _shutdown_gateway_health_export(runner)
-        if runner.exit_reason:
-            logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
-        # Explicit exit codes (GATEWAY_FATAL_CONFIG_EXIT_CODE) must propagate so s6 finish maps 78 → 125.
-        if runner.exit_code is not None:
-            raise SystemExit(runner.exit_code)
-        return True
-    if not runner._running:
-        # Startup aborted by restart/shutdown before running mode; preserve that path without starting cron.
+        def _start_keepalive() -> None:
+            from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
+            start_nous_auth_keepalive()
+
+        _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s")
+        _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
+        _ensure_windows_gateway_venv_imports()
+
+        # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
         try:
-            await runner.wait_for_shutdown()
-            try:
-                await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
-            except Exception:
-                logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
-            return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
-        finally:
+            # MCP tool discovery — run in an executor so the asyncio event loop stays responsive even when a
+            # configured MCP server is slow or unreachable.  discover_mcp_tools() uses a blocking 120s wait
+            # internally; calling it from the loop thread would freeze platform heartbeats (Discord shard,
+            # Telegram polling) until it returned. See #16856.
+            await _discover_gateway_mcp_tools(runner.config)
+        except Exception as e:
+            logger.debug("MCP tool discovery failed: %s", e)
+
+        try:
+            success = await runner.start()
+        except BaseException:
             _shutdown_gateway_health_export(runner)
+            raise
+        if not success:
+            _shutdown_gateway_health_export(runner)
+            return False
 
-    cron_stop, cron_provider, cron_thread, housekeeping_thread = (
-        _start_gateway_start_cron_and_housekeeping(runner))
+        def _recover_pending() -> None:
+            recovered = _recover_pending_flushes(runner)
+            if recovered:
+                logger.info("Recovered %d pending message(s) from shutdown flush", recovered)
 
-    # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
-    runner._start_systemd_watchdog()
+        _best_effort(_recover_pending)
+        if runner.should_exit_cleanly:
+            _shutdown_gateway_health_export(runner)
+            if runner.exit_reason:
+                logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
+            # Explicit exit codes (GATEWAY_FATAL_CONFIG_EXIT_CODE) must propagate so s6 finish maps 78 → 125.
+            if runner.exit_code is not None:
+                raise SystemExit(runner.exit_code)
+            return True
+        if not runner._running:
+            # Startup aborted by restart/shutdown before running mode; preserve that path without starting cron.
+            try:
+                await runner.wait_for_shutdown()
+                try:
+                    await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
+                except Exception:
+                    logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
+                return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
+            finally:
+                _shutdown_gateway_health_export(runner)
 
-    await runner.wait_for_shutdown()
+        cron_stop, cron_provider, cron_thread, housekeeping_thread = (
+            _start_gateway_start_cron_and_housekeeping(runner))
 
-    return await _start_gateway_shutdown_tail(
-        runner, _control_server, cron_stop, cron_provider, cron_thread, housekeeping_thread,
-        _planned_stop_watcher_stop, _planned_stop_watcher_thread, _signal_initiated_shutdown)
+        # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
+        runner._start_systemd_watchdog()
+
+        await runner.wait_for_shutdown()
+
+        return await _start_gateway_shutdown_tail(
+            runner, _control_server, cron_stop, cron_provider, cron_thread, housekeeping_thread,
+            _planned_stop_watcher_stop, _planned_stop_watcher_thread, _signal_initiated_shutdown)
+    finally:
+        _planned_stop_watcher_stop.set()
+        if _planned_stop_watcher_thread.is_alive():
+            _planned_stop_watcher_thread.join(timeout=2)
 
 
 def _guard_corrupt_user_config() -> None:
