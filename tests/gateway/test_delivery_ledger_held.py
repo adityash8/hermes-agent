@@ -92,16 +92,32 @@ async def test_other_send_failures_still_spend_attempts():
     store.mark_resume_pending.assert_not_awaited()
 
 
-def test_held_rows_survive_retention_and_prune_last():
+def _prune(now):
+    with dl._DB_LOCK, dl._transaction() as conn:
+        dl._prune_unlocked(conn, now)
+
+
+def test_held_rows_outlive_normal_retention_then_expire():
     _record("held")
     _record("done")
     assert dl.mark_held("held", "slack_thread_deleted")
     dl.mark_delivered("done")
-    later = time.time() + dl._RETENTION_SECONDS + 60
-    with dl._DB_LOCK, dl._transaction() as conn:
-        dl._prune_unlocked(conn, later)
+    _prune(time.time() + dl._RETENTION_SECONDS + 60)
     assert _row("done") is None
     assert _row("held")["state"] == "held"
+    _prune(time.time() + dl._HELD_RETENTION_SECONDS + 60)
+    assert _row("held") is None
+
+
+def test_held_rows_never_displace_live_rows_under_the_cap(monkeypatch):
+    monkeypatch.setattr(dl, "_MAX_ROWS", 2)
+    for oid in ("h1", "h2"):
+        _record(oid)
+        assert dl.mark_held(oid, "slack_participation_revoked")
+    _record("live")
+    _prune(time.time())
+    assert _row("live")["state"] == "pending"
+    assert [_row(oid) is None for oid in ("h1", "h2")].count(True) == 1
 
 
 def test_release_held_returns_row_to_redelivery():

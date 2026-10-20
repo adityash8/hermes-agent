@@ -8,7 +8,8 @@ only on SendResult.success | mark_failed() 'failed' on a definitive rejection. C
 rejected once, restart is a retry boundary, also marked; delivered = prune. Attempts are capped
 and stale rows expire, both -> 'abandoned' (kept briefly, then pruned). A redelivery the platform
 refused for authorization (participation revoked, surface deleted) -> 'held': no attempt spent, never
-swept, abandoned or time-pruned, until release_held() returns it to 'failed'. Everything is
+swept or abandoned, kept for _HELD_RETENTION_SECONDS unless release_held() returns it to 'failed',
+and pruned before live rows under the row cap. Everything is
 best-effort: ledger failures must never block a send; callers wrap every call in try/except.
 """
 
@@ -35,6 +36,7 @@ _DB_LOCK = threading.Lock()
 MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
+_HELD_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _MAX_ROWS = 500
 
 # Visible prefixes for redeliveries that might duplicate an already-received message (crash mid-send /
@@ -333,9 +335,9 @@ def is_authorization_hold(error: Any) -> bool:
 def mark_held(obligation_id: str, error: str = "") -> bool:
     """Park a claimed row the platform refused for authorization as ``held``, refunding its claim.
 
-    Held rows are outside every sweep and the retention prune, so a revoked or deleted surface can
-    neither burn MAX_ATTEMPTS across restarts nor let the answer expire; release_held() is the
-    only way back into redelivery."""
+    Held rows are outside every sweep, so a revoked or deleted surface cannot burn MAX_ATTEMPTS
+    across restarts; they outlive the normal retention (_HELD_RETENTION_SECONDS) but never displace
+    a live row under the row cap. release_held() is the only way back into redelivery."""
     with _DB_LOCK, _transaction() as conn:
         cursor = conn.execute(
             """UPDATE delivery_obligations
@@ -575,7 +577,9 @@ def _prune_unlocked(conn, now: float) -> None:
     """Retention DELETEs on the caller's open connection — must run inside the caller's transaction."""
     conn.execute(
         """DELETE FROM delivery_obligations
-           WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""", (now - _RETENTION_SECONDS,))
+           WHERE (state IN ('delivered', 'abandoned') AND updated_at < ?)
+              OR (state = 'held' AND updated_at < ?)""",
+        (now - _RETENTION_SECONDS, now - _HELD_RETENTION_SECONDS))
     total = conn.execute("SELECT COUNT(*) FROM delivery_obligations").fetchone()[0]
     if total > _MAX_ROWS:
         conn.execute(
@@ -584,8 +588,8 @@ def _prune_unlocked(conn, now: float) -> None:
                  ORDER BY CASE state
                             WHEN 'delivered' THEN 0
                             WHEN 'abandoned' THEN 1
-                            WHEN 'held' THEN 3
-                            ELSE 2
+                            WHEN 'held' THEN 2
+                            ELSE 3
                           END, updated_at ASC
                  LIMIT ?)""", (total - _MAX_ROWS,))
 
