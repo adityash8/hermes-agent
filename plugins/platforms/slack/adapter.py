@@ -2059,18 +2059,18 @@ class SlackAdapter(SlackParticipationMixin):
         """Grant from gateway.restricted_users, else the platform default.
 
         An empty grant means this sender gets no tools. None means unrestricted.
+        An unreadable config or grant fails closed to no tools.
         """
         from gateway.run import _load_gateway_config
-        from plugins.platforms.slack.restricted_grant import grant_toolsets
+        from plugins.platforms.slack.restricted_grant import NO_MCP, grant_toolsets
 
         user_id = getattr(source, "user_id", None)
         chat_id = getattr(source, "chat_id", None)
         try:
-            config = _load_gateway_config()
+            return grant_toolsets(_load_gateway_config(), user_id, chat_id)
         except Exception:
-            return None
-        granted = grant_toolsets(config, user_id, chat_id)
-        return granted
+            logger.warning("[Slack] restricted grant unreadable; serving the turn with no tools")
+            return [NO_MCP]
 
     def _get_client(self, chat_id: str, team_id: Optional[str] = None) -> Any:
         """Return the client matching explicit provenance or an unambiguous channel inference.
