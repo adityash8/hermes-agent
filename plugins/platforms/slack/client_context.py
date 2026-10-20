@@ -194,7 +194,9 @@ def _invalidate_cookunity_history(adapter, event, body):
     """
     from gateway.client_context_cookunity import CHANNEL, WORKSPACE
 
-    if event.get("subtype") not in {"message_changed", "message_deleted"} or event.get("channel") != CHANNEL:
+    subtype = event.get("subtype")
+    if type(subtype) is not str or subtype not in {"message_changed", "message_deleted"} \
+            or event.get("channel") != CHANNEL:
         return
     try:
         from gateway.client_context_codewords_history import slack_timestamp

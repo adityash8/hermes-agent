@@ -727,7 +727,7 @@ async def test_cookunity_actorless_change_invalidates_once_without_becoming_a_re
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("forgery", ["workspace", "event_team", "codewords_channel", "nested_channel",
-                                     "unbound", "no_body", "timestamp", "not_message"])
+                                     "unbound", "no_body", "timestamp", "not_message", "unhashable_subtype"])
 async def test_forged_cookunity_changes_cannot_invalidate(native, forgery):
     from plugins.platforms.slack.client_context import admit_event
 
@@ -748,6 +748,8 @@ async def test_forged_cookunity_changes_cannot_invalidate(native, forgery):
         body = None
     elif forgery == "timestamp":
         change["message"]["ts"] = "invalid"
+    elif forgery == "unhashable_subtype":
+        change["subtype"] = ["message_changed"]
     else:
         change["type"] = "app_mention"
     await admit_event(adapter, change, body)

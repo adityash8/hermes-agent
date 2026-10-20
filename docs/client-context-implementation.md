@@ -438,6 +438,23 @@ No live Slack/provider run or authenticated acceptance proof was performed. Line
 Done remains blocked on the separate authenticated Slack proof and parent-owned
 activation gate.
 
+### History repairs (EZ-826 follow-up, 2026-10-20)
+
+- **Invoking channel first.** Channel queries search the request's own channel
+  before any other approved channel, so a busy secondary channel cannot consume the
+  shared read budget first. `authorized_channel_ids`/`channel_ids` keep configured
+  order; coverage adds `search_order`.
+- **Reply-bearing roots.** Thread-root discovery uses only the root's `ts`,
+  `thread_ts` and `reply_count`, so replies under file, attachment or excluded-subtype
+  roots are found. The root's own content is still filtered and never returned.
+- **CookUnity invalidation.** Authenticated `message_changed`/`message_deleted`
+  events in `C0BBD05512M` (outer workspace `T07MMEX5658`, bound client, valid
+  timestamps, replay-deduplicated) bump a CookUnity-only revision, including edits
+  by the restricted user and edits in other threads. The CookUnity turn retains the
+  history receipt through completion and send, so a change during the turn withholds
+  the reply. These events never authorize, admit or answer anything, and the
+  existing admission result for them is unchanged.
+
 Local verification used `/Users/adityasheth/.hermes/hermes-agent/venv/bin/python`
 with isolated `HERMES_HOME` and scratch `TMPDIR`. The focused history/account/CookUnity
 suite passed **177 tests, 2 skipped**. The 11-file client-context regression run
