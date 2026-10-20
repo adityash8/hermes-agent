@@ -117,10 +117,17 @@ _BILLING_PATTERNS = (
     "hard billing limit",
 )
 
-# Not proof of exhaustion: Anthropic returns the same "out of extra usage" body
-# for a content-filter rejection (#82154). Verdict stays ``billing`` but is
-# marked unverified so surfaces hedge and the pool uses a short cooldown.
-_UNVERIFIED_BILLING_PATTERNS = ("out of extra usage",)
+# Not proof of exhaustion. Two Anthropic HTTP 400 bodies are returned for a
+# healthy credential as well as a depleted one:
+#   * "out of extra usage" — also a server-side content-filter rejection on a
+#     subscription OAuth token (#82154).
+#   * "credit balance is too low" — also a transient Console credit-ledger
+#     glitch. Reproduced 2026-10-19: the same ``sk-ant`` key that drew this 400
+#     served ``/v1/messages`` with HTTP 200 minutes later, so a confirmed
+#     one-hour billing bench was wrong.
+# Verdict stays ``billing`` (fallback still engages) but is marked unverified
+# so surfaces hedge and the pool uses the short cooldown instead of the bench.
+_UNVERIFIED_BILLING_PATTERNS = ("out of extra usage", "credit balance is too low")
 
 # xAI's Grok credit-exhaustion code arrives as HTTP 403, not 402. Provider-
 # scoped on purpose: other providers' billing codes on a 403 stay auth failures.

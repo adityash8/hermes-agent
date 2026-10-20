@@ -14,7 +14,7 @@ from gateway.session import SessionSource
 logger = logging.getLogger(__name__)
 
 
-async def admit_event(adapter, event, body=None, *, original_source=None):
+async def admit_event(adapter, event, body=None, *, original_source=None, interaction=False):
     from gateway import client_context_restricted as restricted
     probe = SimpleNamespace(platform=Platform.SLACK,
                             chat_id=event.get("channel") or event.get("channel_id"),
@@ -104,12 +104,12 @@ async def admit_event(adapter, event, body=None, *, original_source=None):
 
             require(body is not None and not is_dm)
             require(team == WORKSPACE and channel == CHANNEL)
-            require(channel_type in {"channel", "group"}
+            require(interaction or channel_type in {"channel", "group"}
                     or channel_type in {None, ""} and event.get("type") == "app_mention")
             require(team in adapter._team_clients and bool(adapter._team_bot_user_ids.get(team)))
             require(not source.is_bot and event.get("subtype") in {None, ""})
             require(not event.get("files") and not event.get("attachments"))
-            require(isinstance(event.get("text"), str) and bool(event["text"].strip()))
+            require(interaction or isinstance(event.get("text"), str) and bool(event["text"].strip()))
             # users.info is identity verification only. Do not use the adapter's
             # ordinary bot cache: its network-error fallback treats users as human.
             slack_client = adapter._team_clients[team]
@@ -125,15 +125,34 @@ async def admit_event(adapter, event, body=None, *, original_source=None):
             require(member.get("is_bot") is False)
             require(not member.get("is_workflow_bot") and not member.get("deleted"))
             source._codewords_native_identity = native_identity(source)
+            policy_reader = getattr(adapter, "_client_context_codewords_policy", None)
+            policy = policy_reader(source) if policy_reader is not None else None
+            if policy is not None and policy.operator_user_id == user:
+                from gateway.client_context_codewords_owner import issue
+                from gateway.client_context_codewords_history import slack_timestamp
+                require(not event.get("bot_id") and not event.get("bot_profile"))
+                if interaction:
+                    require(body.get("type") == "block_actions")
+                    source.thread_id = (original_source.thread_id if original_source is not None
+                                        else body.get("message", {}).get("thread_ts"))
+                else:
+                    require(event.get("type") in {"message", "app_mention"})
+                    slack_timestamp(event.get("ts"))
+                    source.thread_id = adapter._session_thread_ts(event, event["ts"], False, {})
+                    slack_timestamp(source.thread_id)
+                issue(adapter, source, policy, member, event.get("ts"))
+            elif interaction:
+                return "deny", None
         elif restricted.selected(source):
             require(original_source is None)
             await restricted.admit_native(adapter, event, body, source)
+        if original_source is not None:
+            require((original_source.platform, original_source.scope_id, original_source.chat_id,
+                     original_source.user_id) == (Platform.SLACK, team, channel, user))
         if restricted.selected(source):
             # CookUnity must keep its fresh native receipt, never a legacy source.
             pass
-        elif original_source is not None:
-            require((original_source.platform, original_source.scope_id, original_source.chat_id,
-                     original_source.user_id) == (Platform.SLACK, team, channel, user))
+        elif original_source is not None and not hasattr(source, "_codewords_owner"):
             source = copy(original_source)
         mode = await adapter_admission(adapter, source)
         if mode == "deny":
@@ -217,7 +236,7 @@ async def send_codewords(adapter, chat_id, content, reply_to, metadata):
             _codewords_release.reset(token)
 
 
-async def interaction_is_legacy(adapter, body, *, original_source=None):
+async def interaction_is_legacy(adapter, body, *, original_source=None, admitted_sources=None):
     from gateway.client_context_restricted import USER
     from gateway.client_context_cookunity import EXTRA_USERS, CHANNEL as COOKUNITY_CHANNEL
     if (body.get("user", {}).get("id") in EXTRA_USERS
@@ -228,10 +247,12 @@ async def interaction_is_legacy(adapter, body, *, original_source=None):
     # Only the actor/channel of the authenticated interaction, never action.value
     # or the embedded message author, can authorize an owner control.
     try:
-        mode, _ = await admit_event(adapter, {
+        mode, admitted = await admit_event(adapter, {
             "channel": body.get("channel", {}).get("id"),
             "user": body.get("user", {}).get("id"),
-        }, body, original_source=original_source)
+        }, body, original_source=original_source, interaction=True)
+        if mode == "legacy" and admitted_sources is not None and admitted is not None:
+            admitted_sources.append(admitted)
         return mode == "legacy"
     except (AttributeError, TypeError):
         return False
@@ -311,7 +332,7 @@ async def dispatch_scoped(adapter, event, source):
         is_dm=False, force_process=False, allow_thread_lookup=False, source=source,
     ):
         return
-    if ts and adapter._dedup.is_duplicate(adapter._workspace_event_id(source.scope_id, ts)):
+    if adapter._claim_inbound_event_dedup(source.scope_id or "", source.chat_id, ts):
         return
     if bot_uid:
         text = text.replace(f"<@{bot_uid}>", "").strip()

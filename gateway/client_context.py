@@ -106,6 +106,9 @@ def route_options(config, source) -> Options | None:
 async def admission(runner, source) -> str:
     """Classify authenticated transport identity before any legacy capability runs."""
     from gateway.client_context_codewords import selected, route, native_identity, has_receipt
+    from gateway.client_context_codewords_owner import authorized as owner_authorized
+    if hasattr(source, "_codewords_owner"):
+        return "legacy" if owner_authorized(runner.config, source) else "deny"
     if (hasattr(source, "_text_only_native_identity") or hasattr(source, "_text_only_policy")
             or has_receipt(source) and not selected(getattr(runner, "config", None), source)):
         return "deny"  # Revoked native receipts must not become legacy hook/background grants.
@@ -305,6 +308,10 @@ async def answer(opts: Options, source, question: str):
 async def handle_turn(runner, event, source, key: str, generation: int):
     """Returns (handled, text); the generation check also applies to denials/failures."""
     from gateway import client_context_codewords as codewords
+    from gateway.client_context_codewords_owner import event_authorized, authorized as owner_authorized
+    if (event_authorized(runner.config, event) and owner_authorized(runner.config, source)
+            and codewords.native_identity(source) == codewords.native_identity(event.source)):
+        return False, None
     if (codewords.selected(getattr(runner, "config", None), source)
             or codewords.has_request(event) or codewords.has_receipt(source)):
         return await codewords.handle_turn(runner, event, source, key, generation)
@@ -397,6 +404,9 @@ async def handle_ingress(runner, event):
     """Gate before pre-dispatch plugins, commands, reply intercepts or restored sessions."""
     from gateway import client_context_codewords as codewords
     source = event.source
+    from gateway.client_context_codewords_owner import event_authorized
+    if event_authorized(runner.config, event):
+        return False, None
     bounded = (codewords.selected(getattr(runner, "config", None), source)
                or codewords.has_request(event) or codewords.has_receipt(source))
     from gateway import client_context_restricted as restricted

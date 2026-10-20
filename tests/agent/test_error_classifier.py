@@ -1349,15 +1349,53 @@ class TestAdversarialEdgeCases:
         assert result.billing_unverified is True
         assert result.error_context.get("possible_content_filter") is True
 
-    def test_400_unambiguous_billing_body_is_not_marked_unverified(self):
-        """A 400 whose billing evidence is NOT the ambiguous 'out of extra
-        usage' body keeps a confirmed verdict (#82154)."""
+    def test_400_credit_balance_too_low_is_unverified(self):
+        """Anthropic's 'credit balance is too low' 400 is not proof the key is
+        empty. The same body is returned during a transient Console credit-ledger
+        glitch: a key that drew this 400 served /v1/messages with HTTP 200
+        minutes later (2026-10-19). Mark it unverified so the pool uses the
+        short cooldown instead of benching a healthy key for an hour. A real
+        depletion re-latches on the next failure."""
         e = MockAPIError(
             "Your credit balance is too low to access the Anthropic API.",
             status_code=400,
             body={"error": {
                 "type": "invalid_request_error",
                 "message": "Your credit balance is too low to access the Anthropic API.",
+            }},
+        )
+        result = classify_api_error(e, provider="anthropic")
+        assert result.reason == FailoverReason.billing
+        assert result.should_fallback is True
+        assert result.should_rotate_credential is True
+        assert result.billing_unverified is True
+
+    def test_400_other_billing_body_stays_confirmed(self):
+        """A 400 whose billing evidence is neither ambiguous Anthropic body
+        keeps a confirmed verdict."""
+        e = MockAPIError(
+            "Your account balance is too low to continue.",
+            status_code=400,
+            body={"error": {
+                "type": "invalid_request_error",
+                "message": "Your account balance is too low to continue.",
+            }},
+        )
+        result = classify_api_error(e, provider="openrouter")
+        assert result.reason == FailoverReason.billing
+        assert result.billing_unverified is False
+
+    def test_400_unambiguous_billing_body_is_not_marked_unverified(self):
+        """A 400 whose billing evidence is neither ambiguous Anthropic body
+        keeps a confirmed verdict. 'credit balance is too low' is itself
+        ambiguous (transient Console credit-ledger glitch), so it is covered by
+        test_400_credit_balance_too_low_is_unverified rather than here."""
+        e = MockAPIError(
+            "Billing hard limit reached for this workspace.",
+            status_code=400,
+            body={"error": {
+                "type": "invalid_request_error",
+                "message": "Billing hard limit reached for this workspace.",
             }},
         )
         result = classify_api_error(e, provider="anthropic")

@@ -232,8 +232,8 @@ class TestClaimHelperBounded:
 
         assert len(adapter._processed_message_ts) <= 10
         # newest survive, oldest evicted
-        assert "24.0" in adapter._processed_message_ts
-        assert "0.0" not in adapter._processed_message_ts
+        assert ("", "", "24.0") in adapter._processed_message_ts
+        assert ("", "", "0.0") not in adapter._processed_message_ts
 
     def test_empty_ts_is_ignored(self):
         delivered = []
@@ -273,7 +273,7 @@ class TestClaimReleasedOnFailure:
             with pytest.raises(RuntimeError):
                 await adapter._handle_slack_message(_original_event(), _body())
             # The failed invocation must not leave the ts claimed...
-            assert ORIGINAL_TS not in adapter._processed_message_ts
+            assert ("T025KND0E", "C0BF1EYUA9H", ORIGINAL_TS) not in adapter._processed_message_ts
             # ...so a user edit of the unanswered message still summons the bot.
             await adapter._handle_slack_message(edit, _body())
 
@@ -288,7 +288,7 @@ class TestClaimReleasedOnFailure:
 
         async def scenario():
             await adapter._handle_slack_message(_original_event(), _body())
-            assert ORIGINAL_TS in adapter._processed_message_ts
+            assert ("T025KND0E", "C0BF1EYUA9H", ORIGINAL_TS) in adapter._processed_message_ts
             # A later invocation for the same ts that fails must not strip
             # the claim the successful turn already holds.
             adapter._resolve_user_name = AsyncMock(
@@ -300,7 +300,7 @@ class TestClaimReleasedOnFailure:
                 await adapter._handle_slack_message(second, _body())
             except RuntimeError:
                 pass
-            assert ORIGINAL_TS in adapter._processed_message_ts
+            assert ("T025KND0E", "C0BF1EYUA9H", ORIGINAL_TS) in adapter._processed_message_ts
 
         asyncio.run(scenario())
         assert len(delivered) == 1

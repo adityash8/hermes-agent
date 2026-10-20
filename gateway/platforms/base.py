@@ -2629,7 +2629,7 @@ class BasePlatformAdapter(ABC):
             thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(source))
         from gateway.client_context_restricted import session_key
-        # Codewords keeps its existing channel isolation/session behavior.
+        # build_session_key also isolates Codewords participants in shared threads.
         return session_key(key, source)
 
     def _text_batch_key(self, event: "MessageEvent") -> str:
@@ -4137,9 +4137,15 @@ class BasePlatformAdapter(ABC):
                         return
             except Exception:
                 return
-        if not codewords and (sealed_request is not None
+        owner_check = getattr(self, "_client_context_codewords_owner", None)
+        native_owner = owner_check is not None and owner_check(event.source) is True
+        if native_owner:
+            if event.internal or str(event.message_id or "") != event.source._codewords_owner.message_id:
+                return
+        if not codewords and not native_owner and (sealed_request is not None
                 or hasattr(event.source, "_codewords_native_identity")
-                or hasattr(event.source, "_codewords_policy")):
+                or hasattr(event.source, "_codewords_policy")
+                or hasattr(event.source, "_codewords_owner")):
             return
         from gateway import client_context_restricted as restricted
         restricted_turn = not codewords and (restricted.selected(event.source) or hasattr(event, "_restricted_request"))

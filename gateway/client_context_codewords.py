@@ -62,7 +62,7 @@ def selected(config, source) -> bool:
 def has_receipt(source) -> bool:
     # Retired receipts are tombstones, never a compatibility execution path.
     return any(hasattr(source, name) for name in (
-        "_codewords_native_identity", "_codewords_policy",
+        "_codewords_native_identity", "_codewords_policy", "_codewords_owner",
         "_text_only_native_identity", "_text_only_policy",
     ))
 
@@ -77,16 +77,34 @@ class ReadPolicy:
     generation: str
     completion: Options
     resources: tuple
+    # Seal explicit settings too: removing an all-reader list must revoke admission.
+    read_tools: tuple[str, ...] | None = None
+    operator_user_id: str | None = None
 
 
 def route(config, source) -> ReadPolicy:
-    from gateway.client_context_codewords_reads import bindings
+    from gateway.client_context_codewords_reads import NAMES, bindings
 
-    require(selected(config, source) and not getattr(config, "multiplex_profiles", False))
+    require(selected(config, source))
     require("text_only_channels" not in config.client_context)
     require(type(config.client_context.get("enabled")) is bool)
     cfg = fields(config.client_context["codewords_read_channels"], {CHANNEL})
-    value = fields(cfg[CHANNEL], {"scope_id", "generation", "provider", "model"})
+    expected = {"scope_id", "generation", "provider", "model"}
+    if isinstance(cfg[CHANNEL], dict) and "read_tools" in cfg[CHANNEL]:
+        expected.add("read_tools")
+    if isinstance(cfg[CHANNEL], dict) and "operator_user_id" in cfg[CHANNEL]:
+        expected.add("operator_user_id")
+    value = fields(cfg[CHANNEL], expected)
+    owner = value.get("operator_user_id")
+    if "operator_user_id" in value:
+        require(type(owner) is str and owner == "U07MJJMMK9T")
+    allowed = None
+    if "read_tools" in value:
+        names = value["read_tools"]
+        require(type(names) is list and len(names) <= len(NAMES))
+        require(all(type(name) is str and name in NAMES for name in names))
+        require(len(set(names)) == len(names))
+        allowed = tuple(names)
     scope = identifier(value["scope_id"])
     require(scope == WORKSPACE)
     generation = identifier(value["generation"])
@@ -98,7 +116,8 @@ def route(config, source) -> ReadPolicy:
     require(isinstance(source.user_id, str) and re.fullmatch(r"[UW][A-Za-z0-9]+", source.user_id))
     require(not source.is_bot and not source.profile_route_rejected
             and not source.delivered_via_upstream_relay and not source.profile)
-    return ReadPolicy(scope, generation, Options("", value["provider"], model), bindings())
+    resources = tuple(binding for binding in bindings() if allowed is None or binding.name in allowed)
+    return ReadPolicy(scope, generation, Options("", value["provider"], model), resources, allowed, owner)
 
 
 def native_identity(source) -> tuple:
@@ -184,7 +203,9 @@ def _completion_loop(policy, question, validate, receipts, history, request_time
                           "untrusted_same_thread_context": json.loads(context)}, allow_nan=False)
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": content}]
     seen, count, comparison = set(), 0, None
-    tools = [*reads.schemas(), slack_history.schema()]
+    allowed = {binding.name for binding in policy.resources}
+    tools = [schema for schema in reads.schemas() if schema["function"]["name"] in allowed]
+    tools.append(slack_history.schema())
     for _ in range(MAX_CALLS + 1):
         validate()
         result = cc.complete(policy.completion, "", messages=messages,
@@ -219,6 +240,7 @@ def _completion_loop(policy, question, validate, receipts, history, request_time
             if function["name"] == "codewords_slack_history_read":
                 slack_history.validate_call(function["arguments"])
             else:
+                require(type(function["name"]) is str and function["name"] in allowed)
                 reads.validate_call(function["name"], function["arguments"])
             validated.append((call_id, function))
         messages.append(result)

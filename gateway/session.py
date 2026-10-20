@@ -678,6 +678,8 @@ def is_shared_multi_user_session(
 ) -> bool:
     """True when a non-DM session is shared across participants (mirrors the
     isolation rules in :func:`build_session_key`)."""
+    if _codewords_isolated(source):
+        return False
     if source.chat_type == "dm":
         return False
     return not (thread_sessions_per_user if source.thread_id else group_sessions_per_user)
@@ -710,6 +712,12 @@ def _canonical_participant(source: SessionSource) -> Optional[str]:
     if participant_id and source.platform == Platform.WHATSAPP:
         participant_id = canonical_whatsapp_identifier(str(participant_id)) or participant_id
     return participant_id
+
+
+def _codewords_isolated(source):
+    return (source.platform == Platform.SLACK
+            and source.chat_id == "C09PF4QGQMC"
+            and source.chat_type != "dm")
 
 
 def build_session_key(
@@ -753,6 +761,9 @@ def build_session_key(
     user_part = [str(participant_id)] if isolate_user and participant_id else []
     thread_part = [thread_id] if thread_id else []
     parts += user_part + thread_part if is_dm else thread_part + user_part
+    if _codewords_isolated(source):
+        # Never resume pre-exemption shared or per-user operator transcripts.
+        parts += ["codewords-owner-isolation", source.user_id or "unknown"]
     return ":".join(str(part) for part in parts)
 
 

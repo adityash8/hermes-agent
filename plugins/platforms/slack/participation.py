@@ -180,8 +180,17 @@ class SlackParticipationMixin(SlackDeletionMixin):
         finally:
             _codewords_history_read.reset(token)
 
+    def _codewords_owner_grant(self, grant):
+        check = getattr(self, "_client_context_codewords_owner", None)
+        return (grant is not None and grant.adapter is self and check is not None
+                and check(grant.source) is True)
+
     def _codewords_surface(self, key):
         selector = getattr(self, "_client_context_codewords", None)
+        grant = _participation_scope.get()
+        if (grant is not None and grant.adapter is self and grant.key[:2] == key[:2]
+                and self._codewords_owner_grant(grant)):
+            return False
         return selector is not None and selector(SimpleNamespace(
             platform=self.platform, scope_id=key[0], chat_id=key[1])) is True
 
@@ -306,7 +315,9 @@ class SlackParticipationMixin(SlackDeletionMixin):
     def _participation_valid(self, grant):
         from gateway.client_context_codewords import has_receipt
 
-        codewords = self._codewords_surface(grant.key) or has_receipt(grant.source)
+        if hasattr(grant.source, "_codewords_owner") and not self._codewords_owner_grant(grant):
+            return False
+        codewords = (self._codewords_surface(grant.key) or has_receipt(grant.source)) and not self._codewords_owner_grant(grant)
         return (grant.live and not grant.revoked
                 and not self._ancestry_revoked(grant)
                 and (not codewords or self._codewords_channel_allowed(grant.key))

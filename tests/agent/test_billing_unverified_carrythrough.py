@@ -42,11 +42,11 @@ def _classified_unverified():
 
 def _classified_confirmed():
     e = MockAPIError(
-        "Your credit balance is too low to access the Anthropic API.",
+        "Billing hard limit reached for this workspace.",
         status_code=400,
         body={"error": {
             "type": "invalid_request_error",
-            "message": "Your credit balance is too low to access the Anthropic API.",
+            "message": "Billing hard limit reached for this workspace.",
         }},
     )
     return classify_api_error(e, provider="anthropic")

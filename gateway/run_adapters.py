@@ -1292,9 +1292,12 @@ class GatewayAdapterLifecycleMixin:
         # A relay adapter can front Slack even when its primary platform is different.
         adapter.client_context_enabled = applies(getattr(self, "config", None), SimpleNamespace(platform=Platform.SLACK))
         adapter._client_context_admission = lambda source: admission(self, source)
-        from gateway.client_context_codewords import authorized, selected
+        from gateway.client_context_codewords import authorized, selected, route
         adapter._client_context_applies = lambda source: applies(self.config, source)
-        adapter._client_context_codewords = lambda source: selected(self.config, source)
+        from gateway.client_context_codewords_owner import authorized as owner_authorized
+        adapter._client_context_codewords_owner = lambda source: owner_authorized(self.config, source, adapter)
+        adapter._client_context_codewords_policy = lambda source: route(self.config, source)
+        adapter._client_context_codewords = lambda source: selected(self.config, source) and not owner_authorized(self.config, source, adapter)
         adapter._client_context_codewords_authorized = lambda source: authorized(self.config, source)
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
