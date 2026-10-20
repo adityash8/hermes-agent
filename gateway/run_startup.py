@@ -426,7 +426,9 @@ class GatewayStartupMixin:
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
-            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
+            from gateway.delivery_ledger import (
+                RECOVERED_MARKER, is_authorization_hold, mark_delivered, mark_failed, mark_held,
+            )
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
@@ -456,6 +458,14 @@ class GatewayStartupMixin:
                         "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
                         row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
                     )
+                elif result is not None and is_authorization_hold(getattr(result, "error", "")):
+                    # The surface was revoked or deleted: hold the answer without spending attempts, and
+                    # keep the session marked with a reason that never auto-resumes, so only a fresh ask
+                    # re-opens it (fail closed) while the answer itself is retained.
+                    await asyncio.to_thread(mark_held, row["obligation_id"], str(result.error))
+                    if row.get("session_key"):
+                        await self.async_session_store.mark_resume_pending(
+                            row["session_key"], reason="delivery_held")
                 else:
                     await asyncio.to_thread(
                         mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
