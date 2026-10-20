@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import time
+import threading
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, ClassVar, Dict, Optional, Any, Tuple, List
@@ -65,6 +66,19 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _SlackHandlerClaims:
+    """Per-ingress invocation claims whose ownership must survive concurrent dispatch."""
+
+    dedup: List[Tuple[MessageDeduplicator, Tuple[str, object]]] = field(default_factory=list)
+    processed: List[Tuple[Tuple[str, str, str], object]] = field(default_factory=list)
+    defer_dedup_commit: bool = False
+
+
+_SLACK_HANDLER_CLAIMS: contextvars.ContextVar[Optional[_SlackHandlerClaims]] = contextvars.ContextVar(
+    "slack_handler_claims", default=None)
 
 # User-Agent prefix (``HermesAgent/<version>``) for platform-partner attribution of API calls.
 from hermes_cli.version_info import get_version_info
@@ -1074,8 +1088,11 @@ class SlackAdapter(SlackParticipationMixin):
         # Dedup cache: prevents duplicate bot responses when Socket Mode reconnects redeliver events
         # (#4777).
         self._dedup = MessageDeduplicator(ttl_seconds=_slack_dedup_ttl_seconds())
-        # ts of messages already routed to the agent, so later edits don't re-trigger a reply.
-        self._processed_message_ts: Dict[str, float] = {}
+        # Workspace/channel/message-ts claims prevent a later edit from re-triggering a routed turn.
+        # Ownership is tracked separately so a failed invocation cannot clear a newer claim.
+        self._processed_message_ts: Dict[Tuple[str, str, str], float] = {}
+        self._processed_message_owners: Dict[Tuple[str, str, str], object] = {}
+        self._processed_message_lock = threading.Lock()
         # approval / clarify message_ts (or (team_id, ts)) → resolved; blocks double-clicks.
         # Bounded: never-clicked prompts would otherwise leak forever.
         self._approval_resolved: Dict[Any, bool] = {}
@@ -1989,9 +2006,36 @@ class SlackAdapter(SlackParticipationMixin):
         return ""
 
     @staticmethod
-    def _workspace_event_id(team_id: str, event_id: str) -> str:
-        """Scope Slack's workspace-local event/message ids for deduplication."""
-        return f"{team_id}:{event_id}" if team_id else str(event_id)
+    def _workspace_event_id(
+        team_id: str, channel_id: str, event_ts: Optional[str] = None) -> str:
+        """Scope Slack message/edit timestamps by workspace and channel.
+
+        The two-argument form preserves compatibility for older test/helper callers; production
+        ingress always supplies the channel explicitly.
+        """
+        if event_ts is None:
+            # Legacy call shape: (team_id, event_id). Keep it isolated from the scoped form.
+            return f"{team_id}:{channel_id}" if team_id else str(channel_id)
+        return f"{team_id or ''}:{channel_id or ''}:{event_ts or ''}"
+
+    @staticmethod
+    def _workspace_message_key(team_id: str, channel_id: str, message_ts: str) -> Tuple[str, str, str]:
+        """Identity for one Slack message, whose timestamp is channel/workspace-local."""
+        return (str(team_id or ""), str(channel_id or ""), str(message_ts or ""))
+
+    def _claim_inbound_event_dedup(self, team_id: str, channel_id: str, event_ts: str) -> bool:
+        """Claim a workspace/channel-scoped event key, joining active ingress cleanup."""
+        if not event_ts:
+            return False
+        key = self._workspace_event_id(team_id, channel_id, event_ts)
+        claims = _SLACK_HANDLER_CLAIMS.get()
+        if claims is None:
+            return self._dedup.is_duplicate(key)
+        reservation = self._dedup.reserve(key)
+        if reservation is None:
+            return True
+        claims.dedup.append((self._dedup, reservation))
+        return False
 
     @staticmethod
     def _workspace_message_marker(team_id: str, message_id: str) -> Any:
@@ -2029,13 +2073,36 @@ class SlackAdapter(SlackParticipationMixin):
         return granted
 
     def _get_client(self, chat_id: str, team_id: Optional[str] = None) -> Any:
-        """Return the workspace-specific WebClient for a channel."""
-        if team_id and team_id in self._team_clients:
-            return self._team_clients[team_id]
-        team_id = self._channel_team.get(chat_id)
-        if team_id and team_id in self._team_clients:
-            return self._team_clients[team_id]
-        return self._app.client  # fallback to primary
+        """Return the client matching explicit provenance or an unambiguous channel inference.
+
+        An explicit workspace is never replaced by another workspace's channel mapping. Without
+        an explicit workspace, a unique channel owner is inferred; unmapped channels retain the
+        primary-client default.
+        """
+        explicit_team = str(team_id) if team_id else ""
+        channel_id = str(chat_id or "")
+        channel_teams = set((getattr(self, "_channel_teams", None) or {}).get(channel_id, set()))
+        mapped_team = (getattr(self, "_channel_team", None) or {}).get(channel_id)
+        if mapped_team:
+            channel_teams.add(str(mapped_team))
+
+        if explicit_team:
+            client = (getattr(self, "_team_clients", None) or {}).get(explicit_team)
+            if client is None:
+                raise ValueError("Unknown Slack workspace in explicit routing metadata")
+            if channel_teams and explicit_team not in channel_teams:
+                raise ValueError("Slack workspace/channel provenance conflict")
+            return client
+
+        if len(channel_teams) > 1:
+            raise ValueError("Ambiguous Slack channel workspace provenance")
+        if channel_teams:
+            inferred_team = next(iter(channel_teams))
+            client = (getattr(self, "_team_clients", None) or {}).get(inferred_team)
+            if client is None:
+                raise ValueError("Slack channel maps to an unavailable workspace")
+            return client
+        return self._app.client  # unmapped channel: preserve the primary default
 
     def _client_for(self, chat_id: str, metadata: Optional[Dict[str, Any]]) -> Any:
         """WebClient for ``chat_id``, workspace-scoped by outbound ``metadata``."""
@@ -2295,6 +2362,10 @@ class SlackAdapter(SlackParticipationMixin):
         blocked = self._outbound_blocked(chat_id, "outbound generic send to")
         if blocked:
             return blocked
+        try:
+            self._client_for(chat_id, metadata)
+        except ValueError as exc:
+            return SendResult(success=False, error=str(exc))
         if hasattr(content, "_restricted_validate"):
             from gateway.client_context_restricted import send
             return await send(self, chat_id, content, reply_to, metadata)
@@ -2578,9 +2649,9 @@ class SlackAdapter(SlackParticipationMixin):
         stream_key = self._stream_key(chat_id, metadata)
         if stream_key is None:
             return SendResult(success=False, error="no thread_ts for native stream")
-        client = self._client_for(chat_id, metadata)
         stream = self._active_streams.get(stream_key)
         try:
+            client = self._client_for(chat_id, metadata)
             if stream is not None and stream.get("draft_id") != draft_id:
                 # New segment while a prior stream is open: seal the old one so
                 # it doesn't hang with a live-typing indicator.
@@ -3703,15 +3774,94 @@ class SlackAdapter(SlackParticipationMixin):
             "context_channel_id": context_channel_id or cached.get("context_channel_id", ""),
             "team_id": team_id, "user_id": user_id}
 
-    def _remember_processed_message_ts(self, ts: str) -> None:
-        """Claim a message ts for the ``message_changed`` guard: on entry (suppresses mid-flight
-        unfurls) and after construction (refreshes LRU recency). Bounded."""
+    def _remember_processed_message_ts(
+        self, ts: str, channel_id: str = "", team_id: str = "") -> None:
+        """Record/refresh one workspace/channel/message identity for the edit guard."""
         if not ts:
             return
-        self._processed_message_ts[ts] = time.time()
-        if len(self._processed_message_ts) > self._PROCESSED_MESSAGE_TS_MAX:
-            newest = sorted(self._processed_message_ts.items(), key=lambda item: item[1])
-            self._processed_message_ts = dict(newest[-self._PROCESSED_MESSAGE_TS_MAX :])
+        key = self._workspace_message_key(team_id, channel_id, ts)
+        processed = getattr(self, "_processed_message_ts", None)
+        if processed is None:
+            processed = self._processed_message_ts = {}
+        owners = getattr(self, "_processed_message_owners", None)
+        if owners is None:
+            owners = self._processed_message_owners = {}
+        lock = getattr(self, "_processed_message_lock", None)
+        if lock is None:
+            lock = self._processed_message_lock = threading.Lock()
+        with lock:
+            processed[key] = time.time()
+            maximum = getattr(self, "_PROCESSED_MESSAGE_TS_MAX", 2000)
+            if len(processed) > maximum:
+                newest = sorted(processed.items(), key=lambda item: item[1])[-maximum:]
+                retained = dict(newest)
+                for evicted in processed.keys() - retained.keys():
+                    owners.pop(evicted, None)
+                self._processed_message_ts = processed = retained
+
+    def _has_processed_message_ts(self, ts: str, channel_id: str, team_id: str) -> bool:
+        """Check the message-specific processed claim without cross-channel collisions."""
+        key = self._workspace_message_key(team_id, channel_id, ts)
+        lock = getattr(self, "_processed_message_lock", None)
+        if lock is None:
+            return key in getattr(self, "_processed_message_ts", {})
+        with lock:
+            return key in getattr(self, "_processed_message_ts", {})
+
+    def _claim_processed_message_ts(self, ts: str, channel_id: str, team_id: str) -> bool:
+        """Atomically claim an unprocessed message and record this invocation as its owner."""
+        if not ts:
+            return True
+        key = self._workspace_message_key(team_id, channel_id, ts)
+        processed = getattr(self, "_processed_message_ts", None)
+        if processed is None:
+            processed = self._processed_message_ts = {}
+        owners = getattr(self, "_processed_message_owners", None)
+        if owners is None:
+            owners = self._processed_message_owners = {}
+        lock = getattr(self, "_processed_message_lock", None)
+        if lock is None:
+            lock = self._processed_message_lock = threading.Lock()
+        with lock:
+            if key in processed:
+                claims = _SLACK_HANDLER_CLAIMS.get()
+                if key in owners and claims is not None:
+                    # A duplicate that acquired a fresh TTL reservation must not
+                    # poison retry if the older, still-running owner later fails.
+                    claims.defer_dedup_commit = True
+                return False
+            processed[key] = time.time()
+            owner = object()
+            owners[key] = owner
+            maximum = getattr(self, "_PROCESSED_MESSAGE_TS_MAX", 2000)
+            if len(processed) > maximum:
+                newest = sorted(processed.items(), key=lambda item: item[1])[-maximum:]
+                retained = dict(newest)
+                for evicted in processed.keys() - retained.keys():
+                    owners.pop(evicted, None)
+                self._processed_message_ts = processed = retained
+            if key not in processed:
+                return False
+            claims = _SLACK_HANDLER_CLAIMS.get()
+            if claims is not None:
+                claims.processed.append((key, owner))
+            return True
+
+    def _finish_processed_message_claim(
+        self, key: Tuple[str, str, str], owner: object, *, release: bool) -> bool:
+        """Commit or release only a processed claim still owned by this invocation."""
+        lock = getattr(self, "_processed_message_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            owners = getattr(self, "_processed_message_owners", {})
+            if owners.get(key) is not owner:
+                return False
+            owners.pop(key, None)
+            if release:
+                getattr(self, "_processed_message_ts", {}).pop(key, None)
+            return True
+
 
     @staticmethod
     def _event_team_id(event: dict, body: Optional[dict] = None) -> str:
@@ -4159,21 +4309,29 @@ class SlackAdapter(SlackParticipationMixin):
         # Let the normal message.file_share event arrive first; if it did,
         # its share ts is already recorded and this fallback skips.
         await asyncio.sleep(0.75)
-        if ts and self._dedup.is_duplicate(self._workspace_event_id(team_id, ts)):
+        reservation = (
+            self._dedup.reserve(self._workspace_event_id(team_id, channel_id, str(ts))) if ts else None)
+        if ts and reservation is None:
             return
-        fallback_event = {
-            "type": "message",
-            "subtype": "file_share",
-            "text": "",
-            "user": event.get("user_id") or file_obj.get("user", ""),
-            "channel": channel_id,
-            "channel_type": "im" if channel_id.startswith("D") else "channel",
-            "team": team_id,
-            "ts": "",  # already recorded above; avoid tripping our own dedup guard
-            "files": [file_obj]}
-        if thread_ts and thread_ts != ts:
-            fallback_event["thread_ts"] = thread_ts
-        await self._handle_slack_message(fallback_event)
+        try:
+            fallback_event = {
+                "type": "message",
+                "subtype": "file_share",
+                "text": "",
+                "user": event.get("user_id") or file_obj.get("user", ""),
+                "channel": channel_id,
+                "channel_type": "im" if channel_id.startswith("D") else "channel",
+                "team": team_id,
+                "ts": "",  # already recorded above; avoid tripping our own dedup guard
+                "files": [file_obj]}
+            if thread_ts and thread_ts != ts:
+                fallback_event["thread_ts"] = thread_ts
+            await self._handle_slack_message(fallback_event)
+        except BaseException:
+            self._dedup.release(reservation)
+            raise
+        else:
+            self._dedup.commit(reservation)
 
     def _register_mentioned_thread(self, thread_ts: str, team_id: str = "") -> None:
         """Record a thread as bot-mentioned so future replies auto-trigger.
@@ -4293,15 +4451,18 @@ class SlackAdapter(SlackParticipationMixin):
         return await self._should_wake_on_unmentioned_message(
             event_thread_ts, channel_id, user_id, is_thread_reply, team_id)
 
-    def _normalize_changed_message(self, event: dict) -> Optional[dict]:
+    def _normalize_changed_message(self, event: dict, payload: Optional[dict] = None) -> Optional[dict]:
         """Turn a ``message_changed`` envelope into a plain message event.
-        None if malformed or the original was already routed to the agent. The edit's own ts rides
-        along as ``_slack_changed_event_ts`` for dedup."""
+        None if malformed or that workspace/channel/message was already routed. The edit's own ts
+        rides along as ``_slack_changed_event_ts`` for duplicate-edit detection."""
         updated_message = event.get("message")
         if not isinstance(updated_message, dict):
             return None
         original_message_ts = str(updated_message.get("ts") or "")
-        if original_message_ts and original_message_ts in self._processed_message_ts:
+        channel_id = str(event.get("channel") or updated_message.get("channel") or "")
+        team_id = self._event_team_id(event, payload)
+        if original_message_ts and self._has_processed_message_ts(
+                original_message_ts, channel_id=channel_id, team_id=team_id):
             return None
         edited = updated_message.get("edited")
         edited_ts = str(edited.get("ts") or "") if isinstance(edited, dict) else ""
@@ -4497,23 +4658,34 @@ class SlackAdapter(SlackParticipationMixin):
         self._evict_oldest_by_ts(self._reacting_message_ids, self._REACTING_MESSAGE_IDS_MAX)
 
     async def _handle_slack_message(self, event: dict, payload: Optional[dict] = None) -> None:
-        """Guard around :meth:`_handle_slack_message_impl`: the impl claims the ts early (no second
-        turn from a mid-flight unfurl); if THIS call newly claimed it and raises, release the claim
-        so a retry/edit can re-drive it. Pre-existing claims stay."""
-        _ts = str((event or {}).get("ts") or "")
-        # getattr: bare test doubles (object.__new__) may lack the map.
-        _claims = getattr(self, "_processed_message_ts", None)
-        _was_claimed = bool(_ts) and _claims is not None and _ts in _claims
+        """Release only claims newly owned by this failed/cancelled ingress invocation."""
+        claims = _SlackHandlerClaims()
+        context_token = _SLACK_HANDLER_CLAIMS.set(claims)
         try:
-            return await self._handle_slack_message_impl(event, payload)
-        except BaseException:
-            _claims = getattr(self, "_processed_message_ts", None)
-            if _ts and not _was_claimed and _claims is not None and _ts in _claims:
-                _claims.pop(_ts, None)
-                logger.warning(
-                    "[%s] handler failed after claiming ts=%s; claim released "
-                    "so a retry or edit can re-drive the turn", self.name, _ts)
-            raise
+            try:
+                result = await self._handle_slack_message_impl(event, payload)
+            except BaseException:
+                released_processed = False
+                for dedup, reservation in claims.dedup:
+                    dedup.release(reservation)
+                for key, owner in claims.processed:
+                    released_processed = self._finish_processed_message_claim(
+                        key, owner, release=True) or released_processed
+                if released_processed:
+                    logger.warning(
+                        "[%s] handler failed after claiming a processed Slack message; "
+                        "claims released so a retry or edit can re-drive the turn", self.name)
+                raise
+            for dedup, reservation in claims.dedup:
+                if claims.defer_dedup_commit:
+                    dedup.release(reservation)
+                else:
+                    dedup.commit(reservation)
+            for key, owner in claims.processed:
+                self._finish_processed_message_claim(key, owner, release=False)
+            return result
+        finally:
+            _SLACK_HANDLER_CLAIMS.reset(context_token)
 
     async def _drop_bot_sender(self, event: dict) -> bool:
         """allow_bots gate: ``none`` drops all bot posts (default), ``mentions`` those not
@@ -4566,18 +4738,16 @@ class SlackAdapter(SlackParticipationMixin):
                 await self._handle_message_deleted(event, payload)
             return None
         if event.get("subtype") == "message_changed":
-            event = self._normalize_changed_message(event)
+            event = self._normalize_changed_message(event, payload)
             if event is None:
                 return None
-        # Socket Mode redelivers after reconnects. Scope by workspace: ts is only unique per team.
-        # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777) Scope the dedup id by
-        # workspace: Slack event ts values are only unique within one workspace, so two teams' events with
-        # the same ts must not suppress each other.
-        event_ts = event.get("_slack_changed_event_ts") or event.get("ts", "")
+        # Socket Mode redelivers after reconnects. A workspace/channel pair owns its
+        # timestamp space, and message edits use their edit timestamp as the duplicate key.
+        channel_id = str(event.get("channel") or "")
+        event_ts = str(event.get("_slack_changed_event_ts") or event.get("ts") or "")
         dedup_team_id = self._event_team_id(event, payload)
-        if event_ts and self._dedup.is_duplicate(self._workspace_event_id(dedup_team_id, event_ts)):
+        if self._claim_inbound_event_dedup(dedup_team_id, channel_id, event_ts):
             return None
-        channel_id = event.get("channel", "")
         if self._is_ignored_channel(channel_id):
             logger.info("[Slack] Ignoring message in configured ignored channel %s", channel_id)
             return None
@@ -4745,8 +4915,9 @@ class SlackAdapter(SlackParticipationMixin):
         # before the slow enrichment awaits. Claiming before the filters would let an ignored
         # original block a later "@bot" edit from summoning the bot.
         _claim_ts = str(event.get("ts") or "")
-        if _claim_ts:
-            self._remember_processed_message_ts(_claim_ts)
+        if _claim_ts and not self._claim_processed_message_ts(
+                _claim_ts, channel_id=channel_id, team_id=str(team_id or "")):
+            return
         if is_mentioned:
             text, original_text, command_probe_text, is_command_text = self._apply_bot_mention(
                 text, original_text, command_probe_text, is_command_text, bot_uid, thread_ts,
@@ -4781,7 +4952,8 @@ class SlackAdapter(SlackParticipationMixin):
                 f"[Slack app context: user is viewing channel {context_channel_id}]\n\n"
                 f"{msg_event.text}")
         if ts:
-            self._remember_processed_message_ts(ts)
+            self._remember_processed_message_ts(
+                ts, channel_id=channel_id, team_id=str(team_id or ""))
         if (self._deletion_record(deletion_key).get("muted")
                 or self._deletion_generation(deletion_key) != deletion_generation):
             return

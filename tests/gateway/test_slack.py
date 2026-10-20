@@ -2813,6 +2813,7 @@ class TestThreadReplyHandling:
         )
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
+        a._team_clients["T_TEAM"] = a._app.client
         a._running = True
         a.set_authorization_check(lambda user_id, *args, **kwargs: bool(user_id))
         a.handle_message = AsyncMock()
@@ -3023,6 +3024,7 @@ class TestAssistantThreadLifecycle:
         )
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
+        a._team_clients["T_TEAM"] = a._app.client
         a._running = True
         a.set_authorization_check(lambda user_id, *args, **kwargs: bool(user_id))
         a.handle_message = AsyncMock()
@@ -4534,6 +4536,7 @@ class TestThreadImageContext:
         )
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
+        a._team_clients["T_TEAM"] = a._app.client
         a._running = True
         a.set_authorization_check(lambda user_id, *args, **kwargs: bool(user_id))
         a.handle_message = AsyncMock()
