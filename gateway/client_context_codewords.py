@@ -77,16 +77,29 @@ class ReadPolicy:
     generation: str
     completion: Options
     resources: tuple
+    # Seal the explicit allowlist too: changing or removing it must revoke admission.
+    read_tools: tuple[str, ...] | None = None
 
 
 def route(config, source) -> ReadPolicy:
-    from gateway.client_context_codewords_reads import bindings
+    from gateway.client_context_codewords_reads import NAMES, bindings
 
     require(selected(config, source) and not getattr(config, "multiplex_profiles", False))
     require("text_only_channels" not in config.client_context)
     require(type(config.client_context.get("enabled")) is bool)
     cfg = fields(config.client_context["codewords_read_channels"], {CHANNEL})
-    value = fields(cfg[CHANNEL], {"scope_id", "generation", "provider", "model"})
+    expected = {"scope_id", "generation", "provider", "model"}
+    if isinstance(cfg[CHANNEL], dict) and "read_tools" in cfg[CHANNEL]:
+        expected.add("read_tools")
+    # Every sender, including the workspace owner, stays in this read-only lane.
+    value = fields(cfg[CHANNEL], expected)
+    allowed = None
+    if "read_tools" in value:
+        names = value["read_tools"]
+        require(type(names) is list and len(names) <= len(NAMES))
+        require(all(type(name) is str and name in NAMES for name in names))
+        require(len(set(names)) == len(names))
+        allowed = tuple(names)
     scope = identifier(value["scope_id"])
     require(scope == WORKSPACE)
     generation = identifier(value["generation"])
@@ -98,7 +111,8 @@ def route(config, source) -> ReadPolicy:
     require(isinstance(source.user_id, str) and re.fullmatch(r"[UW][A-Za-z0-9]+", source.user_id))
     require(not source.is_bot and not source.profile_route_rejected
             and not source.delivered_via_upstream_relay and not source.profile)
-    return ReadPolicy(scope, generation, Options("", value["provider"], model), bindings())
+    resources = tuple(binding for binding in bindings() if allowed is None or binding.name in allowed)
+    return ReadPolicy(scope, generation, Options("", value["provider"], model), resources, allowed)
 
 
 def native_identity(source) -> tuple:
@@ -184,7 +198,9 @@ def _completion_loop(policy, question, validate, receipts, history, request_time
                           "untrusted_same_thread_context": json.loads(context)}, allow_nan=False)
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": content}]
     seen, count, comparison = set(), 0, None
-    tools = [*reads.schemas(), slack_history.schema()]
+    allowed = {binding.name for binding in policy.resources}
+    tools = [schema for schema in reads.schemas() if schema["function"]["name"] in allowed]
+    tools.append(slack_history.schema())
     for _ in range(MAX_CALLS + 1):
         validate()
         result = cc.complete(policy.completion, "", messages=messages,
@@ -219,6 +235,7 @@ def _completion_loop(policy, question, validate, receipts, history, request_time
             if function["name"] == "codewords_slack_history_read":
                 slack_history.validate_call(function["arguments"])
             else:
+                require(type(function["name"]) is str and function["name"] in allowed)
                 reads.validate_call(function["name"], function["arguments"])
             validated.append((call_id, function))
         messages.append(result)
