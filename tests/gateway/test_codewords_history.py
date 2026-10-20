@@ -520,3 +520,99 @@ async def test_channel_read_budget_exhaustion_is_partial_without_dead_cursor(his
     assert not result["coverage"]["thread_roots_complete"]
     case.client.conversations_history.assert_not_awaited()
     case.client.conversations_replies.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_invoking_channel_is_searched_before_other_approved_channels(history_case):
+    case = history_case
+    case.event.source.chat_id = SECOND_CHANNEL
+    reply_ts = stamp("2026-09-16", 1)
+
+    pages = iter(range(1, 1000))
+
+    async def channel_page(**kwargs):
+        if kwargs["channel"] == CHANNEL:
+            # Another approved channel that never ends must not starve the invoking one.
+            return {"ok": True, "has_more": True, "response_metadata": {"next_cursor": f"more-{next(pages)}"},
+                    "messages": [channel_message("noise", "2026-09-15", fraction=7)]}
+        return {"ok": True, "has_more": False,
+                "messages": [channel_message("own channel decision", "2026-09-16", ts=reply_ts)]}
+
+    case.client.conversations_history.side_effect = channel_page
+    instance = reader(case, client_id="codewords", channels=(CHANNEL, SECOND_CHANNEL),
+                      validate_channels=lambda: None)
+    result = await execute(instance, operation="channel", start_date="2026-09-14",
+                           end_date="2026-09-20", query="own channel decision")
+    calls = case.client.conversations_history.call_args_list
+    assert calls[0].kwargs["channel"] == SECOND_CHANNEL
+    assert [item["text"] for item in result["messages"]] == ["own channel decision"]
+    assert result["coverage"]["search_order"] == [SECOND_CHANNEL, CHANNEL]
+    assert result["coverage"]["channel_ids"] == [CHANNEL, SECOND_CHANNEL]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root_shape", ["files", "attachments", "subtype", "previous_message"])
+async def test_replies_under_excluded_reply_bearing_roots_are_found_without_root_content(history_case, root_shape):
+    case = history_case
+    thread = stamp("2026-09-15", 3)
+    root = {"type": "message", "ts": thread, "user": "UPEER", "text": "ROOT_PRIVATE_CONTENT", "reply_count": 1}
+    if root_shape == "files":
+        root["files"] = [{"id": "F1", "name": "deck.pdf"}]
+    elif root_shape == "attachments":
+        root["attachments"] = [{"text": "ROOT_PRIVATE_CONTENT"}]
+    elif root_shape == "subtype":
+        root["subtype"] = "file_share"
+    else:
+        root["previous_message"] = {"text": "ROOT_PRIVATE_CONTENT"}
+
+    async def channel_page(**kwargs):
+        return {"ok": True, "has_more": False, "messages": [root] if kwargs["channel"] == CHANNEL else []}
+
+    async def thread_page(**kwargs):
+        assert kwargs["channel"] == CHANNEL and kwargs["ts"] == thread
+        return {"ok": True, "has_more": False, "messages": [
+            {**root, "thread_ts": thread},
+            message("approved decision under the shared file", "2026-09-16", thread=thread,
+                    ts=stamp("2026-09-16", 4)),
+        ]}
+
+    case.client.conversations_history.side_effect = channel_page
+    case.client.conversations_replies.side_effect = thread_page
+    instance = reader(case, client_id="codewords", channels=(CHANNEL, SECOND_CHANNEL),
+                      validate_channels=lambda: None)
+    result = await execute(instance, operation="channel", start_date="2026-09-14",
+                           end_date="2026-09-20", query="approved decision")
+    assert [item["text"] for item in result["messages"]] == ["approved decision under the shared file"]
+    assert result["messages"][0]["thread_ts"] == thread
+    assert "ROOT_PRIVATE_CONTENT" not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["zero_replies", "reply_root_mismatch", "future", "foreign_channel",
+                                     "malformed_ts"])
+async def test_thread_root_discovery_stays_bounded(history_case, variant):
+    case = history_case
+    thread = stamp("2026-09-15", 3)
+    root = {"type": "message", "ts": thread, "user": "UPEER", "text": "root", "reply_count": 2}
+    if variant == "zero_replies":
+        root["reply_count"] = 0
+    elif variant == "reply_root_mismatch":
+        root["thread_ts"] = stamp("2026-09-14", 9)
+    elif variant == "future":
+        root["ts"] = stamp("2026-09-22")
+    elif variant == "foreign_channel":
+        root["channel"] = COOKUNITY_CHANNEL
+    else:
+        root["ts"] = "not-a-timestamp"
+
+    async def channel_page(**kwargs):
+        return {"ok": True, "has_more": False, "messages": [root] if kwargs["channel"] == CHANNEL else []}
+
+    case.client.conversations_history.side_effect = channel_page
+    instance = reader(case, client_id="codewords", channels=(CHANNEL, SECOND_CHANNEL),
+                      validate_channels=lambda: None)
+    result = await execute(instance, operation="channel", start_date="2026-09-14",
+                           end_date="2026-09-20", query="anything")
+    # A malformed row keeps the reader's existing fail-closed result.
+    assert result["status"] == ("unavailable" if variant == "malformed_ts" else "observation")
+    case.client.conversations_replies.assert_not_awaited()

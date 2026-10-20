@@ -19,6 +19,7 @@ async def admit_event(adapter, event, body=None, *, original_source=None, intera
     probe = SimpleNamespace(platform=Platform.SLACK,
                             chat_id=event.get("channel") or event.get("channel_id"),
                             user_id=event.get("user") or event.get("user_id"))
+    _invalidate_cookunity_history(adapter, event, body)
     if not is_codewords(adapter, probe) and any(
         isinstance(event.get(key), dict) and event[key].get("user") == restricted.USER
         for key in ("message", "previous_message")
@@ -183,6 +184,55 @@ async def admit_event(adapter, event, body=None, *, original_source=None, intera
             channel, ts, type(error).__name__,
         )
         return "deny", None
+
+
+def _invalidate_cookunity_history(adapter, event, body):
+    """Authenticated CookUnity edits/deletions revoke retained history reads.
+
+    This only bumps a revision counter: it never authorizes, admits or replies,
+    and the caller's existing admission decision for the event is unchanged.
+    """
+    from gateway.client_context_cookunity import CHANNEL, WORKSPACE
+
+    if event.get("subtype") not in {"message_changed", "message_deleted"} or event.get("channel") != CHANNEL:
+        return
+    try:
+        from gateway.client_context_codewords_history import slack_timestamp
+
+        require(body is not None and event.get("type") == "message")
+        team = body.get("team_id") or body.get("team")
+        if isinstance(team, dict):
+            team = team.get("id")
+        team = identifier(team)
+        for key in ("team_id", "team"):
+            if event.get(key):
+                require(event[key] == team)
+        require(team == WORKSPACE and team in adapter._team_clients
+                and bool(adapter._team_bot_user_ids.get(team)))
+        slack_timestamp(event.get("event_ts") or event.get("ts"))
+        deleted = event["subtype"] == "message_deleted"
+        changed = event.get("previous_message", {}) if deleted else event.get("message")
+        require(type(changed) is dict and changed.get("channel", CHANNEL) == CHANNEL)
+        changed_ts = slack_timestamp(event.get("deleted_ts") if deleted else changed.get("ts"))
+        require(not changed.get("ts") or changed["ts"] == changed_ts)
+        version = ""
+        if not deleted:
+            edited = changed.get("edited", {})
+            require(type(edited) is dict)
+            version = slack_timestamp(edited.get("ts") or event.get("event_ts") or event.get("ts"))
+        changes = vars(adapter).get("_cookunity_history_changes", {})
+        require(type(changes) is dict)
+        receipt = (team, CHANNEL, event["subtype"], changed_ts, version)
+        if receipt in changes:
+            return
+        revision = vars(adapter).get("_cookunity_history_revision", 0)
+        require(type(revision) is int and revision >= 0)
+        adapter._cookunity_history_revision = revision + 1
+        changes[receipt] = True
+        adapter._trim_oldest_dict_entries(changes, 512)
+        adapter._cookunity_history_changes = changes
+    except Exception as error:
+        logger.warning("slack cookunity history invalidation skipped error=%s", type(error).__name__)
 
 
 def is_codewords(adapter, source):

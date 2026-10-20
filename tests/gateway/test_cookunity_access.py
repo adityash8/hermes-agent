@@ -655,3 +655,101 @@ async def test_cookunity_completion_exposes_scoped_history_tool(native, wire):
     tools = {tool["function"]["name"] for tool in wire.captured[0]["tools"]}
     assert "cookunity_slack_history_read" in tools
     assert not any(name.startswith("codewords_") for name in tools)
+
+
+def cookunity_change(subtype, *, thread="1789940000.000001", author="UOTHER"):
+    change = {"type": "message", "subtype": subtype, "channel": cu.CHANNEL, "ts": "1789948801.000009",
+              "event_ts": "1789948801.000009"}
+    edited = {"type": "message", "channel": cu.CHANNEL, "ts": "1789940001.000001", "thread_ts": thread,
+              "user": author, "text": "CookUnity evidence"}
+    if subtype == "message_changed":
+        change["message"] = {**edited, "edited": {"ts": "1789948801.000008"}}
+    else:
+        change.update(deleted_ts=edited["ts"], previous_message=edited)
+    return change
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subtype", ["message_changed", "message_deleted"])
+@pytest.mark.parametrize("author", ["UOTHER", lane.USER])
+async def test_cookunity_edit_or_delete_during_turn_withholds_reply(native, wire, subtype, author):
+    adapter, client, event = native
+    event.update(ts="1789948800.000001", thread_ts="1789948700.000001")
+    loop = asyncio.get_running_loop()
+
+    def change_another_thread(_body):
+        # Evidence in another CookUnity thread changes while the answer is being produced.
+        future = asyncio.run_coroutine_threadsafe(adapter._handle_slack_message(
+            cookunity_change(subtype, author=author), {"team_id": cu.WORKSPACE}), loop)
+        future.result(timeout=2)
+
+    wire.state.callback = change_another_thread
+    await invoke(native)
+
+    assert len(wire.captured) == 1
+    assert adapter._cookunity_history_revision == 1
+    assert adapter.__dict__.get("_codewords_history_revision", 0) == 0
+    client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cookunity_change_after_turn_does_not_affect_next_turn(native, wire):
+    adapter, client, event = native
+    await adapter._handle_slack_message(cookunity_change("message_changed"), {"team_id": cu.WORKSPACE})
+    assert adapter._cookunity_history_revision == 1
+    await invoke(native)
+    client.chat_postMessage.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subtype", ["message_changed", "message_deleted"])
+async def test_cookunity_actorless_change_invalidates_once_without_becoming_a_request(native, subtype):
+    from plugins.platforms.slack.client_context import admit_event
+
+    adapter, client, _ = native
+    adapter._message_handler = AsyncMock()
+    change = cookunity_change(subtype)
+    first = await admit_event(adapter, change, {"team_id": cu.WORKSPACE})
+    replay = await admit_event(adapter, change, {"team_id": cu.WORKSPACE})
+    assert first[0] == replay[0] == "deny"
+    assert adapter._cookunity_history_revision == 1
+    newer = cookunity_change(subtype)
+    if subtype == "message_changed":
+        newer["message"]["edited"]["ts"] = "1789948802.000001"
+    else:
+        newer["deleted_ts"] = newer["previous_message"]["ts"] = "1789940002.000001"
+    await admit_event(adapter, newer, {"team_id": cu.WORKSPACE})
+    assert adapter._cookunity_history_revision == 2
+    client.users_info.assert_not_awaited()
+    adapter._message_handler.assert_not_awaited()
+    client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forgery", ["workspace", "event_team", "codewords_channel", "nested_channel",
+                                     "unbound", "no_body", "timestamp", "not_message"])
+async def test_forged_cookunity_changes_cannot_invalidate(native, forgery):
+    from plugins.platforms.slack.client_context import admit_event
+
+    adapter, client, _ = native
+    change = cookunity_change("message_changed")
+    body = {"team_id": cu.WORKSPACE}
+    if forgery == "workspace":
+        body["team_id"] = "TFOREIGN"
+    elif forgery == "event_team":
+        change["team"] = "TFOREIGN"
+    elif forgery == "codewords_channel":
+        change["channel"] = lane.CODEWORDS
+    elif forgery == "nested_channel":
+        change["message"]["channel"] = "CFOREIGN"
+    elif forgery == "unbound":
+        adapter._team_clients.clear()
+    elif forgery == "no_body":
+        body = None
+    elif forgery == "timestamp":
+        change["message"]["ts"] = "invalid"
+    else:
+        change["type"] = "app_mention"
+    await admit_event(adapter, change, body)
+    assert adapter.__dict__.get("_cookunity_history_revision", 0) == 0
+    client.chat_postMessage.assert_not_awaited()

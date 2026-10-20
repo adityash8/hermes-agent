@@ -19,6 +19,7 @@ NAME = "codewords_slack_history_read"
 CLIENT_CHANNELS = {"codewords": CHANNELS, "cookunity": (COOKUNITY_CHANNEL,)}
 CLIENT_WORKSPACES = {"codewords": WORKSPACE, "cookunity": COOKUNITY_WORKSPACE}
 CLIENT_TOOL_NAMES = {"codewords": NAME, "cookunity": "cookunity_slack_history_read"}
+HISTORY_REVISION_ATTRS = {"codewords": "_codewords_history_revision", "cookunity": "_cookunity_history_revision"}
 PAGE_SIZE = 15
 CONTEXT_PAGES = 3
 SEARCH_PAGES = 8
@@ -130,6 +131,9 @@ class HistoryReader:
                 and set(self.channels) <= set(current_channels))
         if client_id == "codewords" and len(self.channels) > 1:
             require(callable(validate_channels))
+        # The invoking channel is searched first so another approved channel can
+        # never consume the shared read budget before the request's own channel.
+        self.search_channels = (self.channel,) + tuple(c for c in self.channels if c != self.channel)
         self.workspace = workspace
         self.cutoff = slack_timestamp(event.message_id)
         self.thread = slack_timestamp(source.thread_id) if source.thread_id is not None else self.cutoff
@@ -154,9 +158,10 @@ class HistoryReader:
         return bots.get(self.workspace) if type(bots) is dict else None
 
     def _revision(self):
-        if self.client_id != "codewords":
-            return 0
-        revision = vars(self.adapter).get("_codewords_history_revision", 0) if self.adapter is not None else 0
+        # Authenticated edits/deletions in the client's channels bump this counter;
+        # any change invalidates history already read in this turn.
+        name = HISTORY_REVISION_ATTRS[self.client_id]
+        revision = vars(self.adapter).get(name, 0) if self.adapter is not None else 0
         require(type(revision) is int and revision >= 0)
         return revision
 
@@ -310,6 +315,22 @@ class HistoryReader:
             record["edited_at"] = edited_ts
         return record
 
+    def _thread_root(self, row, channel, latest):
+        """Discovery key only: a reply-bearing root's own content stays filtered by _record."""
+        if type(row) is not dict or row.get("type") != "message" or channel not in self.channels:
+            return None
+        reply_count = row.get("reply_count", 0)
+        if row.get("channel", channel) != channel or type(reply_count) is not int or reply_count <= 0:
+            return None
+        try:
+            ts = slack_timestamp(row.get("ts"))
+            raw_thread_ts = row.get("thread_ts")
+            if raw_thread_ts is not None and slack_timestamp(raw_thread_ts) != ts:
+                return None
+            return ts if _micros(ts) < latest else None
+        except Exception:
+            return None  # A malformed row is skipped like any other filtered record.
+
     def _unavailable(self, operation, reason):
         self._guard()
         return json.dumps({"operation": CLIENT_TOOL_NAMES[self.client_id], "client_id": self.client_id,
@@ -431,7 +452,7 @@ class HistoryReader:
         records, pages, scanned, filtered, threads_scanned = [], 0, 0, 0, 0
         try:
             while pages < SEARCH_PAGES and self.reads < MAX_READS and not state["done"]:
-                if state["channel_index"] >= len(self.channels):
+                if state["channel_index"] >= len(self.search_channels):
                     state["done"] = True
                     break
                 if state["pending_threads"]:
@@ -469,7 +490,7 @@ class HistoryReader:
                     state["history_cursor"] = ""
                     state["history_more"] = True
                     continue
-                channel = self.channels[state["channel_index"]]
+                channel = self.search_channels[state["channel_index"]]
                 kwargs = {"channel": channel, "limit": PAGE_SIZE, "oldest": "0.000000",
                           "latest": latest_ts, "inclusive": True}
                 cursor = state["history_cursor"]
@@ -489,10 +510,9 @@ class HistoryReader:
                     else:
                         state["seen_messages"].add(key)
                         records.append(record)
-                    root = self._record(row, operation, "", 0, latest, channel=channel)
-                    reply_count = row.get("reply_count", 0) if type(row) is dict else 0
-                    if root is not None and type(reply_count) is int and reply_count > 0:
-                        thread_key = (channel, root["ts"])
+                    root = self._thread_root(row, channel, latest)
+                    if root is not None:
+                        thread_key = (channel, root)
                         if thread_key not in state["seen_threads"]:
                             state["seen_threads"].add(thread_key)
                             state["pending_threads"].append(thread_key)
@@ -504,7 +524,7 @@ class HistoryReader:
                 else:
                     state["history_cursor"] = ""
                     state["history_more"] = False
-            if state["channel_index"] >= len(self.channels) and not state["pending_threads"]:
+            if state["channel_index"] >= len(self.search_channels) and not state["pending_threads"]:
                 state["done"] = True
             self._guard()
         except Exception:
@@ -513,8 +533,8 @@ class HistoryReader:
         read_budget_exhausted = self.reads >= MAX_READS and not state["done"]
         has_more = not state["done"]
         root_scan_complete = (
-            state["channel_index"] >= len(self.channels)
-            or state["channel_index"] == len(self.channels) - 1 and not state["history_more"]
+            state["channel_index"] >= len(self.search_channels)
+            or state["channel_index"] == len(self.search_channels) - 1 and not state["history_more"]
         )
         next_cursor = None
         if has_more and not read_budget_exhausted:
@@ -522,7 +542,8 @@ class HistoryReader:
             self.cursors[next_cursor] = (identity, "channel", state)
         records.sort(key=lambda record: (record["channel_id"], _micros(record["ts"])))
         coverage = {"scope": f"{self.client_id} approved live channels and their thread replies",
-                    "channel_ids": list(self.channels), "pagination_complete": not has_more,
+                    "channel_ids": list(self.channels), "search_order": list(self.search_channels),
+                    "pagination_complete": not has_more,
                     "read_budget_exhausted": read_budget_exhausted,
                     "pages": pages, "scanned_messages": scanned, "filtered_messages": filtered,
                     "threads_scanned": threads_scanned, "output_truncated": False,

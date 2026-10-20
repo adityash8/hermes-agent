@@ -191,17 +191,23 @@ async def handle_turn(runner, event, source, key, generation):
         require(event.source is source)
         adapter = runner._delivery_adapter_for(source)
         require(native(source, adapter).adapter is adapter)
+        receipts = []
 
         def validate():
             require(not stopped.is_set() and time.monotonic() < deadline)
             require(event.source is source and seal_event(event) == original)
             require(validate_event(runner, event) == grant)
             require(runner._is_session_run_current(key, generation))
+            # Retained history receipt: an authenticated edit/deletion in the
+            # CookUnity channel invalidates this turn through completion and send.
+            for receipt in receipts:
+                receipt()
 
         from gateway.client_context_codewords_history import HistoryReader
 
         history = HistoryReader(adapter, event, validate, asyncio.get_running_loop(),
                                 client_id="cookunity", channels=(cookunity.CHANNEL,))
+        receipts.append(history.validate_receipt)
         reply = await asyncio.wait_for(asyncio.to_thread(
             _loop, grant, event.text, validate, getattr(source, "_cookunity_context", ()), history,
         ), TIMEOUT)

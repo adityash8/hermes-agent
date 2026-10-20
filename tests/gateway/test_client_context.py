@@ -770,7 +770,8 @@ async def test_native_owner_keeps_media_approvals_reactions_busy_and_hooks(nativ
     await adapter._handle_slack_reaction(reaction, body=reaction_body)
     runner.hooks.emit.assert_awaited_once()
     assert client.conversations_replies.await_count == 2
-    assert "1789948800.000002" in adapter._processed_message_ts
+    assert adapter._has_processed_message_ts("1789948800.000002", channel_id="Downer",
+                                             team_id="workspace-synthetic")
     assert adapter.handle_message.await_count == 2
 
     runner._is_user_authorized = Mock(return_value=True)
