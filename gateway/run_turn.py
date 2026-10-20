@@ -2401,6 +2401,10 @@ class GatewayTurnMixin:
             override = adapter.toolsets_for_source(source) if adapter is not None else None
         except Exception:
             override = None
+        if isinstance(override, list) and not override:
+            # Explicit empty grant = zero tools. Expanding [] through platform resolution would
+            # re-add platform-native/plugin toolsets; None (no grant) stays unrestricted.
+            return []
         if override and isinstance(override, list):
             pts = dict(user_config.get("platform_toolsets") or {})
             pts[platform_key] = [str(x) for x in override]
