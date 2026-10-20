@@ -1,10 +1,13 @@
-"""Secret stores under HERMES_HOME are write-denied; control files stay writable (#110464).
+"""Secret stores and gateway control files under HERMES_HOME are write-denied (#110464, EZ-1034).
 
 ``get_read_block_error`` refuses every credential store. The write side is deliberately
 narrower — #45947 freed ``auth.json`` / ``config.yaml`` / ``webhook_subscriptions.json`` so
 the user can ask to edit them — but the secret *material* it meant to keep blocked had
 drifted: ``auth/google_oauth.json``, the plaintext Bitwarden cache, ``vault/`` and
 ``browser-profile/`` were writable through ``write_file`` / ``patch``.
+
+EZ-1034 reverses #45947 for ``auth.json`` / ``auth.lock`` / ``webhook_subscriptions.json``
+on this deployment; only ``config.yaml`` stays writable (behind the sensitive-path approval).
 """
 
 from __future__ import annotations
@@ -19,7 +22,8 @@ import agent.file_safety as fs
 SECRET_STORES = (
     "auth/google_oauth.json", "cache/bws_cache.json", "vault/vault.key", "browser-profile/Default/Cookies",
 )
-WRITABLE_CONTROL_FILES = ("auth.json", "config.yaml", "webhook_subscriptions.json")
+WRITABLE_CONTROL_FILES = ("config.yaml",)
+DENIED_CONTROL_FILES = ("auth.json", "auth.lock", "webhook_subscriptions.json")
 
 
 @pytest.fixture()
@@ -54,6 +58,8 @@ def test_control_files_and_lookalikes_outside_home_stay_writable(hermes_layout, 
     for base in (profile, root):
         for rel in WRITABLE_CONTROL_FILES:
             assert fs.is_write_denied(str(_touch(base, rel))) is False, f"#45947 regression: {rel}"
+        for rel in DENIED_CONTROL_FILES:
+            assert fs.is_write_denied(str(_touch(base, rel))) is True, f"EZ-1034 regression: {rel}"
     assert fs.is_write_denied(str(_touch(tmp_path / "myproject", "cache/bws_cache.json"))) is False
     assert fs.is_write_denied(str(_touch(tmp_path / "myproject", "vault/vault.key"))) is False
 

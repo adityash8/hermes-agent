@@ -249,12 +249,13 @@ def build_write_denied_paths(home: str) -> set[str]:
     # token store; both Bitwarden caches hold Secrets Manager material; .op.env holds
     # the 1Password service-account token and op_cache.json its resolved-secret cache.
     #
-    # auth.json, auth.lock, config.yaml and webhook_subscriptions.json are
-    # deliberately NOT here: #45947 freed those control files on purpose
-    # ("true containment belongs in Docker/remote backends and OS permissions,
-    # not an expanding hardcoded denylist"). They stay read-denied, not write-denied.
+    # EZ-1034: auth.json (gateway auth store), auth.lock and
+    # webhook_subscriptions.json are write-denied here too, reversing #45947 for
+    # this deployment: overwriting them rewrites who can reach the gateway.
+    # config.yaml stays writable through the sensitive-path approval gate.
     hermes_files = (
         ".env", ".op.env", ".anthropic_oauth.json",
+        "auth.json", "auth.lock", "webhook_subscriptions.json",
         os.path.join("auth", "google_oauth.json"),
         os.path.join("cache", "bws_cache.json"),
         os.path.join("cache", "bws_cache.enc.json"),

@@ -87,9 +87,36 @@ class TestWriteAllowed:
         assert _is_write_denied("/tmp/safe_file.txt") is False
 
 
-    def test_hermes_control_files_requested_writable(self):
+    def test_hermes_config_yaml_writable(self):
+        from hermes_constants import get_hermes_home
+
+        # config.yaml is gated by the sensitive-path approval check, not the denylist.
+        assert _is_write_denied(str(get_hermes_home() / "config.yaml")) is False
+
+
+class TestWriteDenyHermesControlFiles:
+    """EZ-1034: gateway auth, webhook and Bitwarden stores are never writable."""
+
+    NAMES = [
+        "auth.json",
+        "auth.lock",
+        "webhook_subscriptions.json",
+        os.path.join("auth", "google_oauth.json"),
+        os.path.join("cache", "bws_cache.json"),
+    ]
+
+    def test_denied_under_active_home(self):
         from hermes_constants import get_hermes_home
 
         home = get_hermes_home()
-        for name in ["auth.json", "config.yaml", "webhook_subscriptions.json"]:
-            assert _is_write_denied(str(home / name)) is False, f"{name} should be writable"
+        for name in self.NAMES:
+            assert _is_write_denied(str(home / name)) is True, f"{name} should be denied"
+
+    def test_denied_under_root_when_running_under_profile(self, tmp_path, monkeypatch):
+        root = tmp_path / "hermes_root"
+        profile = root / "profiles" / "coder"
+        profile.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        for name in self.NAMES:
+            assert _is_write_denied(str(root / name)) is True, f"root {name} should be denied"
+            assert _is_write_denied(str(profile / name)) is True, f"profile {name} should be denied"
