@@ -2178,7 +2178,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             **self._status_head(session), "output": "\n".join(selected),
             "total_lines": total_lines, "showing": f"{len(selected)} lines"}
         if session.exited and observed_completion_output:
-            self._completion_consumed.add(session_id)
+            self._completion_consumed.add(session.id)
         return result
 
     def wait(self, session_id: str, timeout: int = None) -> dict:
@@ -2212,7 +2212,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             self._reconcile_local_exit(session)  # orphaned-pipe reader guard
             result = None
             if session.exited:
-                self._completion_consumed.add(session_id)
+                self._completion_consumed.add(session.id)
                 result = self._exit_snapshot(session, "exited")
             elif _is_interrupted():
                 result = {
@@ -2286,7 +2286,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # Only suppress the autonomous turn after its output is present in
             # the explicit kill result, matching wait/log consumption.
             if consume_output:
-                self._completion_consumed.add(session_id)
+                self._completion_consumed.add(session.id)
             return result
         try:
             early = self._signal_kill(session, session_id, consume_output)
@@ -2323,7 +2323,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
             with session._lock:
                 output = _completion_output(session)
                 if consume_output:
-                    self._completion_consumed.add(session_id)
+                    self._completion_consumed.add(session.id)
                 session.exited = True
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
@@ -2370,7 +2370,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 with session._lock:
                     output = _completion_output(session)
                 if consume_output:
-                    self._completion_consumed.add(session_id)
+                    self._completion_consumed.add(session.id)
                 # No waitable handle, so this is not a collected exit. Close the
                 # entry without queueing a completion, and do not signal a PID
                 # whose start time does not match.

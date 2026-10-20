@@ -35,7 +35,7 @@ from gateway.session import (
     neutralize_untrusted_inline_text,
 )
 from gateway.turn_lease import TurnLeaseTimeoutError
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
@@ -1329,6 +1329,8 @@ class GatewayInboundMixin:
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
+        if not await cast("GatewayRunner", self)._refresh_completion_event(event):
+            return None
         from gateway.client_context import handle_ingress
         handled, result = await handle_ingress(self, event)
         if handled:
@@ -1408,6 +1410,8 @@ class GatewayInboundMixin:
 
         try:
             try:
+                if not await cast("GatewayRunner", self)._refresh_completion_event(event):
+                    return None
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except TurnLeaseTimeoutError as exc:
                 # A rejected message, not a completed turn: return before the /goal judge so it
@@ -1760,6 +1764,10 @@ class GatewayInboundMixin:
         rehome_inbound_media(event)  # before any consumer (vision, STT, document notes) reads media_urls
         _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
         message_text = (event._gateway_pending_stt_text if _pending_stt_prepared else event.text) or ""
+        if event.internal and getattr(event, "_completion_entries", None) is not None:
+            # Completion bytes are assembled at final admission, after the
+            # awaits below and turn preparation can settle queued results.
+            message_text = ""
         # Prefer the caller's resolved session key so this write key matches the consume key at the
         # run_conversation site; derive it here only for tests and legacy standalone callers.
         session_key = session_key or self._session_key_for_source(source)

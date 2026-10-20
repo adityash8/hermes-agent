@@ -1838,6 +1838,25 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
         incoming_is_photo = event.message_type == MessageType.PHOTO
         both_photo = existing_is_photo and incoming_is_photo
         incoming_has_media = bool(event.media_urls)
+        both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
+        will_merge = both_photo or existing.media_urls or incoming_has_media or (merge_text and both_text)
+        prior_completions = existing._completion_entries
+        new_completions = event._completion_entries
+        if will_merge and (prior_completions is not None or new_completions is not None):
+            entries = [*(prior_completions or []), *(new_completions or [])]
+            if existing.internal and prior_completions is not None and not event.internal:
+                # Keep the actual user's event, including trusted scoped-admission
+                # markers and reply anchors; completion context cannot own it.
+                event._pending_completion_entries = entries
+                pending_messages[session_key] = event
+                return
+            if not existing.internal:
+                existing._pending_completion_entries = entries
+                if event.internal and new_completions is not None:
+                    return
+            elif prior_completions is not None and new_completions is not None:
+                existing.metadata = {**existing.metadata, "_completion_entries": entries}
+                return
 
         def _padded_inline_flags(msg: MessageEvent) -> List[Optional[bool]]:
             flags = list(getattr(msg, "media_text_inlined", []) or [])
@@ -1866,7 +1885,6 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
                 if hasattr(existing, attr):
                     delattr(existing, attr)
             return
-        both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
