@@ -43,13 +43,13 @@ def _handler(name):
     return run
 
 
-def _register():
+def _schemas():
     from gateway.client_context_rhiz_reads import schemas
 
-    for entry in schemas():
-        schema = entry["function"]
-        registry.register(name=schema["name"], toolset="spi", schema=schema,
-                          handler=_handler(schema["name"]), emoji="📈")
+    return [entry["function"] for entry in schemas()]
 
 
-_register()
+# Module-level loop: discover_builtin_tools only imports modules whose body calls registry.register.
+for _schema in _schemas():
+    registry.register(name=_schema["name"], toolset="spi", schema=_schema,
+                      handler=_handler(_schema["name"]), emoji="📈")

@@ -1,5 +1,6 @@
 """The spi toolset reaches only Rhiz's Slack grant and re-checks the bound turn per call (EZ-1074)."""
 import json
+from pathlib import Path
 
 import pytest
 
@@ -8,7 +9,7 @@ from gateway import client_context_restricted as lane
 from gateway.session_context import clear_session_vars, set_session_vars
 from hermes_cli.tools_config import _platform_default_keys
 from tools import rhiz_spi_tool
-from tools.registry import registry
+from tools.registry import _module_registers_tools, registry
 
 SPI_TOOLS = {"spi_ga4_report", "spi_gsc_report"}
 
@@ -37,6 +38,10 @@ def test_spi_toolset_is_registered_and_never_a_platform_default():
     for name, entry in toolsets.TOOLSETS.items():
         if name != "spi":
             assert not SPI_TOOLS & set(toolsets.resolve_toolset(name)), name
+
+
+def test_builtin_discovery_imports_the_spi_module():
+    assert _module_registers_tools(Path(rhiz_spi_tool.__file__))
 
 
 def test_rhiz_slack_turn_with_spi_grant_passes_guard(turn):
