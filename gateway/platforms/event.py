@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from gateway.session import SessionSource
 
@@ -106,6 +106,18 @@ class MessageEvent:
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
+    # Local queue sidecar; a declared field survives dataclasses.replace at
+    # ingress without importing completion routing metadata into a human event.
+    _pending_completion_entries: Optional[List[Tuple[str, dict]]] = field(
+        default=None, repr=False, compare=False)
+
+    @property
+    def _completion_entries(self) -> Optional[List[Tuple[str, dict]]]:
+        # Only locally queued context may accompany a human event. Never trust
+        # transport metadata to give that event completion identity/authority.
+        if self.internal:
+            return (self.metadata or {}).get("_completion_entries")
+        return self._pending_completion_entries
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
         """One turn now answers *other* too: an addressed message wins, then an unknown one."""

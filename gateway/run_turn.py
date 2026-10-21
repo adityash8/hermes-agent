@@ -2186,6 +2186,18 @@ class GatewayTurnMixin:
             from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
             if not heartbeat_owner_is_current(self, event, session_key):
                 return
+            if getattr(event, "_completion_entries", None) is not None:
+                message_text = await self._admit_completion_message(
+                    event, prepared.persist_user_message if prepared.persist_user_message is not None
+                    else prepared.message_text,
+                )
+                if message_text is None:
+                    await self._hmwa_stop_typing_for_turn(event, source)
+                    return None
+                (prepared.message_text, prepared.persist_user_message, prepared.persist_user_timestamp) = (
+                    self._hmwa_apply_message_timestamp(event, message_text)
+                )
+                message_text = prepared.message_text
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
             # Admission/typing is not execution. All routing, authorization and
@@ -3968,6 +3980,13 @@ class GatewayTurnMixin:
         # (the helper's own ``except Exception`` does not catch cancellation).
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
+            if getattr(pending_event, "_completion_entries", None) is not None:
+                next_message = await self._admit_completion_message(pending_event, next_message)
+                if next_message is None:
+                    # Every queued completion settled while waiting: no follow-up turn is owed.
+                    await _run_followup_processing_hook(
+                        _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
+                    return result
 
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
