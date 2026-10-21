@@ -6,7 +6,10 @@ only on SendResult.success | mark_failed() 'failed' on a definitive rejection. C
 (never silently resend an ambiguous send): pending = never started, redeliver plainly; attempting
 = crashed mid-await, platform MAY have it, redeliver WITH a visible recovered marker; failed =
 rejected once, restart is a retry boundary, also marked; delivered = prune. Attempts are capped
-and stale rows expire, both -> 'abandoned' (kept briefly, then pruned). Everything is
+and stale rows expire, both -> 'abandoned' (kept briefly, then pruned). A redelivery the platform
+refused for authorization (participation revoked, surface deleted) -> 'held': no attempt spent, never
+swept or abandoned, kept for _HELD_RETENTION_SECONDS unless release_held() returns it to 'failed',
+and pruned before live rows under the row cap. Everything is
 best-effort: ledger failures must never block a send; callers wrap every call in try/except.
 """
 
@@ -33,6 +36,7 @@ _DB_LOCK = threading.Lock()
 MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
+_HELD_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _MAX_ROWS = 500
 
 # Visible prefixes for redeliveries that might duplicate an already-received message (crash mid-send /
@@ -319,6 +323,41 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+# Send errors that mean the platform refused the target, not that delivery failed: retrying cannot
+# succeed until someone re-authorizes it, so the row is held instead of spending its attempt budget.
+AUTHORIZATION_HOLD_ERRORS = frozenset({"slack_participation_revoked", "slack_thread_deleted"})
+
+
+def is_authorization_hold(error: Any) -> bool:
+    return str(error or "").strip() in AUTHORIZATION_HOLD_ERRORS
+
+
+def mark_held(obligation_id: str, error: str = "") -> bool:
+    """Park a claimed row the platform refused for authorization as ``held``, refunding its claim.
+
+    Held rows are outside every sweep, so a revoked or deleted surface cannot burn MAX_ATTEMPTS
+    across restarts; they outlive the normal retention (_HELD_RETENTION_SECONDS) but never displace
+    a live row under the row cap. release_held() is the only way back into redelivery."""
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='held', attempts=CASE
+                       WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                   updated_at=?, last_error=?
+               WHERE obligation_id=? AND state IN ('pending', 'attempting', 'failed')""",
+            (time.time(), error[:500] if error else None, obligation_id))
+    return bool(cursor.rowcount)
+
+
+def release_held(obligation_id: str) -> bool:
+    """Return a held row to ``failed`` (attempts unchanged) once its target is authorized again."""
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations SET state='failed', updated_at=?, last_error=NULL
+               WHERE obligation_id=? AND state='held'""", (time.time(), obligation_id))
+    return bool(cursor.rowcount)
+
+
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
     """Return an unsent runtime claim to ``failed`` without spending an attempt.
 
@@ -538,7 +577,9 @@ def _prune_unlocked(conn, now: float) -> None:
     """Retention DELETEs on the caller's open connection — must run inside the caller's transaction."""
     conn.execute(
         """DELETE FROM delivery_obligations
-           WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""", (now - _RETENTION_SECONDS,))
+           WHERE (state IN ('delivered', 'abandoned') AND updated_at < ?)
+              OR (state = 'held' AND updated_at < ?)""",
+        (now - _RETENTION_SECONDS, now - _HELD_RETENTION_SECONDS))
     total = conn.execute("SELECT COUNT(*) FROM delivery_obligations").fetchone()[0]
     if total > _MAX_ROWS:
         conn.execute(
@@ -547,7 +588,8 @@ def _prune_unlocked(conn, now: float) -> None:
                  ORDER BY CASE state
                             WHEN 'delivered' THEN 0
                             WHEN 'abandoned' THEN 1
-                            ELSE 2
+                            WHEN 'held' THEN 2
+                            ELSE 3
                           END, updated_at ASC
                  LIMIT ?)""", (total - _MAX_ROWS,))
 
